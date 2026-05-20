@@ -22,10 +22,16 @@
 - [x] DeepEP multi-segment fatbin capture and pre-linking
 - [ ] Release NVSHMEM stub layer for single-GPU offline template capture
 
-## Stage 4: vLLM Integration
+## Stage 4: vLLM/SGLang Integration
 
-- [ ] Sync with latest vLLM release
-- [ ] Drop-in integration layer for CUDA graph persistence in vLLM
+- [x] Sync with latest vLLM release
+    - [x] EP on vLLM with DeepEP
+    - [ ] TP on vLLM
+    - [x] Quantized MoE with DeepGemm
+- [x] Drop-in integration layer for CUDA graph persistence in vLLM
+- [x] Sync with latest SGLang release
+    - [ ] EP on SGLang
+    - [ ] TP on SGLang
 
 ## Stage 5: Disaggregated and Large-Scale Serving
 

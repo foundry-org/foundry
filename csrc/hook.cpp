@@ -3442,9 +3442,21 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
     }
 
     // FIXME: this will reset memory region, try to avoid that
-    // Ensure CUDA context exists before loading modules
+    // Ensure CUDA context exists before loading modules.
+    //
+    // NOTE: the four dlsym lookups below use RTLD_DEFAULT with RTLD_NEXT
+    // fallback. Reason: under forkserver, libcudart gets loaded with
+    // RTLD_LOCAL scope (ctypes default), which is reachable via
+    // RTLD_DEFAULT but not via RTLD_NEXT from this preload. Under spawn,
+    // libcudart is loaded via DT_NEEDED with a scope visible to RTLD_NEXT.
+    // Querying DEFAULT first + falling back to NEXT makes both cases work.
+    // We do NOT change RTLD_NEXT usage elsewhere in this file — those are
+    // genuine interposer lookups (hook wants the *real* function, not its
+    // own wrapper) and must stay on RTLD_NEXT.
     typedef CUresult (*cuCtxGetCurrent_t)(CUcontext*);
-    auto ctx_get_current = (cuCtxGetCurrent_t)real_dlsym(RTLD_NEXT, "cuCtxGetCurrent");
+    auto ctx_get_current = (cuCtxGetCurrent_t)real_dlsym(RTLD_DEFAULT, "cuCtxGetCurrent");
+    if (!ctx_get_current)
+        ctx_get_current = (cuCtxGetCurrent_t)real_dlsym(RTLD_NEXT, "cuCtxGetCurrent");
     CUcontext ctx = nullptr;
     if (ctx_get_current) {
         ctx_get_current(&ctx);
@@ -3453,7 +3465,9 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
         // Get current device from CUDA runtime (set by PyTorch/framework)
         // cudaError_t is an enum, cudaSuccess = 0
         typedef int (*cudaGetDevice_t)(int*);
-        auto get_device = (cudaGetDevice_t)real_dlsym(RTLD_NEXT, "cudaGetDevice");
+        auto get_device = (cudaGetDevice_t)real_dlsym(RTLD_DEFAULT, "cudaGetDevice");
+        if (!get_device)
+            get_device = (cudaGetDevice_t)real_dlsym(RTLD_NEXT, "cudaGetDevice");
         int device = 0;
         if (get_device) {
             int err = get_device(&device);
@@ -3476,8 +3490,12 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
         // survives NCCL's context management.
         typedef int (*cudaSetDevice_t)(int);
         typedef int (*cudaFree_t)(void*);
-        auto set_dev = (cudaSetDevice_t)real_dlsym(RTLD_NEXT, "cudaSetDevice");
-        auto cuda_free = (cudaFree_t)real_dlsym(RTLD_NEXT, "cudaFree");
+        auto set_dev = (cudaSetDevice_t)real_dlsym(RTLD_DEFAULT, "cudaSetDevice");
+        if (!set_dev)
+            set_dev = (cudaSetDevice_t)real_dlsym(RTLD_NEXT, "cudaSetDevice");
+        auto cuda_free = (cudaFree_t)real_dlsym(RTLD_DEFAULT, "cudaFree");
+        if (!cuda_free)
+            cuda_free = (cudaFree_t)real_dlsym(RTLD_NEXT, "cudaFree");
         if (set_dev && cuda_free) {
             int err = set_dev(device);
             if (err != 0) {

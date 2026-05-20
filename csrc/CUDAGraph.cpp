@@ -2,6 +2,10 @@
 #include <ATen/Functions.h>
 #include <ATen/cuda/Exceptions.h>
 #include <ATen/cuda/CUDAContext.h>
+#if __has_include(<ATen/cuda/MemPool.h>)
+#include <ATen/cuda/MemPool.h>
+#define FOUNDRY_HAS_ATEN_CUDA_MEMPOOL 1
+#endif
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/driver_api.h>
@@ -124,6 +128,18 @@ namespace at {
 
 namespace foundry {
 
+namespace {
+
+MempoolId_t torch_graph_pool_handle(bool is_user_created = true) {
+#if FOUNDRY_HAS_ATEN_CUDA_MEMPOOL
+  return at::cuda::MemPool::graph_pool_handle(is_user_created);
+#else
+  return c10::cuda::MemPool::graph_pool_handle(is_user_created);
+#endif
+}
+
+} // namespace
+
 static bool _cuda_graphs_debug = false;
 
 static CUDAGeneratorStateRegistry global_generator_state_registry;
@@ -159,7 +175,7 @@ c10::intrusive_ptr<at::CUDAGeneratorState> CUDAGeneratorStateRegistry::get_state
 }
 
 MempoolId_t graph_pool_handle() {
-  return c10::cuda::MemPool::graph_pool_handle();
+  return torch_graph_pool_handle();
 }
 
 void preallocate_cublas_workspaces() {
@@ -226,7 +242,7 @@ void CUDAGraph::capture_begin(MempoolId_t pool, cudaStreamCaptureMode capture_mo
     TORCH_INTERNAL_ASSERT(!(pool.first && pool.second));
     mempool_id_ = pool;
   } else {
-    mempool_id_ = c10::cuda::MemPool::graph_pool_handle(false);
+    mempool_id_ = torch_graph_pool_handle(false);
     TORCH_INTERNAL_ASSERT(mempool_id_.first > 0);
   }
 
@@ -236,7 +252,7 @@ void CUDAGraph::capture_begin(MempoolId_t pool, cudaStreamCaptureMode capture_mo
       AT_CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &status, &stream_capture_id));
       return status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive && stream_capture_id == capture_id_;
   });
-  foundry::resume_allocation_region();
+  // foundry::resume_allocation_region();
   foundry::start_hook_record();
 
   AT_CUDA_CHECK(cudaStreamBeginCapture(capture_stream_, capture_mode));
@@ -257,7 +273,7 @@ void CUDAGraph::capture_end() {
   c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
 
   foundry::end_hook_record();
-  foundry::stop_allocation_region();
+  // foundry::stop_allocation_region();
   allocator_events_ = foundry::save_hook_events_to_json();
   foundry::clear_hook_events();
 
@@ -1516,7 +1532,7 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
     TORCH_INTERNAL_ASSERT(!(pool.first && pool.second));
     graph->mempool_id_ = pool;
   } else {
-    graph->mempool_id_ = c10::cuda::MemPool::graph_pool_handle(false);
+    graph->mempool_id_ = torch_graph_pool_handle(false);
     TORCH_INTERNAL_ASSERT(graph->mempool_id_.first > 0);
   }
 

@@ -2,6 +2,10 @@
 #include <ATen/Functions.h>
 #include <ATen/cuda/Exceptions.h>
 #include <ATen/cuda/CUDAContext.h>
+#if __has_include(<ATen/cuda/MemPool.h>)
+#include <ATen/cuda/MemPool.h>
+#define FOUNDRY_HAS_ATEN_CUDA_MEMPOOL 1
+#endif
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/driver_api.h>
@@ -99,6 +103,18 @@ boost::json::value read_and_parse_graph_json(const std::string& json_path) {
 
 namespace foundry {
 
+namespace {
+
+MempoolId_t torch_graph_pool_handle(bool is_user_created = true) {
+#if FOUNDRY_HAS_ATEN_CUDA_MEMPOOL
+  return at::cuda::MemPool::graph_pool_handle(is_user_created);
+#else
+  return c10::cuda::MemPool::graph_pool_handle(is_user_created);
+#endif
+}
+
+} // namespace
+
 // ============================================================================
 // Phase 1b: graph shell creation + generator registration
 // ============================================================================
@@ -120,7 +136,7 @@ ParsedGraphData CUDAGraph::prepare_graph_shell(
     TORCH_INTERNAL_ASSERT(!(pool.first && pool.second));
     graph->mempool_id_ = pool;
   } else {
-    graph->mempool_id_ = c10::cuda::MemPool::graph_pool_handle(false);
+    graph->mempool_id_ = torch_graph_pool_handle(false);
     TORCH_INTERNAL_ASSERT(graph->mempool_id_.first > 0);
   }
 
@@ -1541,7 +1557,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
 
   MempoolId_t resolved_pool = pool;
   if (resolved_pool.first == 0 && resolved_pool.second == 0) {
-    resolved_pool = c10::cuda::MemPool::graph_pool_handle(false);
+    resolved_pool = torch_graph_pool_handle(false);
     TORCH_INTERNAL_ASSERT(resolved_pool.first > 0);
   }
 

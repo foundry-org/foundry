@@ -130,8 +130,8 @@ ext_modules = [
             '-lcuda',
             '-lboost_filesystem',
             '-lboost_json',
-            '-Wl,-rpath,$ORIGIN'
-        ]
+            '-Wl,-rpath,$ORIGIN',
+        ] + [f'-Wl,-rpath,{p}' for p in library_paths(device_type='cuda')]
     ),
 ]
 

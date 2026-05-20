@@ -24,7 +24,12 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["foundry"]
+packages = [
+    "foundry",
+    "foundry.integration",
+    "foundry.integration.vllm",
+    "foundry.integration.sglang",
+]
 package-dir = {"" = "python"}
 include-package-data = true
 zip-safe = false

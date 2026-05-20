@@ -2,9 +2,20 @@
 
 Foundry is a system that persists CUDA graph states through *template-based context materialization*. It materializes both the structure and execution context of captured CUDA graphs, making graph restoration kernel-agnostic and eliminating the need for hand-crafted patching rules. By intercepting CUDA driver calls, Foundry enforces a deterministic memory layout and automatically detects and serializes the binaries of kernels used in the CUDA graphs.
 
-With Foundry, LLM serving engines can directly reload CUDA states from disk and skip the warmup process to start in a few seconds. 
+With Foundry, LLM serving engines can directly reload CUDA states from disk and skip the warmup process to start in a few seconds.
 
-> **Coming soon:** vLLM integration layer for CUDA graph persistence in real LLM serving.
+## Inference-Engine Integrations
+
+Foundry ships two engine integrations under `foundry/python/foundry/integration/`:
+
+| Engine | Integration code | Documentation |
+|---|---|---|
+| vLLM | [`integration/vllm/`](python/foundry/integration/vllm/) | [`docs/vllm/overview.md`](docs/vllm/overview.md) |
+| SGLang | [`integration/sglang/`](python/foundry/integration/sglang/) | [`docs/sglang/overview.md`](docs/sglang/overview.md) |
+
+Both share the same shape — a tiny shim file in the host engine's source tree calls `install_hooks(...)` from foundry; all substantive logic (VMM region setup, graph save/load, warmup skipping) lives in the foundry package. See [`docs/overview.md`](docs/overview.md) for the cross-engine architecture summary and [`docs/<engine>/direct-edits.md`](docs/) for the per-engine list of files touched in the host repo (~47 lines for SGLang, ~97 lines for vLLM).
+
+The adapted vLLM / SGLang forks (with the direct edits applied) will be released alongside this repo at `foundry-org/vllm` and `foundry-org/sglang`.
 
 ## Roadmap
 
@@ -20,8 +31,6 @@ See [ROADMAP.md](ROADMAP.md) for the full development plan and progress.
 If you are using a conda environment, you can install the requirements with the following command:
 ```bash
 conda install -c conda-forge boost-cpp boost
-
-pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu130
 ```
 
 ## Installation
@@ -31,6 +40,8 @@ pip install cmake # make sure cmake 4.0.0 +
 # re-enter env
 conda deactivate 
 conda activate xxx
+# Torch 2.11 with CUDA 13.0
+pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 pip install -e . --no-build-isolation
 ```
 
@@ -160,9 +171,12 @@ with fdry.allocation_region(0x500000000000, '16GB', prealloc_size='8GB'):
 |----------|-------------|
 | `set_allocation_region(base, size)` | Set VMM allocation region for deterministic memory addresses |
 | `stop_allocation_region()` | Stop the allocation region |
+| `resume_allocation_region()` | Re-enable a previously stopped allocation region |
 | `allocation_region(base, size, prealloc_size=None)` | Context manager to set up VMM allocation region with optional preallocation |
 | `preallocate_region(size)` | Manually preallocate memory inside an allocation region |
 | `free_preallocated_region()` | Free manually preallocated memory |
+| `get_current_alloc_offset()` / `set_current_alloc_offset(offset)` | Read or fast-forward the in-region cursor |
+| `parse_size(size)` | Parse a size string (`"1GB"`, `"16MB"`, …) to bytes |
 | `load_cuda_modules_and_libraries(archive_dir)` | Load CUDA modules and libraries for graph loading |
 | `save_graph_manifest(archive_dir)` | Write graph_manifest.json with topology groups and template assignments |
 
