@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """vLLM integration for foundry.
 
 Public API consumed by ``vllm/compilation/foundry_shim.py``:
@@ -7,9 +8,9 @@ Public API consumed by ``vllm/compilation/foundry_shim.py``:
 - :func:`get_graph_extension_mode` — current mode (``NONE`` if not configured).
 - :func:`install_hooks` — entry point invoked from ``CompilationConfig.__post_init__``
   when ``graph_extension_config_path`` is set. Loads the TOML and installs
-  every runtime monkey-patch listed in ``claude-doc/03-vllm-hook-surface.md``.
+  every runtime monkey-patch.
 
-See the ``claude-doc/`` design docs for the full architecture.
+See ``foundry/docs/vllm/`` and ``claude-doc/`` for the full architecture.
 """
 
 from foundry.integration.vllm.config import (

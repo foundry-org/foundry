@@ -36,3 +36,67 @@ zip-safe = false
 
 [tool.setuptools.package-data]
 foundry = ["*.so"]
+
+# -----------------------------------------------------------------------------
+# Lint / format
+# -----------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    "build",
+    "dist",
+    "*.egg-info",
+    "python/foundry/_version.py",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # Pyflakes
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "ISC", # flake8-implicit-str-concat
+    "SIM", # flake8-simplify
+    "I",   # isort
+    "G",   # flake8-logging-format
+]
+ignore = [
+    # star imports
+    "F405", "F403",
+    # lambda expression assignment
+    "E731",
+    # zip without `strict=`
+    "B905",
+    # Loop control variable not used within loop body
+    "B007",
+    # f-string format
+    "UP032",
+]
+# Lint-level autofix policy.
+# F401 ("unused import") is reported but NEVER auto-stripped — re-export
+# modules (foundry/__init__.py, allocation_region.py) hold imports that ruff
+# can't see are public API. A `--fix` pass that removes them silently breaks
+# the integration (vLLM serve "runs fine" without foundry hooks). Likewise
+# F841 (unused-local) is report-only because tests often assign for clarity.
+unfixable = ["F401", "F841"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests are allowed to leave dangling locals & long lines.
+"tests/**" = ["E501", "F841"]
+# Public re-exports: F401 (unused import) doesn't apply to __init__.
+"**/__init__.py" = ["F401"]
+# .pyi stubs commonly use overload-style redefinitions; ignore F811 and
+# allow legacy Optional[X] / Union annotations for compatibility.
+"**/*.pyi" = ["F811", "UP007"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# -----------------------------------------------------------------------------
+# pytest
+# -----------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

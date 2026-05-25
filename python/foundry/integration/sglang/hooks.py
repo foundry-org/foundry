@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Runtime monkey-patch installer for the Foundry SGLang integration."""
 
 from __future__ import annotations
@@ -125,6 +126,7 @@ def _patch_init_memory_pool() -> None:
 
         if mode == CUDAGraphExtensionMode.LOAD:
             import torch
+
             rt.log_alloc_offset("before_init_memory_pool")
             state = rt.load_warmup_state()
             if not state.memory_pool_config:
@@ -253,6 +255,7 @@ def _patch_cuda_graph_capture() -> None:
             from sglang.srt.distributed.device_communicators.pynccl_allocator import (
                 set_graph_pool_id,
             )
+
             from foundry.integration.sglang.graph_ops import (
                 initialize_all_attention_metadata,
                 load_all_graphs,
@@ -311,8 +314,13 @@ def _patch_cuda_graph_capture() -> None:
             real_init = attn_backend.init_forward_metadata_capture_cuda_graph
 
             def reuse_pre_pass_init(
-                bs, num_tokens, req_pool_indices, seq_lens,
-                encoder_lens, forward_mode, spec_info,
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                encoder_lens,
+                forward_mode,
+                spec_info,
             ):
                 # The pre-pass already allocated a wrapper for this
                 # bs and stored it in
@@ -334,14 +342,23 @@ def _patch_cuda_graph_capture() -> None:
                     wrappers = attn_backend.decode_cuda_graph_metadata.get(bs)
                     if wrappers is None:
                         return real_init(
-                            bs, num_tokens, req_pool_indices, seq_lens,
-                            encoder_lens, forward_mode, spec_info,
+                            bs,
+                            num_tokens,
+                            req_pool_indices,
+                            seq_lens,
+                            encoder_lens,
+                            forward_mode,
+                            spec_info,
                         )
                     seq_lens_sum = seq_lens.sum().item()
                     attn_backend.indices_updater_decode.update(
-                        req_pool_indices, seq_lens, seq_lens.cpu(),
-                        seq_lens_sum, decode_wrappers=wrappers,
-                        encoder_lens=encoder_lens, spec_info=spec_info,
+                        req_pool_indices,
+                        seq_lens,
+                        seq_lens.cpu(),
+                        seq_lens_sum,
+                        decode_wrappers=wrappers,
+                        encoder_lens=encoder_lens,
+                        spec_info=spec_info,
                         fixed_split_size=None,
                         disable_split_kv=attn_backend.disable_cuda_graph_kv_split,
                     )
@@ -355,8 +372,13 @@ def _patch_cuda_graph_capture() -> None:
                     wrappers = attn_backend.prefill_cuda_graph_metadata.get(bs)
                     if wrappers is None:
                         return real_init(
-                            bs, num_tokens, req_pool_indices, seq_lens,
-                            encoder_lens, forward_mode, spec_info,
+                            bs,
+                            num_tokens,
+                            req_pool_indices,
+                            seq_lens,
+                            encoder_lens,
+                            forward_mode,
+                            spec_info,
                         )
                     seq_lens_sum = seq_lens.sum().item()
                     use_ragged = forward_mode.is_dllm_extend()
@@ -365,23 +387,29 @@ def _patch_cuda_graph_capture() -> None:
                         if forward_mode.is_dllm_extend()
                         else None
                     )
-                    spec_info_arg = (
-                        None if forward_mode.is_dllm_extend() else spec_info
-                    )
+                    spec_info_arg = None if forward_mode.is_dllm_extend() else spec_info
                     attn_backend.indices_updater_prefill.update(
-                        req_pool_indices, seq_lens, seq_lens.cpu(),
-                        seq_lens_sum, prefix_lens=prefix_lens,
-                        prefill_wrappers=wrappers, use_ragged=use_ragged,
-                        encoder_lens=encoder_lens, spec_info=spec_info_arg,
+                        req_pool_indices,
+                        seq_lens,
+                        seq_lens.cpu(),
+                        seq_lens_sum,
+                        prefix_lens=prefix_lens,
+                        prefill_wrappers=wrappers,
+                        use_ragged=use_ragged,
+                        encoder_lens=encoder_lens,
+                        spec_info=spec_info_arg,
                     )
-                    attn_backend.forward_metadata = PrefillMetadata(
-                        wrappers, use_ragged, False
-                    )
+                    attn_backend.forward_metadata = PrefillMetadata(wrappers, use_ragged, False)
                     return
                 # Unknown mode — fall back to real init.
                 return real_init(
-                    bs, num_tokens, req_pool_indices, seq_lens,
-                    encoder_lens, forward_mode, spec_info,
+                    bs,
+                    num_tokens,
+                    req_pool_indices,
+                    seq_lens,
+                    encoder_lens,
+                    forward_mode,
+                    spec_info,
                 )
 
             attn_backend.init_forward_metadata_capture_cuda_graph = reuse_pre_pass_init

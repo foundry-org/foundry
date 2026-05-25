@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Graph capture / save / load mechanics.
 
-Ports ``capture_or_load_graph``, ``start_graph_builds``,
-``preload_all_graphs``, ``save_graph_manifest``, ``pack_fatbins`` and
-helpers from ``vllm-cge/vllm/compilation/graph_extension.py:794–1156``.
+Provides ``capture_or_load_graph``, ``start_graph_builds``,
+``save_graph_manifest``, ``pack_fatbins`` and helpers.
 
-The ``start_graph_builds`` call site has moved (audit fix): it is no
-longer called from ``EngineCore._initialize_kv_caches`` (which only
-worked under UniprocExecutor); it is called from
-``_load_model_with_cge_overlap`` in the worker process so it works
-across all executor types. See doc 05.
+LOAD uses per-graph finish: ``capture_or_load_graph`` calls
+``FoundryCUDAGraph.finish_one_graph_load(pending, index)`` for the
+current batch's identifier, so allocator-event replay interleaves with
+the upstream capture loop's between-capture work.
+
+``start_graph_builds`` is invoked from ``_load_model_with_overlap``
+in the worker process (not ``EngineCore._initialize_kv_caches``) so it
+works across all executor types. NVSHMEM has already been bootstrapped
+by the time we are called (see ``_patch_prepare_comm_buffer``).
 """
 
 from __future__ import annotations
@@ -17,18 +21,20 @@ from __future__ import annotations
 import os
 import re
 import time
-
-from vllm.logger import init_logger
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import BatchDescriptor
+from vllm.logger import init_logger
+from vllm.utils.torch_utils import weak_ref_tensors
 
 import foundry as foundry_pkg
-from foundry import ops as cge
+from foundry import ops as fops
 from foundry.graph import CUDAGraph as FoundryCUDAGraph
 from foundry.graph import graph as foundry_graph_ctx
-
 from foundry.integration.vllm.config import (
     CUDAGraphExtensionMode,
     get_config,
@@ -36,12 +42,8 @@ from foundry.integration.vllm.config import (
 )
 from foundry.integration.vllm.runtime import get_state
 
-from vllm.config import CUDAGraphMode
-from vllm.forward_context import BatchDescriptor
-from vllm.utils.torch_utils import weak_ref_tensors
-
 if TYPE_CHECKING:
-    from torch.cuda import _POOL_HANDLE
+    from torch.cuda import _POOL_HANDLE  # noqa: F401
 
 log = init_logger("vllm.foundry.graph_ops")
 
@@ -55,34 +57,34 @@ GraphIdentifier = tuple[CUDAGraphMode, BatchDescriptor, "int | None"]
 # ---------------------------------------------------------------------------
 
 
-def _build_graph_identifier(
-    runtime_mode: CUDAGraphMode,
-    batch_descriptor: BatchDescriptor,
-    piecewise_compile_index: "int | None",
-) -> GraphIdentifier:
-    return (runtime_mode, batch_descriptor, piecewise_compile_index)
+def _piecewise_index(runtime_mode: CUDAGraphMode, runnable: Callable) -> int | None:
+    """``piecewise_compile_index`` if this is a PIECEWISE batch, else None.
+
+    Used by both SAVE (when writing the per-graph filename) and LOAD (when
+    looking up the pre-built template index).
+    """
+    if runtime_mode != CUDAGraphMode.PIECEWISE:
+        return None
+    from vllm.compilation.piecewise_backend import PiecewiseBackend
+
+    assert isinstance(runnable, PiecewiseBackend), (
+        "For PIECEWISE mode, runnable must be PiecewiseBackend"
+    )
+    return runnable.piecewise_compile_index
 
 
 def _build_graph_filename(
     index: int,
     runtime_mode: CUDAGraphMode,
     batch_descriptor: BatchDescriptor,
-    piecewise_compile_index: "int | None",
+    piecewise_compile_index: int | None,
 ) -> str:
     mode = runtime_mode.name
     tokens = batch_descriptor.num_tokens
-    reqs = (
-        batch_descriptor.num_reqs
-        if batch_descriptor.num_reqs is not None
-        else "N"
-    )
+    reqs = batch_descriptor.num_reqs if batch_descriptor.num_reqs is not None else "N"
     uniform = "U" if batch_descriptor.uniform else "X"
     lora = "L" if batch_descriptor.has_lora else "X"
-    pc = (
-        piecewise_compile_index
-        if piecewise_compile_index is not None
-        else "N"
-    )
+    pc = piecewise_compile_index if piecewise_compile_index is not None else "N"
     return f"graph_{index}_{mode}_t{tokens}_r{reqs}_{uniform}{lora}_pc{pc}.json"
 
 
@@ -93,7 +95,7 @@ _GRAPH_FILENAME_RE = re.compile(
 
 def _parse_graph_filename(
     filename: str,
-) -> "tuple[int, CUDAGraphMode, BatchDescriptor, int | None] | None":
+) -> tuple[int, CUDAGraphMode, BatchDescriptor, int | None] | None:
     m = _GRAPH_FILENAME_RE.match(filename)
     if not m:
         return None
@@ -123,9 +125,9 @@ def capture_or_load_graph(
     runnable: Callable,
     weak_ref_output: bool,
     runtime_mode: CUDAGraphMode,
-    graph_pool: "_POOL_HANDLE",
+    graph_pool: _POOL_HANDLE,
     runnable_args: tuple = (),
-    runnable_kwargs: "dict | None" = None,
+    runnable_kwargs: dict | None = None,
 ):
     """Capture (NONE/SAVE) or look up (LOAD) a CUDA graph for one batch.
 
@@ -135,9 +137,9 @@ def capture_or_load_graph(
     if runnable_kwargs is None:
         runnable_kwargs = {}
 
-    cge_mode = get_graph_extension_mode()
+    mode = get_graph_extension_mode()
 
-    if cge_mode == CUDAGraphExtensionMode.NONE:
+    if mode == CUDAGraphExtensionMode.NONE:
         cudagraph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(cudagraph, pool=graph_pool):
             output = runnable(*runnable_args, **runnable_kwargs)
@@ -150,16 +152,9 @@ def capture_or_load_graph(
     if cfg is None or state is None:
         raise RuntimeError("Graph extension is not initialized")
 
-    if cge_mode == CUDAGraphExtensionMode.SAVE:
-        from vllm.compilation.piecewise_backend import PiecewiseBackend
+    piecewise_compile_index = _piecewise_index(runtime_mode, runnable)
 
-        piecewise_compile_index: "int | None" = None
-        if runtime_mode == CUDAGraphMode.PIECEWISE:
-            assert isinstance(runnable, PiecewiseBackend), (
-                "For PIECEWISE mode, runnable must be PiecewiseBackend"
-            )
-            piecewise_compile_index = runnable.piecewise_compile_index
-
+    if mode == CUDAGraphExtensionMode.SAVE:
         graph = FoundryCUDAGraph()
         with foundry_graph_ctx(graph, pool=graph_pool):
             output = runnable(*runnable_args, **runnable_kwargs)
@@ -182,44 +177,57 @@ def capture_or_load_graph(
             output = weak_ref_tensors(output)
         return graph, output
 
-    elif cge_mode == CUDAGraphExtensionMode.LOAD:
-        from vllm.compilation.piecewise_backend import PiecewiseBackend
-
-        piecewise_compile_index = None
-        if runtime_mode == CUDAGraphMode.PIECEWISE:
-            assert isinstance(runnable, PiecewiseBackend), (
-                "For PIECEWISE mode, runnable must be PiecewiseBackend"
-            )
-            piecewise_compile_index = runnable.piecewise_compile_index
-
-        identifier = _build_graph_identifier(
-            runtime_mode, batch_descriptor, piecewise_compile_index
+    if mode == CUDAGraphExtensionMode.LOAD:
+        identifier: GraphIdentifier = (
+            runtime_mode,
+            batch_descriptor,
+            piecewise_compile_index,
         )
-        if identifier not in state.loaded_graphs:
+        if _pending_graph_builds is None:
             raise RuntimeError(
-                f"Graph not found in preloaded graphs: {identifier}"
+                "capture_or_load_graph called on LOAD but no pending graph "
+                "builds — was start_graph_builds() called first?"
             )
-        graph, output = state.loaded_graphs[identifier]
+        index = _pending_graph_builds.identifier_to_index.get(identifier)
+        if index is None:
+            raise RuntimeError(f"Graph identifier not in pending builds: {identifier}")
+        graph, output = FoundryCUDAGraph.finish_one_graph_load(_pending_graph_builds.pending, index)
+        # Strong-reference the (graph, output) pair. The upstream
+        # CUDAGraphWrapper stores `entry.output = weak_ref_tensors(output)`,
+        # so without this dict the VMM-backed output tensors get GC'd between
+        # captures and the next replay writes to freed memory → CUDA illegal
+        # memory access. Don't drop this line.
+        state.loaded_graphs[identifier] = (graph, output)
         return graph, output
 
-    else:
-        raise RuntimeError(
-            f"capture_or_load_graph called with mode {cge_mode}, "
-            "expected NONE, SAVE, or LOAD"
-        )
+    raise RuntimeError(
+        f"capture_or_load_graph called with mode {mode}, expected NONE, SAVE, or LOAD"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Two-phase LOAD pipeline: start_graph_builds + preload_all_graphs
+# LOAD pipeline: start_graph_builds (background) → per-graph finish on demand
+#
+# capture_or_load_graph calls finish_one_graph_load(pending, index) per
+# batch as the patched capture_model's loop walks them. This keeps the
+# foundry VMM cursor on LOAD walking the same trajectory it did on SAVE:
+# allocations between captures (attention metadata, dummy inputs) happen
+# on both sides in the same order, interleaved with replayed graph events.
 # ---------------------------------------------------------------------------
 
 
-_pending_graph_builds: tuple | None = None
+@dataclass
+class _PendingGraphBuilds:
+    pending: object  # opaque PendingGraphLoads handle from C++
+    identifier_to_index: dict[GraphIdentifier, int]
+
+
+_pending_graph_builds: _PendingGraphBuilds | None = None
 
 
 def _scan_graph_files(
     workspace_dir: str,
-) -> "list[tuple[int, str, tuple]]":
+) -> list[tuple[int, str, tuple]]:
     """Return (index, filename, (mode, batch_descriptor, pc)) per graph file,
     sorted by index. Only the encoded-filename format is accepted — SAVE
     always writes that format, and LOAD never needs to read the JSON body."""
@@ -239,9 +247,19 @@ def _scan_graph_files(
 def start_graph_builds() -> None:
     """Phase 1: kick off background template builds.
 
-    Called from ``_load_model_with_cge_overlap`` (worker process) on
-    LOAD, after ``preallocate_for_load_mode`` for dense, or after
-    NVSHMEM init + preallocate for EP.
+    Called from ``_load_model_with_overlap`` (worker process) on LOAD,
+    AFTER ``do_original_load()`` completes. Background threads build
+    cuGraph templates and prepare on-demand graphs concurrently with
+    everything that happens between weight load and ``capture_model``
+    (KV cache init etc). Running template builds in parallel with the
+    weight load itself was tried earlier and dropped: it slowed weight
+    load down (driver contention) without recovering meaningful time
+    on the template side.
+
+    By the time we are called, NVSHMEM is already bootstrapped — the
+    DeepEP Buffer creation inside ``prepare_communication_buffer_for_model``
+    runs inside ``do_original_load`` and ``_patch_prepare_comm_buffer``'s
+    post-orig hook has flushed ``init_nvshmem_for_loaded_modules``.
     """
     global _pending_graph_builds
     cfg = get_config()
@@ -256,87 +274,33 @@ def start_graph_builds() -> None:
         return
 
     graph_files = _scan_graph_files(workspace_dir)
-    json_paths = [
-        os.path.join(workspace_dir, filename) for _, filename, _ in graph_files
-    ]
+    json_paths = [os.path.join(workspace_dir, filename) for _, filename, _ in graph_files]
     if not json_paths:
         return
 
     num_threads = 4
     s = time.perf_counter()
     log.info(
-        "[CGE] Starting early graph builds (%d graphs, %d threads)",
+        "[foundry] Starting early graph builds (%d graphs, %d threads)",
         len(json_paths),
         num_threads,
     )
-    pending = FoundryCUDAGraph.start_graph_builds(
-        json_paths, num_threads=num_threads
-    )
-    e = time.perf_counter()
+    pending = FoundryCUDAGraph.start_graph_builds(json_paths, num_threads=num_threads)
     log.info(
-        "[CGE] start_graph_builds returned in %.3fs (building in background)",
-        e - s,
-    )
-    _pending_graph_builds = (pending, graph_files)
-
-
-def preload_all_graphs(
-    graph_pool: "_POOL_HANDLE | None" = None,
-) -> None:
-    """Phase 2: NVSHMEM init for loaded modules, then finish_graph_loads.
-
-    Called from the patched ``capture_model`` on LOAD. Populates
-    ``state.loaded_graphs`` so ``capture_or_load_graph`` can satisfy
-    inference-time lookups.
-    """
-    global _pending_graph_builds
-    cfg = get_config()
-    state = get_state()
-    if cfg is None or state is None:
-        raise RuntimeError("Graph extension is not initialized")
-
-    workspace_dir = cfg.workspace_dir
-    if workspace_dir is None:
-        raise RuntimeError("Workspace directory is not set")
-
-    # Init NVSHMEM for any modules pending init from load_cuda_modules.
-    t = time.perf_counter()
-    n = cge.init_nvshmem_for_loaded_modules()
-    log.info(
-        "[CGE TIMING] init_nvshmem_for_loaded_modules: %.3f s (%d modules)",
-        time.perf_counter() - t,
-        n,
+        "[foundry] start_graph_builds returned in %.3fs (building in background)",
+        time.perf_counter() - s,
     )
 
-    if _pending_graph_builds is None:
-        log.warning(
-            "[CGE] preload_all_graphs called but no pending graph builds. "
-            "Was start_graph_builds() called first?"
-        )
-        return
+    # Parsed-filename metadata is already in (runtime_mode, batch_descriptor,
+    # piecewise_compile_index) shape — the same shape as the runtime identifier
+    # built inside capture_or_load_graph — so just reuse it directly.
+    identifier_to_index: dict[GraphIdentifier, int] = {
+        metadata: i for i, (_index, _filename, metadata) in enumerate(graph_files)
+    }
 
-    pending, graph_files = _pending_graph_builds
-    _pending_graph_builds = None
-
-    s = time.perf_counter()
-    load_results = FoundryCUDAGraph.finish_graph_loads(pending)
-    e = time.perf_counter()
-    log.info(
-        "[CGE] finish_graph_loads completed in %.3fs (%d graphs)",
-        e - s,
-        len(load_results),
-    )
-
-    for i, (_index, _filename, metadata) in enumerate(graph_files):
-        graph, output = load_results[i]
-        runtime_mode, batch_descriptor, piecewise_compile_index = metadata
-        identifier = _build_graph_identifier(
-            runtime_mode, batch_descriptor, piecewise_compile_index
-        )
-        state.loaded_graphs[identifier] = (graph, output)
-
-    log.info(
-        "Preloaded %d CUDA graphs from %s", len(graph_files), workspace_dir
+    _pending_graph_builds = _PendingGraphBuilds(
+        pending=pending,
+        identifier_to_index=identifier_to_index,
     )
 
 
@@ -356,5 +320,5 @@ def pack_fatbins() -> None:
     cfg = get_config()
     if cfg is None or cfg.workspace_dir is None:
         raise RuntimeError("Graph extension is not initialized")
-    cge.pack_fatbins_to_folder(cfg.workspace_dir)
-    cge.set_pack_fatbins_on_exit(False)
+    fops.pack_fatbins_to_folder(cfg.workspace_dir)
+    fops.set_pack_fatbins_on_exit(False)

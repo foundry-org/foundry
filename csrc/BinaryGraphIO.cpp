@@ -12,14 +12,13 @@
 
 namespace foundry {
 
-void CUDAGraph::save_binary(const std::string& bin_path,
-                            const boost::json::object& root) {
+void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::object& root) {
   namespace json = boost::json;
   namespace bf = binary_format;
 
   const json::array& nodes_array = root.at("nodes").as_array();
-  const json::array& deps_array = root.contains("dependencies")
-      ? root.at("dependencies").as_array() : json::array{};
+  const json::array& deps_array =
+      root.contains("dependencies") ? root.at("dependencies").as_array() : json::array{};
   const json::array& generators_array = root.at("generators").as_array();
 
   // ---- Build string table (deduplicated function names) ----
@@ -27,7 +26,8 @@ void CUDAGraph::save_binary(const std::string& bin_path,
   std::unordered_map<std::string, uint32_t> string_offsets;
   auto intern_string = [&](const std::string& s) -> uint32_t {
     auto it = string_offsets.find(s);
-    if (it != string_offsets.end()) return it->second;
+    if (it != string_offsets.end())
+      return it->second;
     uint32_t offset = static_cast<uint32_t>(string_table.size());
     string_table.insert(string_table.end(), s.begin(), s.end());
     string_table.push_back('\0');
@@ -35,8 +35,8 @@ void CUDAGraph::save_binary(const std::string& bin_path,
     return offset;
   };
 
-  std::string topology_key = root.contains("topology_key")
-      ? std::string(root.at("topology_key").as_string()) : "";
+  std::string topology_key =
+      root.contains("topology_key") ? std::string(root.at("topology_key").as_string()) : "";
 
   // ---- Build node entries and param data ----
   std::vector<bf::BinNodeEntry> node_entries;
@@ -54,8 +54,7 @@ void CUDAGraph::save_binary(const std::string& bin_path,
   };
 
   // Helper to parse kernel_node_attrs flags from JSON
-  auto parse_kna_flags = [](const json::object& kna,
-                            bf::BinKernelNode& k) {
+  auto parse_kna_flags = [](const json::object& kna, bf::BinKernelNode& k) {
     k.kna_flags = 0;
     if (kna.contains("attrQueryAvailable")) {
       k.kna_flags |= bf::KNA_ATTR_QUERY_AVAILABLE;
@@ -75,7 +74,8 @@ void CUDAGraph::save_binary(const std::string& bin_path,
     }
     if (kna.contains("clusterSchedulingPolicyPreference")) {
       k.kna_flags |= bf::KNA_CLUSTER_SCHEDULING;
-      k.kna_clusterSchedulingPolicy = kna.at("clusterSchedulingPolicyPreference").to_number<int32_t>();
+      k.kna_clusterSchedulingPolicy =
+          kna.at("clusterSchedulingPolicyPreference").to_number<int32_t>();
     }
     if (kna.contains("cooperative")) {
       k.kna_flags |= bf::KNA_COOPERATIVE;
@@ -91,8 +91,10 @@ void CUDAGraph::save_binary(const std::string& bin_path,
     }
     if (kna.contains("memSyncDomainMapDefault")) {
       k.kna_flags |= bf::KNA_MEM_SYNC_DOMAIN_MAP;
-      k.kna_memSyncDomainMapDefault = static_cast<uint8_t>(kna.at("memSyncDomainMapDefault").to_number<int>());
-      k.kna_memSyncDomainMapRemote = static_cast<uint8_t>(kna.at("memSyncDomainMapRemote").to_number<int>());
+      k.kna_memSyncDomainMapDefault =
+          static_cast<uint8_t>(kna.at("memSyncDomainMapDefault").to_number<int>());
+      k.kna_memSyncDomainMapRemote =
+          static_cast<uint8_t>(kna.at("memSyncDomainMapRemote").to_number<int>());
     }
     if (kna.contains("preferredSharedMemCarveout")) {
       k.kna_flags |= bf::KNA_SHARED_MEM_CARVEOUT;
@@ -154,16 +156,23 @@ void CUDAGraph::save_binary(const std::string& bin_path,
       // func_attrs
       if (p.contains("func_attrs")) {
         const json::object& fa = p.at("func_attrs").as_object();
-        k.max_dynamic_shared_size_bytes = fa.at("max_dynamic_shared_size_bytes").to_number<int32_t>();
-        k.preferred_shared_memory_carveout = fa.at("preferred_shared_memory_carveout").to_number<int32_t>();
-        k.cluster_scheduling_policy_preference = fa.contains("cluster_scheduling_policy_preference")
-            ? fa.at("cluster_scheduling_policy_preference").to_number<int32_t>() : 0;
+        k.max_dynamic_shared_size_bytes =
+            fa.at("max_dynamic_shared_size_bytes").to_number<int32_t>();
+        k.preferred_shared_memory_carveout =
+            fa.at("preferred_shared_memory_carveout").to_number<int32_t>();
+        k.cluster_scheduling_policy_preference =
+            fa.contains("cluster_scheduling_policy_preference")
+                ? fa.at("cluster_scheduling_policy_preference").to_number<int32_t>()
+                : 0;
         k.required_cluster_width = fa.contains("required_cluster_width")
-            ? fa.at("required_cluster_width").to_number<int32_t>() : 0;
+                                       ? fa.at("required_cluster_width").to_number<int32_t>()
+                                       : 0;
         k.required_cluster_height = fa.contains("required_cluster_height")
-            ? fa.at("required_cluster_height").to_number<int32_t>() : 0;
+                                        ? fa.at("required_cluster_height").to_number<int32_t>()
+                                        : 0;
         k.required_cluster_depth = fa.contains("required_cluster_depth")
-            ? fa.at("required_cluster_depth").to_number<int32_t>() : 0;
+                                       ? fa.at("required_cluster_depth").to_number<int32_t>()
+                                       : 0;
       }
 
       // kernel_node_attrs (per-node overrides)
@@ -195,7 +204,8 @@ void CUDAGraph::save_binary(const std::string& bin_path,
 
       // Extra arg buffer
       const std::string extra_hex(p.contains("extra_argBuffer_hex")
-          ? std::string(p.at("extra_argBuffer_hex").as_string()) : "");
+                                      ? std::string(p.at("extra_argBuffer_hex").as_string())
+                                      : "");
       if (!extra_hex.empty()) {
         k.arg_buffer_offset = static_cast<uint32_t>(arg_buffer_data.size());
         k.arg_buffer_size = static_cast<uint32_t>(extra_hex.size() / 2);
@@ -268,18 +278,15 @@ void CUDAGraph::save_binary(const std::string& bin_path,
   gens.reserve(generators_array.size());
   for (const auto& gen_val : generators_array) {
     const json::object& g = gen_val.as_object();
-    gens.push_back({
-      g.at("id").to_number<uint64_t>(),
-      g.at("seed").to_number<uint64_t>(),
-      g.at("wholegraph_increment").to_number<uint64_t>()
-    });
+    gens.push_back({g.at("id").to_number<uint64_t>(), g.at("seed").to_number<uint64_t>(),
+                    g.at("wholegraph_increment").to_number<uint64_t>()});
   }
 
   // ---- JSON sections (allocator_events, output_tensors) ----
-  std::string alloc_events_json = root.contains("allocator_events")
-      ? json::serialize(root.at("allocator_events")) : "";
-  std::string output_tensors_json = root.contains("output_tensors")
-      ? json::serialize(root.at("output_tensors")) : "";
+  std::string alloc_events_json =
+      root.contains("allocator_events") ? json::serialize(root.at("allocator_events")) : "";
+  std::string output_tensors_json =
+      root.contains("output_tensors") ? json::serialize(root.at("output_tensors")) : "";
 
   // ---- Compute layout ----
   uint32_t num_sections = bf::SECTION_COUNT;
@@ -300,7 +307,8 @@ void CUDAGraph::save_binary(const std::string& bin_path,
   place_section(bf::SECTION_KERNEL_PARAM_INDEX, param_index.size() * sizeof(bf::BinParamEntry));
   place_section(bf::SECTION_KERNEL_PARAM_DATA, param_data.size());
   place_section(bf::SECTION_ARG_BUFFER_DATA, arg_buffer_data.size());
-  place_section(bf::SECTION_COMMON_KERNEL_ATTRS, has_common_attrs ? sizeof(bf::BinCommonKernelAttrs) : 0);
+  place_section(bf::SECTION_COMMON_KERNEL_ATTRS,
+                has_common_attrs ? sizeof(bf::BinCommonKernelAttrs) : 0);
   place_section(bf::SECTION_GENERATORS_TABLE, gens.size() * sizeof(bf::BinGenerator));
   place_section(bf::SECTION_ALLOCATOR_EVENTS, alloc_events_json.size());
   place_section(bf::SECTION_OUTPUT_TENSORS, output_tensors_json.size());
@@ -309,7 +317,7 @@ void CUDAGraph::save_binary(const std::string& bin_path,
   // ---- Write ----
   std::ofstream out(bin_path, std::ios::binary);
   if (!out.is_open()) {
-    fprintf(stderr, "[CGE] WARNING: Failed to write binary graph: %s\n", bin_path.c_str());
+    fprintf(stderr, "[foundry] WARNING: Failed to write binary graph: %s\n", bin_path.c_str());
     return;
   }
 
@@ -317,11 +325,16 @@ void CUDAGraph::save_binary(const std::string& bin_path,
   memcpy(header.magic, bf::MAGIC, 8);
   header.version = bf::FORMAT_VERSION;
   header.flags = 0;
-  if (has_common_attrs) header.flags |= bf::FLAG_HAS_COMMON_KERNEL_ATTRS;
-  if (!deps.empty()) header.flags |= bf::FLAG_HAS_DEPENDENCIES;
-  if (!alloc_events_json.empty()) header.flags |= bf::FLAG_HAS_ALLOCATOR_EVENTS;
-  if (!output_tensors_json.empty()) header.flags |= bf::FLAG_HAS_OUTPUT_TENSORS;
-  if (!gens.empty()) header.flags |= bf::FLAG_HAS_GENERATORS;
+  if (has_common_attrs)
+    header.flags |= bf::FLAG_HAS_COMMON_KERNEL_ATTRS;
+  if (!deps.empty())
+    header.flags |= bf::FLAG_HAS_DEPENDENCIES;
+  if (!alloc_events_json.empty())
+    header.flags |= bf::FLAG_HAS_ALLOCATOR_EVENTS;
+  if (!output_tensors_json.empty())
+    header.flags |= bf::FLAG_HAS_OUTPUT_TENSORS;
+  if (!gens.empty())
+    header.flags |= bf::FLAG_HAS_GENERATORS;
   header.num_nodes = static_cast<uint32_t>(node_entries.size());
   header.num_dependencies = static_cast<uint32_t>(deps.size());
   header.num_generators = static_cast<uint32_t>(gens.size());
@@ -332,7 +345,8 @@ void CUDAGraph::save_binary(const std::string& bin_path,
   out.write(reinterpret_cast<const char*>(sections), sizeof(sections));
 
   auto write_padded = [&](const void* data, size_t size) {
-    if (size > 0) out.write(static_cast<const char*>(data), size);
+    if (size > 0)
+      out.write(static_cast<const char*>(data), size);
     size_t pad = ((size + 7) & ~7ULL) - size;
     if (pad > 0) {
       static const char zeros[8] = {};
@@ -346,7 +360,8 @@ void CUDAGraph::save_binary(const std::string& bin_path,
   write_padded(param_index.data(), param_index.size() * sizeof(bf::BinParamEntry));
   write_padded(param_data.data(), param_data.size());
   write_padded(arg_buffer_data.data(), arg_buffer_data.size());
-  if (has_common_attrs) write_padded(&common_attrs, sizeof(common_attrs));
+  if (has_common_attrs)
+    write_padded(&common_attrs, sizeof(common_attrs));
   write_padded(gens.data(), gens.size() * sizeof(bf::BinGenerator));
   write_padded(alloc_events_json.data(), alloc_events_json.size());
   write_padded(output_tensors_json.data(), output_tensors_json.size());
@@ -367,7 +382,8 @@ boost::json::value read_and_parse_binary_graph(const std::string& bin_path) {
 
   // Read entire file
   std::ifstream in(bin_path, std::ios::binary | std::ios::ate);
-  if (!in.is_open()) return json::value{};
+  if (!in.is_open())
+    return json::value{};
 
   size_t file_size = in.tellg();
   in.seekg(0);
@@ -378,13 +394,15 @@ boost::json::value read_and_parse_binary_graph(const std::string& bin_path) {
   const uint8_t* data = buf.data();
 
   // Validate header
-  if (file_size < sizeof(bf::FileHeader)) return json::value{};
+  if (file_size < sizeof(bf::FileHeader))
+    return json::value{};
   const bf::FileHeader& header = *reinterpret_cast<const bf::FileHeader*>(data);
-  if (!bf::validate_header(header)) return json::value{};
+  if (!bf::validate_header(header))
+    return json::value{};
 
   // Read section directory
-  const bf::SectionEntry* sections = reinterpret_cast<const bf::SectionEntry*>(
-      data + sizeof(bf::FileHeader));
+  const bf::SectionEntry* sections =
+      reinterpret_cast<const bf::SectionEntry*>(data + sizeof(bf::FileHeader));
 
   auto section = [&](bf::SectionType type) -> std::pair<const uint8_t*, size_t> {
     const auto& s = sections[type];
@@ -472,131 +490,131 @@ boost::json::value read_and_parse_binary_graph(const std::string& bin_path) {
     node_obj["id"] = entry.node_id;
 
     switch (entry.type) {
-    case bf::NODE_KERNEL: {
-      node_obj["type"] = "KernelNode";
-      const auto& k = entry.kernel;
-      json::object params;
+      case bf::NODE_KERNEL: {
+        node_obj["type"] = "KernelNode";
+        const auto& k = entry.kernel;
+        json::object params;
 
-      params["blockDimX"] = k.blockDimX;
-      params["blockDimY"] = k.blockDimY;
-      params["blockDimZ"] = k.blockDimZ;
-      params["gridDimX"] = k.gridDimX;
-      params["gridDimY"] = k.gridDimY;
-      params["gridDimZ"] = k.gridDimZ;
-      params["sharedMemBytes"] = k.sharedMemBytes;
+        params["blockDimX"] = k.blockDimX;
+        params["blockDimY"] = k.blockDimY;
+        params["blockDimZ"] = k.blockDimZ;
+        params["gridDimX"] = k.gridDimX;
+        params["gridDimY"] = k.gridDimY;
+        params["gridDimZ"] = k.gridDimZ;
+        params["sharedMemBytes"] = k.sharedMemBytes;
 
-      params["function_name"] = get_string(k.function_name_offset, k.function_name_length);
-      params["kernel_source_binary_hash"] = k.binary_hash;
+        params["function_name"] = get_string(k.function_name_offset, k.function_name_length);
+        params["kernel_source_binary_hash"] = k.binary_hash;
 
-      // func_attrs
-      json::object func_attrs;
-      func_attrs["max_dynamic_shared_size_bytes"] = k.max_dynamic_shared_size_bytes;
-      func_attrs["preferred_shared_memory_carveout"] = k.preferred_shared_memory_carveout;
-      func_attrs["cluster_scheduling_policy_preference"] = k.cluster_scheduling_policy_preference;
-      func_attrs["required_cluster_width"] = k.required_cluster_width;
-      func_attrs["required_cluster_height"] = k.required_cluster_height;
-      func_attrs["required_cluster_depth"] = k.required_cluster_depth;
-      params["func_attrs"] = func_attrs;
+        // func_attrs
+        json::object func_attrs;
+        func_attrs["max_dynamic_shared_size_bytes"] = k.max_dynamic_shared_size_bytes;
+        func_attrs["preferred_shared_memory_carveout"] = k.preferred_shared_memory_carveout;
+        func_attrs["cluster_scheduling_policy_preference"] = k.cluster_scheduling_policy_preference;
+        func_attrs["required_cluster_width"] = k.required_cluster_width;
+        func_attrs["required_cluster_height"] = k.required_cluster_height;
+        func_attrs["required_cluster_depth"] = k.required_cluster_depth;
+        params["func_attrs"] = func_attrs;
 
-      // kernel_node_attrs
-      params["kernel_node_attrs"] = build_kna_json(k);
+        // kernel_node_attrs
+        params["kernel_node_attrs"] = build_kna_json(k);
 
-      // Kernel params
-      json::array kp_array;
-      const bf::BinParamEntry* param_entries = reinterpret_cast<const bf::BinParamEntry*>(
-          pi_data + k.param_index_offset);
+        // Kernel params
+        json::array kp_array;
+        const bf::BinParamEntry* param_entries =
+            reinterpret_cast<const bf::BinParamEntry*>(pi_data + k.param_index_offset);
 
-      if (k.arg_buffer_offset != 0xFFFFFFFF) {
-        // Extra-style params (metadata only, data in arg buffer)
-        for (uint32_t j = 0; j < k.num_params; j++) {
-          json::object kp;
-          kp["index"] = (int)j;
-          kp["offset"] = param_entries[j].data_offset;
-          kp["size"] = param_entries[j].size;
-          kp_array.push_back(kp);
+        if (k.arg_buffer_offset != 0xFFFFFFFF) {
+          // Extra-style params (metadata only, data in arg buffer)
+          for (uint32_t j = 0; j < k.num_params; j++) {
+            json::object kp;
+            kp["index"] = (int)j;
+            kp["offset"] = param_entries[j].data_offset;
+            kp["size"] = param_entries[j].size;
+            kp_array.push_back(kp);
+          }
+
+          // Reconstruct extra_argBuffer_hex from binary
+          params["extra_argBuffer_hex"] =
+              hex_encode(ab_data + k.arg_buffer_offset, k.arg_buffer_size);
+
+          json::array extra;
+          extra.push_back("CU_LAUNCH_PARAM_BUFFER_POINTER");
+          extra.push_back("null");
+          extra.push_back("CU_LAUNCH_PARAM_BUFFER_SIZE");
+          extra.push_back((uint64_t)k.arg_buffer_size);
+          extra.push_back("CU_LAUNCH_PARAM_END");
+          params["extra"] = extra;
+        } else {
+          // Per-param hex data style
+          for (uint32_t j = 0; j < k.num_params; j++) {
+            json::object kp;
+            kp["index"] = (int)j;
+            kp["offset"] = param_entries[j].data_offset;
+            kp["size"] = param_entries[j].size;
+            kp["value_hex"] =
+                hex_encode(pd_data + param_entries[j].data_offset, param_entries[j].size);
+            kp_array.push_back(kp);
+          }
+          params["extra"] = json::array{};
+          params["extra_argBuffer_hex"] = "";
         }
+        params["kernelParams"] = kp_array;
 
-        // Reconstruct extra_argBuffer_hex from binary
-        params["extra_argBuffer_hex"] = hex_encode(
-            ab_data + k.arg_buffer_offset, k.arg_buffer_size);
-
-        json::array extra;
-        extra.push_back("CU_LAUNCH_PARAM_BUFFER_POINTER");
-        extra.push_back("null");
-        extra.push_back("CU_LAUNCH_PARAM_BUFFER_SIZE");
-        extra.push_back((uint64_t)k.arg_buffer_size);
-        extra.push_back("CU_LAUNCH_PARAM_END");
-        params["extra"] = extra;
-      } else {
-        // Per-param hex data style
-        for (uint32_t j = 0; j < k.num_params; j++) {
-          json::object kp;
-          kp["index"] = (int)j;
-          kp["offset"] = param_entries[j].data_offset;
-          kp["size"] = param_entries[j].size;
-          kp["value_hex"] = hex_encode(
-              pd_data + param_entries[j].data_offset, param_entries[j].size);
-          kp_array.push_back(kp);
-        }
-        params["extra"] = json::array{};
-        params["extra_argBuffer_hex"] = "";
+        node_obj["params"] = params;
+        break;
       }
-      params["kernelParams"] = kp_array;
-
-      node_obj["params"] = params;
-      break;
-    }
-    case bf::NODE_MEMCPY: {
-      node_obj["type"] = "MemcpyNode";
-      const auto& m = entry.memcpy;
-      json::object params;
-      params["Depth"] = m.Depth;
-      params["Height"] = m.Height;
-      params["WidthInBytes"] = m.WidthInBytes;
-      params["dstDevice"] = m.dstDevice;
-      params["dstHeight"] = m.dstHeight;
-      params["dstLOD"] = m.dstLOD;
-      params["dstMemoryType"] = m.dstMemoryType;
-      params["dstPitch"] = m.dstPitch;
-      params["dstXInBytes"] = m.dstXInBytes;
-      params["dstY"] = m.dstY;
-      params["dstZ"] = m.dstZ;
-      params["srcDevice"] = m.srcDevice;
-      params["srcHeight"] = m.srcHeight;
-      params["srcLOD"] = m.srcLOD;
-      params["srcMemoryType"] = m.srcMemoryType;
-      params["srcPitch"] = m.srcPitch;
-      params["srcXInBytes"] = m.srcXInBytes;
-      params["srcY"] = m.srcY;
-      params["srcZ"] = m.srcZ;
-      node_obj["params"] = params;
-      break;
-    }
-    case bf::NODE_MEMSET: {
-      node_obj["type"] = "MemsetNode";
-      const auto& m = entry.memset;
-      json::object params;
-      params["dst"] = m.dst;
-      params["elementSize"] = m.elementSize;
-      params["height"] = m.height;
-      params["pitch"] = m.pitch;
-      params["value"] = m.value;
-      params["width"] = m.width;
-      node_obj["params"] = params;
-      break;
-    }
-    case bf::NODE_EVENT_RECORD:
-      node_obj["type"] = "EventRecordNode";
-      node_obj["params"] = json::object{{"event_id", entry.event.event_id}};
-      break;
-    case bf::NODE_EVENT_WAIT:
-      node_obj["type"] = "EventWaitNode";
-      node_obj["params"] = json::object{{"event_id", entry.event.event_id}};
-      break;
-    case bf::NODE_EMPTY:
-      node_obj["type"] = "EmptyNode";
-      node_obj["params"] = json::object{};
-      break;
+      case bf::NODE_MEMCPY: {
+        node_obj["type"] = "MemcpyNode";
+        const auto& m = entry.memcpy;
+        json::object params;
+        params["Depth"] = m.Depth;
+        params["Height"] = m.Height;
+        params["WidthInBytes"] = m.WidthInBytes;
+        params["dstDevice"] = m.dstDevice;
+        params["dstHeight"] = m.dstHeight;
+        params["dstLOD"] = m.dstLOD;
+        params["dstMemoryType"] = m.dstMemoryType;
+        params["dstPitch"] = m.dstPitch;
+        params["dstXInBytes"] = m.dstXInBytes;
+        params["dstY"] = m.dstY;
+        params["dstZ"] = m.dstZ;
+        params["srcDevice"] = m.srcDevice;
+        params["srcHeight"] = m.srcHeight;
+        params["srcLOD"] = m.srcLOD;
+        params["srcMemoryType"] = m.srcMemoryType;
+        params["srcPitch"] = m.srcPitch;
+        params["srcXInBytes"] = m.srcXInBytes;
+        params["srcY"] = m.srcY;
+        params["srcZ"] = m.srcZ;
+        node_obj["params"] = params;
+        break;
+      }
+      case bf::NODE_MEMSET: {
+        node_obj["type"] = "MemsetNode";
+        const auto& m = entry.memset;
+        json::object params;
+        params["dst"] = m.dst;
+        params["elementSize"] = m.elementSize;
+        params["height"] = m.height;
+        params["pitch"] = m.pitch;
+        params["value"] = m.value;
+        params["width"] = m.width;
+        node_obj["params"] = params;
+        break;
+      }
+      case bf::NODE_EVENT_RECORD:
+        node_obj["type"] = "EventRecordNode";
+        node_obj["params"] = json::object{{"event_id", entry.event.event_id}};
+        break;
+      case bf::NODE_EVENT_WAIT:
+        node_obj["type"] = "EventWaitNode";
+        node_obj["params"] = json::object{{"event_id", entry.event.event_id}};
+        break;
+      case bf::NODE_EMPTY:
+        node_obj["type"] = "EmptyNode";
+        node_obj["params"] = json::object{};
+        break;
     }
 
     nodes_array.push_back(std::move(node_obj));
@@ -694,10 +712,12 @@ BinaryGraphFile read_binary_graph_file(const std::string& bin_path) {
   BinaryGraphFile result;
 
   std::ifstream in(bin_path, std::ios::binary | std::ios::ate);
-  if (!in.is_open()) return result;
+  if (!in.is_open())
+    return result;
 
   size_t file_size = in.tellg();
-  if (file_size < sizeof(bf::FileHeader)) return result;
+  if (file_size < sizeof(bf::FileHeader))
+    return result;
 
   in.seekg(0);
   result.data.resize(file_size);
@@ -710,10 +730,10 @@ BinaryGraphFile read_binary_graph_file(const std::string& bin_path) {
     return result;
   }
 
-  result.sections = reinterpret_cast<const bf::SectionEntry*>(
-      result.data.data() + sizeof(bf::FileHeader));
+  result.sections =
+      reinterpret_cast<const bf::SectionEntry*>(result.data.data() + sizeof(bf::FileHeader));
 
   return result;
 }
 
-} // namespace foundry
+}  // namespace foundry

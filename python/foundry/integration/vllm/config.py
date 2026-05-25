@@ -1,21 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Foundry vLLM-integration configuration.
 
-Ports ``CUDAGraphExtensionMode``, ``CUDAGraphExtensionConfig``,
-``load_graph_extension_config``, and the rank-computation helper from
-``vllm-cge/vllm/compilation/graph_extension.py:365–513``.
+Provides ``CUDAGraphExtensionMode``, ``CUDAGraphExtensionConfig``,
+``load_graph_extension_config``, and the rank-computation helper.
 """
 
 from __future__ import annotations
 
 import enum
 import importlib.util
-from vllm.logger import init_logger
-import os
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import tomllib
+from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import ParallelConfig
@@ -45,7 +45,7 @@ class CUDAGraphExtensionConfig:
     scratch_space_size: str = "64MB"
 
     @classmethod
-    def from_toml(cls, path: str | Path) -> "CUDAGraphExtensionConfig":
+    def from_toml(cls, path: str | Path) -> CUDAGraphExtensionConfig:
         with open(path, "rb") as f:
             data = tomllib.load(f)
 
@@ -53,10 +53,7 @@ class CUDAGraphExtensionConfig:
         mode = CUDAGraphExtensionMode(mode_str)
 
         base_addr_value = data.get("base_addr", cls.base_addr)
-        if isinstance(base_addr_value, str):
-            base_addr = int(base_addr_value, 0)
-        else:
-            base_addr = base_addr_value
+        base_addr = int(base_addr_value, 0) if isinstance(base_addr_value, str) else base_addr_value
 
         hook_library_path = data.get("hook_library_path")
         if hook_library_path is None:
@@ -69,9 +66,7 @@ class CUDAGraphExtensionConfig:
             base_addr=base_addr,
             region_size=data.get("region_size", cls.region_size),
             workspace_root=data.get("workspace_root", cls.workspace_root),
-            scratch_space_size=data.get(
-                "scratch_space_size", cls.scratch_space_size
-            ),
+            scratch_space_size=data.get("scratch_space_size", cls.scratch_space_size),
         )
 
     @staticmethod
@@ -133,7 +128,7 @@ def get_nvshmem_host_path() -> str | None:
 
 
 def _compute_rank_from_parallel_config(
-    parallel_config: "ParallelConfig",
+    parallel_config: ParallelConfig,
 ) -> int:
     """Unique global rank for workspace naming.
 
@@ -147,7 +142,7 @@ def _compute_rank_from_parallel_config(
     return dp_index * parallel_config.world_size + parallel_config.rank
 
 
-def _uses_deepep_backend(parallel_config: "ParallelConfig") -> bool:
+def _uses_deepep_backend(parallel_config: ParallelConfig) -> bool:
     return parallel_config.all2all_backend in (
         "deepep_low_latency",
         "deepep_high_throughput",

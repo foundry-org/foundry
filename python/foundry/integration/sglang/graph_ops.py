@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Foundry CUDA graph save/load helpers for SGLang."""
 
 from __future__ import annotations
@@ -62,9 +63,7 @@ def _unpack_output(tensors: Any) -> Any:
 
     if isinstance(tensors, (tuple, list)):
         if len(tensors) != 1:
-            raise RuntimeError(
-                f"Expected one SGLang CUDA graph output tensor, got {len(tensors)}"
-            )
+            raise RuntimeError(f"Expected one SGLang CUDA graph output tensor, got {len(tensors)}")
         tensors = tensors[0]
     return LogitsProcessorOutput(next_token_logits=tensors)
 
@@ -190,9 +189,7 @@ def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int) -> None:
     """
     buffers = cuda_graph_runner.buffers
     num_tokens = bs * cuda_graph_runner.num_tokens_per_bs
-    encoder_lens = (
-        buffers.encoder_lens[:bs] if cuda_graph_runner.is_encoder_decoder else None
-    )
+    encoder_lens = buffers.encoder_lens[:bs] if cuda_graph_runner.is_encoder_decoder else None
     spec_info = cuda_graph_runner.get_spec_info(num_tokens)
     cuda_graph_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
         bs,

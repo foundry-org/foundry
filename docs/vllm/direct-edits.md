@@ -1,6 +1,6 @@
 # vLLM Direct Edits
 
-Total footprint in the `vllm/` repo: **~97 lines across 5 files**. Every other line of integration logic lives in `foundry.integration.vllm`.
+Total footprint in the `vllm/` repo: **~97 lines across 5 files** (+ a small flashinfer compatibility adjustment). Every other line of integration logic lives in `foundry.integration.vllm`. Foundry-side config patches (env vars, compilation_config fields) are applied at runtime from `install_hooks` — no additional vLLM-side changes are needed for them.
 
 ```
  vllm/compilation/decorators.py    | 11 +++++++++
@@ -107,11 +107,27 @@ def _support_torch_compile(...):
     ...
 ```
 
-On LOAD we replay saved graphs and never re-trace through inductor. Forcing `do_not_compile=True` keeps `torch.compile` out of the LOAD path.
+On LOAD, the wrapped class never gets the `_support_torch_compile.__call__` machinery installed (early return). Dispatch goes through `gpu_model_runner.py:4884`'s `CUDAGraphWrapper(self.model, ...)` reassignment instead — `self.model(...)` from `_dummy_run` calls the wrapper, which on LOAD goes straight to `finish_one_graph_load(...)` for replay. The inner runnable is never invoked, so skipping torch.compile setup is safe and saves the ~2-4s Dynamo + AOT-cache-load cost on cold start.
 
 ## 6. `vllm/utils/flashinfer.py` (~8 lines, small adjustment)
 
 Minor compatibility fix to keep the foundry-mode flashinfer import path clean. Not foundry-specific in intent; folded in with the integration.
+
+## Runtime config patches (no vLLM source change)
+
+`install_hooks` applies one config patch at runtime — it's not in the vLLM tree, but it's load-bearing for correctness. Lives in `foundry/python/foundry/integration/vllm/hooks.py::install_hooks` and stomps a value that vLLM's `VllmConfig.__post_init__` would otherwise force:
+
+```python
+# vLLM hard-overrides this to 1 (vllm/config/vllm.py:1052) whenever cudagraph
+# mode is enabled. The warmup _dummy_run(rm=NONE, force_attention=True) goes
+# through CUDAGraphWrapper.__call__ which short-circuits to self.runnable(...) —
+# an *uncaptured* forward whose allocations break SAVE↔LOAD VMM parity.
+compilation_config.cudagraph_num_of_warmups = 0
+```
+
+`VLLM_USE_AOT_COMPILE` is not touched — it defaults to `False` in `vllm/envs.py`, which is what we want. If a future vLLM build flips the default to `True`, we'd need to force-set it back to `False` here (an AOT cache-hit forward would otherwise produce non-deterministic allocations between SAVE and LOAD).
+
+See [`overview.md`](overview.md#critical-invariants-read-this-first) for the failure modes these prevent.
 
 ## Why none of these can move into the integration layer
 
@@ -130,6 +146,7 @@ Minor compatibility fix to keep the foundry-mode flashinfer import path clean. N
 |---|---|
 | Pre-fork `LD_PRELOAD` env mutation | `_patch_subprocess_spawn_sites` patches `WorkerProc.make_worker_process`, `CoreEngineProcManager.__init__`, and `CoreEngineActorManager.__init__` |
 | `CUDAGraphWrapper.__call__` capture-block swap | `_patch_cuda_graph_wrapper_call` replaces the inner capture stanza with `capture_or_load_graph(...)` |
-| `kernel_warmup`, `_dummy_run`, sampler warmup skipping | `_patch_kernel_warmup`, `_patch_dummy_runs`, `_patch_compile_or_warm_up_model` |
+| `kernel_warmup`, V1 sampler-warmup full-forward skipping | `_patch_kernel_warmup`, `_patch_dummy_runs` (kwarg-signature targeted) |
+| `capture_final_alloc_offset` on SAVE | `_patch_capture_model` post-hook (folded in; no separate `_patch_compile_or_warm_up_model` anymore) |
 | MoE `DeepEPLLAll2AllManager._make_all2all_kwargs` `use_fabric=True` | `_patch_deepep` |
 | `_initialize_kv_caches` profile skip + `WarmupState` write | `_patch_initialize_kv_caches` |

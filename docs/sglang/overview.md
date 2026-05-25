@@ -78,4 +78,3 @@ LOAD:
 - [`memory-lifecycle.md`](memory-lifecycle.md) — VMM region setup, the SAVE↔LOAD allocation parity contract, and the `final_alloc_offset` watermark
 - [`save-load-workflow.md`](save-load-workflow.md) — serve scripts, TOML schema, expected logs, validation checks
 - [`memory-consistency.md`](memory-consistency.md) — the five known divergences that caused silent LOAD failures and how each was fixed
-

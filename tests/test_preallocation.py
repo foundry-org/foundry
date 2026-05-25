@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """
 Test script for the preallocation API.
 
@@ -7,8 +9,8 @@ to just bump a pointer without VMM calls.
 """
 
 import os
-import sys
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -18,15 +20,16 @@ import torch
 
 def _get_hook_so_path():
     import importlib.util
-    spec = importlib.util.find_spec('foundry.ops')
+
+    spec = importlib.util.find_spec("foundry.ops")
     if not spec or not spec.origin:
-        raise RuntimeError('foundry.ops not found; ensure setup.py develop/pip install completed')
+        raise RuntimeError("foundry.ops not found; ensure setup.py develop/pip install completed")
 
     ops_so_path = Path(spec.origin).resolve()
-    hook_so_path = ops_so_path.parent / 'libcuda_hook.so'
+    hook_so_path = ops_so_path.parent / "libcuda_hook.so"
 
     if not hook_so_path.exists():
-        raise RuntimeError(f'libcuda_hook.so not found at {hook_so_path}')
+        raise RuntimeError(f"libcuda_hook.so not found at {hook_so_path}")
 
     return str(hook_so_path)
 
@@ -51,13 +54,13 @@ def _run_core_basic_preallocation():
 
         tensors = []
         for i in range(5):
-            t = torch.empty(1024, 1024, device='cuda')  # ~4MB each
+            t = torch.empty(1024, 1024, device="cuda")  # ~4MB each
             tensors.append(t)
             print(f"[TEST] Allocated tensor {i}: ptr=0x{t.data_ptr():x}")
 
             # Verify address is in region
-            assert t.data_ptr() >= base_addr, f"Address below region base"
-            assert t.data_ptr() < base_addr + region_size, f"Address above region end"
+            assert t.data_ptr() >= base_addr, "Address below region base"
+            assert t.data_ptr() < base_addr + region_size, "Address above region end"
 
         del tensors
         torch.cuda.empty_cache()
@@ -78,14 +81,14 @@ def _run_core_context_manager():
 
     print("[TEST] Testing allocation_region with prealloc_size")
 
-    with fdry.allocation_region(base_addr, '1GB', prealloc_size='128MB'):
+    with fdry.allocation_region(base_addr, "1GB", prealloc_size="128MB"):
         tensors = []
         for i in range(3):
-            t = torch.empty(512, 512, device='cuda')
+            t = torch.empty(512, 512, device="cuda")
             tensors.append(t)
             print(f"[TEST] Allocated tensor {i}: ptr=0x{t.data_ptr():x}")
 
-            assert t.data_ptr() >= base_addr, f"Address below region base"
+            assert t.data_ptr() >= base_addr, "Address below region base"
 
     print("[TEST] test_context_manager PASSED")
 
@@ -110,11 +113,13 @@ def _run_core_fallback():
         # Allocate more than preallocated (5 * 4MB = 20MB > 8MB)
         tensors = []
         for i in range(5):
-            t = torch.empty(1024, 1024, device='cuda')  # ~4MB
+            t = torch.empty(1024, 1024, device="cuda")  # ~4MB
             tensors.append(t)
             print(f"[TEST] Allocated tensor {i}: ptr=0x{t.data_ptr():x}")
 
-        print("[TEST] Successfully allocated beyond preallocated region, you are expected to see an error message from the hook")
+        print(
+            "[TEST] Successfully allocated beyond preallocated region, you are expected to see an error message from the hook"
+        )
 
         del tensors
         torch.cuda.empty_cache()
@@ -127,8 +132,9 @@ def _run_core_fallback():
 
 
 def _run_core_performance():
-    import foundry as fdry
     import random
+
+    import foundry as fdry
 
     torch.cuda.init()
     torch.cuda.synchronize()
@@ -153,7 +159,7 @@ def _run_core_performance():
     # Test 1: Native cudaMalloc
     torch.cuda.synchronize()
     start = time.perf_counter()
-    tensors = [torch.empty(s // 4, dtype=torch.float32, device='cuda') for s in alloc_sizes]
+    tensors = [torch.empty(s // 4, dtype=torch.float32, device="cuda") for s in alloc_sizes]
     torch.cuda.synchronize()
     native_time = time.perf_counter() - start
     del tensors
@@ -165,7 +171,7 @@ def _run_core_performance():
     try:
         torch.cuda.synchronize()
         start = time.perf_counter()
-        tensors = [torch.empty(s // 4, dtype=torch.float32, device='cuda') for s in alloc_sizes]
+        tensors = [torch.empty(s // 4, dtype=torch.float32, device="cuda") for s in alloc_sizes]
         torch.cuda.synchronize()
         slow_time = time.perf_counter() - start
         del tensors
@@ -181,7 +187,7 @@ def _run_core_performance():
 
         torch.cuda.synchronize()
         start = time.perf_counter()
-        tensors = [torch.empty(s // 4, dtype=torch.float32, device='cuda') for s in alloc_sizes]
+        tensors = [torch.empty(s // 4, dtype=torch.float32, device="cuda") for s in alloc_sizes]
         torch.cuda.synchronize()
         fast_time = time.perf_counter() - start
         del tensors
@@ -190,10 +196,10 @@ def _run_core_performance():
     finally:
         fdry.stop_allocation_region()
 
-    print(f"[TEST] Native:    {native_time*1000:.3f} ms")
-    print(f"[TEST] VMM slow:  {slow_time*1000:.3f} ms ({slow_time/native_time:.2f}x native)")
-    print(f"[TEST] VMM fast:  {fast_time*1000:.3f} ms ({fast_time/native_time:.2f}x native)")
-    print(f"[TEST] Speedup:   {slow_time/fast_time:.1f}x (fast vs slow)")
+    print(f"[TEST] Native:    {native_time * 1000:.3f} ms")
+    print(f"[TEST] VMM slow:  {slow_time * 1000:.3f} ms ({slow_time / native_time:.2f}x native)")
+    print(f"[TEST] VMM fast:  {fast_time * 1000:.3f} ms ({fast_time / native_time:.2f}x native)")
+    print(f"[TEST] Speedup:   {slow_time / fast_time:.1f}x (fast vs slow)")
 
     print("[TEST] test_performance_comparison PASSED")
 
@@ -225,7 +231,7 @@ def _run_core_boundary():
         while cumulative < target:
             torch.cuda.synchronize()
             start = time.perf_counter()
-            t = torch.empty(alloc_size // 4, dtype=torch.float32, device='cuda')
+            t = torch.empty(alloc_size // 4, dtype=torch.float32, device="cuda")
             torch.cuda.synchronize()
             elapsed = (time.perf_counter() - start) * 1000
 
@@ -243,7 +249,7 @@ def _run_core_boundary():
         print(f"[TEST] Fast path avg: {avg_fast:.3f} ms ({len(fast_times)} allocs)")
         print(f"[TEST] Slow path avg: {avg_slow:.3f} ms ({len(slow_times)} allocs)")
         if avg_fast > 0:
-            print(f"[TEST] Speedup: {avg_slow/avg_fast:.1f}x")
+            print(f"[TEST] Speedup: {avg_slow / avg_fast:.1f}x")
 
         del tensors
         torch.cuda.empty_cache()
@@ -258,43 +264,43 @@ def _run_core_boundary():
 def _spawn_with_preload(test_mode):
     so_path = _get_hook_so_path()
     env = os.environ.copy()
-    if env.get('LD_PRELOAD'):
-        env['LD_PRELOAD'] = f"{so_path}:{env['LD_PRELOAD']}"
+    if env.get("LD_PRELOAD"):
+        env["LD_PRELOAD"] = f"{so_path}:{env['LD_PRELOAD']}"
     else:
-        env['LD_PRELOAD'] = so_path
+        env["LD_PRELOAD"] = so_path
 
-    cmd = [sys.executable, str(Path(__file__).resolve()), f'--{test_mode}']
+    cmd = [sys.executable, str(Path(__file__).resolve()), f"--{test_mode}"]
     subprocess.check_call(cmd, env=env)
 
 
-@pytest.mark.filterwarnings('ignore:TORCH_CUDA_ARCH_LIST is not set')
+@pytest.mark.filterwarnings("ignore:TORCH_CUDA_ARCH_LIST is not set")
 def test_basic_preallocation():
     """Test basic preallocation functionality."""
-    _spawn_with_preload('basic')
+    _spawn_with_preload("basic")
 
 
-@pytest.mark.filterwarnings('ignore:TORCH_CUDA_ARCH_LIST is not set')
+@pytest.mark.filterwarnings("ignore:TORCH_CUDA_ARCH_LIST is not set")
 def test_context_manager():
     """Test preallocated_allocation_region context manager."""
-    _spawn_with_preload('context-manager')
+    _spawn_with_preload("context-manager")
 
 
-@pytest.mark.filterwarnings('ignore:TORCH_CUDA_ARCH_LIST is not set')
+@pytest.mark.filterwarnings("ignore:TORCH_CUDA_ARCH_LIST is not set")
 def test_fallback_to_slow_path():
     """Test fallback when preallocated memory is exhausted."""
-    _spawn_with_preload('fallback')
+    _spawn_with_preload("fallback")
 
 
-@pytest.mark.filterwarnings('ignore:TORCH_CUDA_ARCH_LIST is not set')
+@pytest.mark.filterwarnings("ignore:TORCH_CUDA_ARCH_LIST is not set")
 def test_performance_comparison():
     """Compare allocation performance: native vs VMM vs VMM+prealloc."""
-    _spawn_with_preload('performance')
+    _spawn_with_preload("performance")
 
 
-@pytest.mark.filterwarnings('ignore:TORCH_CUDA_ARCH_LIST is not set')
+@pytest.mark.filterwarnings("ignore:TORCH_CUDA_ARCH_LIST is not set")
 def test_boundary_performance():
     """Test fast->slow transition at preallocation boundary."""
-    _spawn_with_preload('boundary')
+    _spawn_with_preload("boundary")
 
 
 def test_size_parsing():
@@ -310,16 +316,16 @@ def test_size_parsing():
     assert parse_size("  256 MB  ") == 256 * 1024 * 1024
 
 
-if __name__ == '__main__':
-    if '--basic' in sys.argv:
+if __name__ == "__main__":
+    if "--basic" in sys.argv:
         _run_core_basic_preallocation()
-    elif '--context-manager' in sys.argv:
+    elif "--context-manager" in sys.argv:
         _run_core_context_manager()
-    elif '--fallback' in sys.argv:
+    elif "--fallback" in sys.argv:
         _run_core_fallback()
-    elif '--performance' in sys.argv:
+    elif "--performance" in sys.argv:
         _run_core_performance()
-    elif '--boundary' in sys.argv:
+    elif "--boundary" in sys.argv:
         _run_core_boundary()
     else:
         test_size_parsing()

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Runtime state, VMM memory ops, and LD_PRELOAD env setup for the
 foundry vLLM integration.
 
@@ -13,19 +14,17 @@ import json
 import os
 import shutil
 import time
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING
 
 import torch
 import vllm
 from vllm.logger import init_logger
 
-from foundry import ops as cge
+from foundry import ops as fops
 from foundry.allocation_region import parse_size
-
 from foundry.integration.vllm.config import (
     CUDAGraphExtensionMode,
     _compute_rank_from_parallel_config,
@@ -58,11 +57,9 @@ class WarmupState:
     num_cpu_blocks: int = 0
     gpu_memory_utilization: float = 0.0
     final_alloc_offset: int = 0
-    moe_quant_metadata: dict = field(default_factory=dict)
 
 
 _final_alloc_offset: int = 0
-_moe_quant_metadata: dict | None = None
 
 
 def set_final_alloc_offset(v: int) -> None:
@@ -72,15 +69,6 @@ def set_final_alloc_offset(v: int) -> None:
 
 def get_final_alloc_offset() -> int:
     return _final_alloc_offset
-
-
-def set_moe_quant_metadata(md: dict | None) -> None:
-    global _moe_quant_metadata
-    _moe_quant_metadata = md
-
-
-def get_moe_quant_metadata() -> dict | None:
-    return _moe_quant_metadata
 
 
 def create_warmup_state() -> WarmupState:
@@ -119,6 +107,12 @@ def load_warmup_state(workspace_root: str) -> WarmupState:
 @dataclass
 class CUDAGraphExtensionState:
     capture_index: int = 0
+    # LOAD: strong-reference table keyed by GraphIdentifier. The upstream
+    # CUDAGraphWrapper stores `entry.output = weak_ref_tensors(output)`, so
+    # without a strong ref here the VMM-backed output tensors returned by
+    # `FoundryCUDAGraph.finish_one_graph_load` get GC'd between captures and
+    # the next graph replay writes to freed memory → CUDA illegal memory
+    # access. Do not remove.
     loaded_graphs: dict = field(default_factory=dict)
 
 
@@ -134,7 +128,7 @@ def get_state() -> CUDAGraphExtensionState | None:
 # ---------------------------------------------------------------------------
 
 
-def setup_graph_extension(parallel_config: "ParallelConfig") -> None:
+def setup_graph_extension(parallel_config: ParallelConfig) -> None:
     """VMM region + (LOAD only) CUDA modules. Called BEFORE NCCL."""
     global _state
     cfg = get_config()
@@ -145,7 +139,7 @@ def setup_graph_extension(parallel_config: "ParallelConfig") -> None:
     rank = _compute_rank_from_parallel_config(parallel_config)
     workspace_dir = Path(cfg.workspace_root) / f"rank_{rank}"
     cfg.workspace_dir = str(workspace_dir)
-    log.info("[CGE] rank=%d workspace_dir=%s", rank, workspace_dir)
+    log.info("[foundry] rank=%d workspace_dir=%s", rank, workspace_dir)
 
     if cfg.mode == CUDAGraphExtensionMode.SAVE:
         if workspace_dir.exists():
@@ -153,7 +147,7 @@ def setup_graph_extension(parallel_config: "ParallelConfig") -> None:
         workspace_dir.mkdir(parents=True, exist_ok=True)
 
     elif cfg.mode == CUDAGraphExtensionMode.LOAD:
-        cge.set_skip_fatbin_processing(True)
+        fops.set_skip_fatbin_processing(True)
         if not workspace_dir.exists():
             # rank_0 fallback is only safe for single-rank setups.
             # Under TP/PP/DP > 1 each rank has its own device addresses,
@@ -168,9 +162,9 @@ def setup_graph_extension(parallel_config: "ParallelConfig") -> None:
             fallback = Path(cfg.workspace_root) / "rank_0"
             if is_single_rank and fallback.exists():
                 log.warning(
-                    "Workspace %s missing; falling back to %s "
-                    "(safe only for single-rank setups)",
-                    workspace_dir, fallback,
+                    "Workspace %s missing; falling back to %s (safe only for single-rank setups)",
+                    workspace_dir,
+                    fallback,
                 )
                 cfg.workspace_dir = str(fallback)
             else:
@@ -179,24 +173,24 @@ def setup_graph_extension(parallel_config: "ParallelConfig") -> None:
                     f"exist. For multi-rank LOAD, re-run SAVE with the same "
                     f"parallelism topology."
                 )
-        log.info("[CGE] LOAD: loading CUDA modules from %s", cfg.workspace_dir)
+        log.info("[foundry] LOAD: loading CUDA modules from %s", cfg.workspace_dir)
         t = time.perf_counter()
-        cge.load_cuda_modules_and_libraries(cfg.workspace_dir)
-        log.info("[CGE TIMING] load_cuda_modules_and_libraries: %.3f s",
-                 time.perf_counter() - t)
+        fops.load_cuda_modules_and_libraries(cfg.workspace_dir)
+        log.info(
+            "[foundry TIMING] load_cuda_modules_and_libraries: %.3f s", time.perf_counter() - t
+        )
 
     # set_allocation_region MUST come after load_cuda_modules (which does
     # cuCtxCreate).
     region_size = parse_size(cfg.region_size)
-    log.info("[CGE] Setting up VMM region at %s size %s",
-             hex(cfg.base_addr), cfg.region_size)
-    cge.set_allocation_region(cfg.base_addr, region_size)
-    # Bring cuBLAS handle up so its tiny bring-up lands in scratch.
-    _ = torch._C._cuda_getCurrentBlasHandle()
+    log.info("[foundry] Setting up VMM region at %s size %s", hex(cfg.base_addr), cfg.region_size)
+    fops.set_allocation_region(cfg.base_addr, region_size)
+    # NOTE(liuxs): workspace init is in prepare_graph_capture
+    # # Bring cuBLAS handle up so its tiny bring-up lands in scratch.
+    # _ = torch._C._cuda_getCurrentBlasHandle()
 
     _state = CUDAGraphExtensionState()
-    log.info("[CGE TIMING] setup_graph_extension total: %.3f s",
-             time.perf_counter() - t_total)
+    log.info("[foundry TIMING] setup_graph_extension total: %.3f s", time.perf_counter() - t_total)
 
 
 def skip_to_scratch_boundary() -> None:
@@ -205,30 +199,31 @@ def skip_to_scratch_boundary() -> None:
     if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
         return
     scratch = parse_size(cfg.scratch_space_size)
-    current = cge.get_current_alloc_offset()
+    current = fops.get_current_alloc_offset()
     if current > scratch:
         log.warning(
-            "[CGE] Current offset %d > scratch_space_size %d. "
-            "Increase scratch_space_size.", current, scratch,
+            "[foundry] Current offset %d > scratch_space_size %d. Increase scratch_space_size.",
+            current,
+            scratch,
         )
         return
-    log.info("[CGE] Skip to scratch boundary: %d bytes (current was %d)",
-             scratch, current)
-    cge.set_current_alloc_offset(scratch)
+    log.info("[foundry] Skip to scratch boundary: %d bytes (current was %d)", scratch, current)
+    fops.set_current_alloc_offset(scratch)
 
 
 def capture_final_alloc_offset() -> int:
     """Record per-rank watermark after all graph captures on SAVE."""
     cfg = get_config()
-    offset = cge.get_current_alloc_offset()
+    offset = fops.get_current_alloc_offset()
     set_final_alloc_offset(offset)
-    log.info("[CGE] Captured final_alloc_offset: %d bytes (%.2f GB)",
-             offset, offset / (1024**3))
+    log.info(
+        "[foundry] Captured final_alloc_offset: %d bytes (%.2f GB)", offset, offset / (1024**3)
+    )
     if cfg is not None and cfg.workspace_dir is not None:
         path = os.path.join(cfg.workspace_dir, "final_alloc_offset.json")
         with open(path, "w") as f:
             json.dump({"final_alloc_offset": offset}, f)
-        log.info("[CGE] Saved per-rank final_alloc_offset to %s", path)
+        log.info("[foundry] Saved per-rank final_alloc_offset to %s", path)
     return offset
 
 
@@ -255,20 +250,18 @@ def preallocate_for_load_mode() -> None:
     if final <= 0:
         return
 
-    current = cge.get_current_alloc_offset()
+    current = fops.get_current_alloc_offset()
     remaining = final - current
     if remaining <= 0:
-        log.info("[CGE] LOAD: no preallocation needed")
+        log.info("[foundry] LOAD: no preallocation needed")
         return
 
-    log.info("[CGE] LOAD: preallocating %d bytes (%.2f GB)",
-             remaining, remaining / (1024**3))
+    log.info("[foundry] LOAD: preallocating %d bytes (%.2f GB)", remaining, remaining / (1024**3))
     t = time.perf_counter()
-    if cge.preallocate_region(remaining):
-        log.info("[CGE TIMING] preallocate_region: %.3f s",
-                 time.perf_counter() - t)
+    if fops.preallocate_region(remaining):
+        log.info("[foundry TIMING] preallocate_region: %.3f s", time.perf_counter() - t)
     else:
-        log.warning("[CGE] preallocate_region failed for %d bytes", remaining)
+        log.warning("[foundry] preallocate_region failed for %d bytes", remaining)
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +272,8 @@ def preallocate_for_load_mode() -> None:
 def _preallocate_attention_workspaces(metadata_builders: list | None) -> None:
     try:
         from vllm.v1.attention.backends.flashinfer import (
-            FlashInferMetadataBuilder, _get_trtllm_gen_workspace_buffer,
+            FlashInferMetadataBuilder,
+            _get_trtllm_gen_workspace_buffer,
         )
     except ImportError:
         return
@@ -290,34 +284,71 @@ def _preallocate_attention_workspaces(metadata_builders: list | None) -> None:
                 b._get_workspace_buffer()
 
 
-def prepare_graph_capture(metadata_builders: list | None = None) -> None:
-    """Force cuBLAS + attention workspaces to land at deterministic offsets."""
+def _eager_inductor_lazy_init(device: torch.device) -> None:
+    """Pre-fire ``torch._inductor.fx_passes.joint_graph.lazy_init`` outside
+    any CUDA-graph capture window.
+
+    The first in-capture compile inside ``capture_model`` triggers
+    ``joint_graph.lazy_init`` which calls ``_sfdp_init`` — that builds SDPA
+    pattern templates by copying CPU constants onto the device, which is
+    illegal inside a capture window:
+
+        RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA
+        graph capture unless the CPU tensor is pinned.
+
+    Pre-warming retires the lazy init before capture starts.
+
+    Why only ``joint_graph`` and not the other ``lazy_init`` functions in
+    ``torch._inductor.fx_passes.*``: ``post_grad.lazy_init`` and friends
+    are also ``@init_once_fakemode`` (``@functools.cache``-keyed on
+    ``input_device``), but inductor's own ``post_grad_passes`` calls them
+    with **no argument** (``input_device=None``). If we pre-warm with the
+    indexed ``cuda:N`` device the cache keys don't match, both calls run,
+    and they re-register the same patterns:
+
+        torch._inductor.exc.InductorError: Duplicate pattern: amax_default
+
+    Only ``joint_graph.lazy_init`` is dangerous to leave for capture-time
+    (its body actually allocates on the device); the others just register
+    patterns and are safe to leave to inductor.
+    """
+    try:
+        from torch._inductor.fx_passes.joint_graph import lazy_init
+    except Exception as e:
+        log.debug("[foundry] joint_graph.lazy_init not importable: %s", e)
+        return
+    try:
+        lazy_init(device)
+    except Exception as e:
+        log.debug("[foundry] joint_graph.lazy_init(%s) skipped: %s", device, e)
+
+
+def prepare_graph_capture(
+    metadata_builders: list | None = None,
+    device: torch.device | None = None,
+) -> None:
+    """Force cuBLAS + attention workspaces to land at deterministic offsets,
+    and pre-warm torch._inductor's pattern-matcher lazy init so the first
+    in-capture compile doesn't try to copy CPU tensors onto the device.
+
+    ``device`` is the model_runner's device; passing it lets the inductor
+    lazy-init cache key match the in-capture compile path.
+    """
     import foundry as foundry_pkg
-    cge.preallocate_cublas_workspaces()
+
+    if device is not None:
+        _eager_inductor_lazy_init(device)
+    fops.preallocate_cublas_workspaces()
     _preallocate_attention_workspaces(metadata_builders)
     if foundry_pkg.graph.default_capture_stream is None:
         foundry_pkg.graph.default_capture_stream = torch.cuda.Stream()
     with torch.cuda.stream(foundry_pkg.graph.default_capture_stream):
-        cge.preallocate_cublas_workspaces()
+        fops.preallocate_cublas_workspaces()
         _preallocate_attention_workspaces(metadata_builders)
 
 
-@contextmanager
-def isolated_memory_region(
-    device: torch.device | None = None,
-) -> Generator[None, None, None]:
-    """Route allocations to a separate torch mem-pool (for profile runs)."""
-    cge.stop_allocation_region()
-    try:
-        pool = torch.cuda.MemPool()
-        with torch.cuda.use_mem_pool(pool, device=device):
-            yield
-    finally:
-        cge.resume_allocation_region()
-
-
 # ---------------------------------------------------------------------------
-# Subprocess env setup (LD_PRELOAD + CGE_MODE)
+# Subprocess env setup (LD_PRELOAD + FOUNDRY_MODE consumed by foundry/csrc/hook.cpp)
 # ---------------------------------------------------------------------------
 
 
@@ -343,7 +374,7 @@ def setup_ld_preload_env() -> None:
 
     mode = get_graph_extension_mode()
     if mode != CUDAGraphExtensionMode.NONE:
-        os.environ["CGE_MODE"] = mode.value
+        os.environ["FOUNDRY_MODE"] = mode.value
 
     # Overwrite every spawn site — child reads it on entry.
     os.environ["FOUNDRY_SPAWN_T0_NS"] = str(time.perf_counter_ns())

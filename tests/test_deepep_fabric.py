@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """
 Test DeepEP with use_fabric=True and CGE graph capture/reload.
 
@@ -10,16 +12,16 @@ Requirements:
 - DeepEP installed (deep_ep package)
 - Multiple GPUs for distributed testing
 """
+
 import os
-import sys
-import subprocess
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import torch
 import torch.distributed as dist
-
 
 # Use lower base address (matching working deepep_args example)
 # Note: 0x60000000000 (6TB) NOT 0x600000000000 (96TB) - the extra zero matters!
@@ -31,45 +33,53 @@ HOOK_ARCHIVE_DIR = "hook_archive"
 
 def _get_hook_so_path():
     import importlib.util
-    spec = importlib.util.find_spec('foundry.ops')
+
+    spec = importlib.util.find_spec("foundry.ops")
     if not spec or not spec.origin:
-        raise RuntimeError('foundry.ops not found; ensure setup.py develop/pip install completed')
+        raise RuntimeError("foundry.ops not found; ensure setup.py develop/pip install completed")
 
     ops_so_path = Path(spec.origin).resolve()
-    hook_so_path = ops_so_path.parent / 'libcuda_hook.so'
+    hook_so_path = ops_so_path.parent / "libcuda_hook.so"
 
     if not hook_so_path.exists():
-        raise RuntimeError(f'libcuda_hook.so not found at {hook_so_path}')
+        raise RuntimeError(f"libcuda_hook.so not found at {hook_so_path}")
 
     return str(hook_so_path)
 
 
 def _init_dist(local_rank: int, num_local_ranks: int):
     """Initialize distributed environment for multi-GPU testing."""
-    ip = os.getenv('MASTER_ADDR', '127.0.0.1')
-    port = int(os.getenv('MASTER_PORT', '29500'))
-    num_nodes = int(os.getenv('WORLD_SIZE', 1))
-    node_rank = int(os.getenv('RANK', 0))
+    ip = os.getenv("MASTER_ADDR", "127.0.0.1")
+    port = int(os.getenv("MASTER_PORT", "29500"))
+    num_nodes = int(os.getenv("WORLD_SIZE", 1))
+    node_rank = int(os.getenv("RANK", 0))
 
     import inspect
+
     sig = inspect.signature(dist.init_process_group)
     params = {
-        'backend': 'nccl',
-        'init_method': f'tcp://{ip}:{port}',
-        'world_size': num_nodes * num_local_ranks,
-        'rank': node_rank * num_local_ranks + local_rank,
+        "backend": "nccl",
+        "init_method": f"tcp://{ip}:{port}",
+        "world_size": num_nodes * num_local_ranks,
+        "rank": node_rank * num_local_ranks + local_rank,
     }
-    if 'device_id' in sig.parameters:
-        params['device_id'] = torch.device(f'cuda:{local_rank}')
+    if "device_id" in sig.parameters:
+        params["device_id"] = torch.device(f"cuda:{local_rank}")
     dist.init_process_group(**params)
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device('cuda')
+    torch.set_default_device("cuda")
     torch.cuda.set_device(local_rank)
 
-    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
+    return (
+        dist.get_rank(),
+        dist.get_world_size(),
+        dist.new_group(list(range(num_local_ranks * num_nodes))),
+    )
 
 
-def _create_deterministic_inputs(rank: int, num_tokens: int, hidden: int, num_experts: int, num_topk: int):
+def _create_deterministic_inputs(
+    rank: int, num_tokens: int, hidden: int, num_experts: int, num_topk: int
+):
     """Create deterministic input tensors with traceable patterns.
 
     Pattern for x: each token i has value (rank * 1000 + i) in all hidden dims
@@ -78,12 +88,12 @@ def _create_deterministic_inputs(rank: int, num_tokens: int, hidden: int, num_ex
     import deep_ep
 
     # x[token_i, :] = rank * 1000 + token_i (easy to trace which rank/token)
-    x = torch.zeros((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    x = torch.zeros((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
     for i in range(num_tokens):
         x[i, :] = float(rank * 1000 + i)
 
     # Deterministic topk_idx: token i selects experts [i % num_experts, (i+1) % num_experts, ...]
-    topk_idx = torch.zeros((num_tokens, num_topk), dtype=deep_ep.topk_idx_t, device='cuda')
+    topk_idx = torch.zeros((num_tokens, num_topk), dtype=deep_ep.topk_idx_t, device="cuda")
     for i in range(num_tokens):
         for k in range(num_topk):
             topk_idx[i, k] = (i + k) % num_experts
@@ -97,37 +107,57 @@ def _print_buffer_info(buffer, rank: int, prefix: str):
 
     # Try to access buffer attributes for addresses
     attrs_to_check = [
-        'num_nvl_bytes', 'num_rdma_bytes', 'rank', 'num_ranks',
-        'low_latency_mode', 'device_id'
+        "num_nvl_bytes",
+        "num_rdma_bytes",
+        "rank",
+        "num_ranks",
+        "low_latency_mode",
+        "device_id",
     ]
     for attr in attrs_to_check:
         if hasattr(buffer, attr):
             print(f"[Rank {rank}] {prefix}:   {attr} = {getattr(buffer, attr)}", flush=True)
 
     # Try to get internal buffer pointers if available
-    ptr_attrs = ['nvl_buffer', 'rdma_buffer', 'buffer_ptr', 'recv_buffer', 'send_buffer']
+    ptr_attrs = ["nvl_buffer", "rdma_buffer", "buffer_ptr", "recv_buffer", "send_buffer"]
     for attr in ptr_attrs:
         if hasattr(buffer, attr):
             ptr = getattr(buffer, attr)
-            if hasattr(ptr, 'data_ptr'):
-                print(f"[Rank {rank}] {prefix}:   {attr} address = {hex(ptr.data_ptr())}", flush=True)
+            if hasattr(ptr, "data_ptr"):
+                print(
+                    f"[Rank {rank}] {prefix}:   {attr} address = {hex(ptr.data_ptr())}", flush=True
+                )
             elif isinstance(ptr, int):
                 print(f"[Rank {rank}] {prefix}:   {attr} address = {hex(ptr)}", flush=True)
 
     # Use the public API to fetch the RDMA buffer pointer if available.
-    if hasattr(buffer, 'get_local_buffer_tensor'):
+    if hasattr(buffer, "get_local_buffer_tensor"):
         try:
             rdma_tensor = buffer.get_local_buffer_tensor(
                 torch.uint8, size=torch.Size([1]), offset=0, use_rdma_buffer=True
             )
-            print(f"[Rank {rank}] {prefix}:   rdma_buffer (api) address = {hex(rdma_tensor.data_ptr())}", flush=True)
+            print(
+                f"[Rank {rank}] {prefix}:   rdma_buffer (api) address = {hex(rdma_tensor.data_ptr())}",
+                flush=True,
+            )
         except Exception as exc:
-            print(f"[Rank {rank}] {prefix}:   rdma_buffer (api) address = <error: {exc}>", flush=True)
+            print(
+                f"[Rank {rank}] {prefix}:   rdma_buffer (api) address = <error: {exc}>", flush=True
+            )
 
 
-def _verify_dispatch_result(recv_x, recv_topk_idx, recv_src_idx, num_recv,
-                            rank: int, num_ranks: int, num_tokens: int,
-                            hidden: int, num_experts: int, prefix: str):
+def _verify_dispatch_result(
+    recv_x,
+    recv_topk_idx,
+    recv_src_idx,
+    num_recv,
+    rank: int,
+    num_ranks: int,
+    num_tokens: int,
+    hidden: int,
+    num_experts: int,
+    prefix: str,
+):
     """Verify dispatch results are correct based on our deterministic pattern."""
     num_local_experts = num_experts // num_ranks
     local_expert_start = rank * num_local_experts
@@ -135,20 +165,30 @@ def _verify_dispatch_result(recv_x, recv_topk_idx, recv_src_idx, num_recv,
 
     # num_recv might be an EventOverlap object (async), need to sync and get value
     actual_num_recv = num_recv
-    if hasattr(num_recv, 'wait'):
+    if hasattr(num_recv, "wait"):
         # It's an async object, wait for it
         num_recv.wait()
-    if hasattr(num_recv, 'value'):
+    if hasattr(num_recv, "value"):
         actual_num_recv = num_recv.value
-    elif hasattr(num_recv, 'item'):
+    elif hasattr(num_recv, "item"):
         actual_num_recv = num_recv.item()
     elif not isinstance(num_recv, int):
         # Try to get from recv_x shape
-        actual_num_recv = recv_x.shape[0] * recv_x.shape[1] if recv_x is not None and len(recv_x.shape) >= 2 else 0
-        print(f"[Rank {rank}] {prefix}: num_recv is {type(num_recv)}, using recv_x shape to estimate", flush=True)
+        actual_num_recv = (
+            recv_x.shape[0] * recv_x.shape[1]
+            if recv_x is not None and len(recv_x.shape) >= 2
+            else 0
+        )
+        print(
+            f"[Rank {rank}] {prefix}: num_recv is {type(num_recv)}, using recv_x shape to estimate",
+            flush=True,
+        )
 
     print(f"[Rank {rank}] {prefix}: Verification - num_recv = {actual_num_recv}", flush=True)
-    print(f"[Rank {rank}] {prefix}: Verification - local experts range = [{local_expert_start}, {local_expert_end})", flush=True)
+    print(
+        f"[Rank {rank}] {prefix}: Verification - local experts range = [{local_expert_start}, {local_expert_end})",
+        flush=True,
+    )
 
     # recv_x shape is [num_local_experts, max_tokens_per_expert, hidden]
     # Print shape info for debugging
@@ -163,7 +203,10 @@ def _verify_dispatch_result(recv_x, recv_topk_idx, recv_src_idx, num_recv,
         check_experts = min(2, num_experts_in_recv)
         check_tokens = min(3, tokens_per_expert)
 
-        print(f"[Rank {rank}] {prefix}: Checking first {check_experts} experts, {check_tokens} tokens each:", flush=True)
+        print(
+            f"[Rank {rank}] {prefix}: Checking first {check_experts} experts, {check_tokens} tokens each:",
+            flush=True,
+        )
 
         for expert_i in range(check_experts):
             expert_global_idx = local_expert_start + expert_i
@@ -174,9 +217,12 @@ def _verify_dispatch_result(recv_x, recv_topk_idx, recv_src_idx, num_recv,
                 decoded_src_rank = int(recv_val) // 1000
                 decoded_token_id = int(recv_val) % 1000
 
-                print(f"[Rank {rank}] {prefix}:   expert[{expert_i}] (global {expert_global_idx}), "
-                      f"token[{token_i}]: value={recv_val:.1f} "
-                      f"(decoded: src_rank={decoded_src_rank}, token_id={decoded_token_id})", flush=True)
+                print(
+                    f"[Rank {rank}] {prefix}:   expert[{expert_i}] (global {expert_global_idx}), "
+                    f"token[{token_i}]: value={recv_val:.1f} "
+                    f"(decoded: src_rank={decoded_src_rank}, token_id={decoded_token_id})",
+                    flush=True,
+                )
     else:
         print(f"[Rank {rank}] {prefix}: recv_x is empty or None", flush=True)
 
@@ -185,8 +231,8 @@ def _verify_dispatch_result(recv_x, recv_topk_idx, recv_src_idx, num_recv,
 
 def _run_save(local_rank: int, num_processes: int):
     """SAVE mode: Create DeepEP buffer, capture graph, and save."""
-    import foundry as fdry
     import deep_ep
+    import foundry as fdry
 
     rank, num_ranks, group = _init_dist(local_rank, num_processes)
 
@@ -196,8 +242,14 @@ def _run_save(local_rank: int, num_processes: int):
     # Debug: confirm NVSHMEM env vars are set
     if local_rank == 0:
         print(f"[Rank {local_rank}] NVSHMEM env vars:", flush=True)
-        print(f"  NVSHMEM_REMOTE_TRANSPORT={os.environ.get('NVSHMEM_REMOTE_TRANSPORT', 'not set')}", flush=True)
-        print(f"  NVSHMEM_DISABLE_IBGDA={os.environ.get('NVSHMEM_DISABLE_IBGDA', 'not set')}", flush=True)
+        print(
+            f"  NVSHMEM_REMOTE_TRANSPORT={os.environ.get('NVSHMEM_REMOTE_TRANSPORT', 'not set')}",
+            flush=True,
+        )
+        print(
+            f"  NVSHMEM_DISABLE_IBGDA={os.environ.get('NVSHMEM_DISABLE_IBGDA', 'not set')}",
+            flush=True,
+        )
         print(f"  NVSHMEM_IB_ENABLE={os.environ.get('NVSHMEM_IB_ENABLE', 'not set')}", flush=True)
 
     print(f"[Rank {rank}] SAVE: Initializing CUDA", flush=True)
@@ -223,10 +275,13 @@ def _run_save(local_rank: int, num_processes: int):
     )
 
     # Check if fabric should be used
-    use_fabric = os.environ.get('TEST_USE_FABRIC', '1') == '1'
+    use_fabric = os.environ.get("TEST_USE_FABRIC", "1") == "1"
     # Test: add num_nvl_bytes to reproduce vllm failure
-    num_nvl_bytes = int(os.environ.get('TEST_NVL_BYTES_MB', '0')) * 1024 * 1024
-    print(f"[Rank {rank}] SAVE: Creating DeepEP buffer with use_fabric={use_fabric}, num_nvl_bytes={num_nvl_bytes / 1e6:.2f} MB, num_rdma_bytes={num_rdma_bytes / 1e6:.2f} MB", flush=True)
+    num_nvl_bytes = int(os.environ.get("TEST_NVL_BYTES_MB", "0")) * 1024 * 1024
+    print(
+        f"[Rank {rank}] SAVE: Creating DeepEP buffer with use_fabric={use_fabric}, num_nvl_bytes={num_nvl_bytes / 1e6:.2f} MB, num_rdma_bytes={num_rdma_bytes / 1e6:.2f} MB",
+        flush=True,
+    )
 
     buffer = deep_ep.Buffer(
         group,
@@ -244,19 +299,28 @@ def _run_save(local_rank: int, num_processes: int):
 
     # Create deterministic input tensors
     x, topk_idx = _create_deterministic_inputs(rank, num_tokens, hidden, num_experts, num_topk)
-    cumulative_stats = torch.zeros((num_local_experts,), dtype=torch.int, device='cuda')
+    cumulative_stats = torch.zeros((num_local_experts,), dtype=torch.int, device="cuda")
 
     print(f"[Rank {rank}] SAVE: Input tensors:", flush=True)
     print(f"[Rank {rank}] SAVE:   x address = {hex(x.data_ptr())}, shape = {x.shape}", flush=True)
-    print(f"[Rank {rank}] SAVE:   x[0, :5] = {x[0, :5].tolist()} (expect {rank * 1000 + 0})", flush=True)
-    print(f"[Rank {rank}] SAVE:   x[1, :5] = {x[1, :5].tolist()} (expect {rank * 1000 + 1})", flush=True)
+    print(
+        f"[Rank {rank}] SAVE:   x[0, :5] = {x[0, :5].tolist()} (expect {rank * 1000 + 0})",
+        flush=True,
+    )
+    print(
+        f"[Rank {rank}] SAVE:   x[1, :5] = {x[1, :5].tolist()} (expect {rank * 1000 + 1})",
+        flush=True,
+    )
     print(f"[Rank {rank}] SAVE:   topk_idx address = {hex(topk_idx.data_ptr())}", flush=True)
     print(f"[Rank {rank}] SAVE:   topk_idx[:3] = {topk_idx[:3].tolist()}", flush=True)
 
     # Warmup and verify
     print(f"[Rank {rank}] SAVE: Running warmup dispatch", flush=True)
     result = buffer.low_latency_dispatch(
-        x, topk_idx, num_tokens, num_experts,
+        x,
+        topk_idx,
+        num_tokens,
+        num_experts,
         use_fp8=False,  # Disable FP8 for exact value tracking
         round_scale=False,
         use_ue8m0=False,
@@ -269,13 +333,29 @@ def _run_save(local_rank: int, num_processes: int):
     # Unpack dispatch result
     recv_x, recv_topk_idx, recv_src_idx, num_recv, *rest = result
     print(f"[Rank {rank}] SAVE: Warmup dispatch result:", flush=True)
-    print(f"[Rank {rank}] SAVE:   recv_x address = {hex(recv_x.data_ptr()) if recv_x is not None else 'None'}", flush=True)
-    print(f"[Rank {rank}] SAVE:   recv_x shape = {recv_x.shape if recv_x is not None else 'None'}", flush=True)
+    print(
+        f"[Rank {rank}] SAVE:   recv_x address = {hex(recv_x.data_ptr()) if recv_x is not None else 'None'}",
+        flush=True,
+    )
+    print(
+        f"[Rank {rank}] SAVE:   recv_x shape = {recv_x.shape if recv_x is not None else 'None'}",
+        flush=True,
+    )
     print(f"[Rank {rank}] SAVE:   num_recv = {num_recv}", flush=True)
 
     # Verify results
-    _verify_dispatch_result(recv_x, recv_topk_idx, recv_src_idx, num_recv,
-                           rank, num_ranks, num_tokens, hidden, num_experts, "SAVE-warmup")
+    _verify_dispatch_result(
+        recv_x,
+        recv_topk_idx,
+        recv_src_idx,
+        num_recv,
+        rank,
+        num_ranks,
+        num_tokens,
+        hidden,
+        num_experts,
+        "SAVE-warmup",
+    )
 
     dist.barrier(group)
     print(f"[Rank {rank}] SAVE: Warmup completed and verified", flush=True)
@@ -286,7 +366,10 @@ def _run_save(local_rank: int, num_processes: int):
 
     with fdry.graph(graph):
         graph_result = buffer.low_latency_dispatch(
-            x, topk_idx, num_tokens, num_experts,
+            x,
+            topk_idx,
+            num_tokens,
+            num_experts,
             use_fp8=False,
             round_scale=False,
             use_ue8m0=False,
@@ -307,14 +390,20 @@ def _run_save(local_rank: int, num_processes: int):
     for i, item in enumerate(graph_result):
         item_type = type(item).__name__
         if isinstance(item, torch.Tensor):
-            print(f"[Rank {rank}] SAVE:   result[{i}] = Tensor, address = {hex(item.data_ptr())}, shape = {item.shape}", flush=True)
+            print(
+                f"[Rank {rank}] SAVE:   result[{i}] = Tensor, address = {hex(item.data_ptr())}, shape = {item.shape}",
+                flush=True,
+            )
             output_tensors_to_save.append(item)
         elif isinstance(item, tuple):
             print(f"[Rank {rank}] SAVE:   result[{i}] = tuple of length {len(item)}", flush=True)
             # Check if tuple contains tensors
             for j, sub_item in enumerate(item):
                 if isinstance(sub_item, torch.Tensor):
-                    print(f"[Rank {rank}] SAVE:     result[{i}][{j}] = Tensor, address = {hex(sub_item.data_ptr())}, shape = {sub_item.shape}", flush=True)
+                    print(
+                        f"[Rank {rank}] SAVE:     result[{i}][{j}] = Tensor, address = {hex(sub_item.data_ptr())}, shape = {sub_item.shape}",
+                        flush=True,
+                    )
                     output_tensors_to_save.append(sub_item)
         else:
             print(f"[Rank {rank}] SAVE:   result[{i}] = {item_type}", flush=True)
@@ -334,7 +423,10 @@ def _run_save(local_rank: int, num_processes: int):
     os.makedirs(rank_archive, exist_ok=True)
 
     graph_json = os.path.join(rank_archive, "deepep_dispatch_graph.json")
-    print(f"[Rank {rank}] SAVE: Saving graph to {graph_json} with {len(output_tensors_to_save)} output tensors", flush=True)
+    print(
+        f"[Rank {rank}] SAVE: Saving graph to {graph_json} with {len(output_tensors_to_save)} output tensors",
+        flush=True,
+    )
     graph.save(graph_json, output_tensors=output_tensors_to_save)
     print(f"[Rank {rank}] SAVE: Graph saved successfully", flush=True)
 
@@ -356,8 +448,8 @@ def _run_save(local_rank: int, num_processes: int):
 
 def _run_load(local_rank: int, num_processes: int):
     """LOAD mode: Load saved graph and replay."""
-    import foundry as fdry
     import deep_ep
+    import foundry as fdry
 
     rank, num_ranks, group = _init_dist(local_rank, num_processes)
 
@@ -379,7 +471,9 @@ def _run_load(local_rank: int, num_processes: int):
     # CRITICAL: Set skip_fatbin_processing=True so that when DeepEP loads its
     # kernels during warmup, they are tracked as warmup handles instead of being
     # processed in SAVE mode (which would dump to disk).
-    print(f"[Rank {rank}] LOAD: Setting skip_fatbin_processing=True for warmup tracking", flush=True)
+    print(
+        f"[Rank {rank}] LOAD: Setting skip_fatbin_processing=True for warmup tracking", flush=True
+    )
     fdry.set_skip_fatbin_processing(True)
 
     # CRITICAL ORDER FOR LOAD MODE:
@@ -404,8 +498,11 @@ def _run_load(local_rank: int, num_processes: int):
         num_tokens, hidden, num_ranks, num_experts
     )
 
-    use_fabric = os.environ.get('TEST_USE_FABRIC', '1') == '1'
-    print(f"[Rank {rank}] LOAD: Creating DeepEP buffer with use_fabric={use_fabric}, size={num_rdma_bytes / 1e6:.2f} MB", flush=True)
+    use_fabric = os.environ.get("TEST_USE_FABRIC", "1") == "1"
+    print(
+        f"[Rank {rank}] LOAD: Creating DeepEP buffer with use_fabric={use_fabric}, size={num_rdma_bytes / 1e6:.2f} MB",
+        flush=True,
+    )
 
     buffer = deep_ep.Buffer(
         group,
@@ -428,19 +525,28 @@ def _run_load(local_rank: int, num_processes: int):
 
     # Create deterministic input tensors (same as SAVE)
     x, topk_idx = _create_deterministic_inputs(rank, num_tokens, hidden, num_experts, num_topk)
-    cumulative_stats = torch.zeros((num_local_experts,), dtype=torch.int, device='cuda')
+    cumulative_stats = torch.zeros((num_local_experts,), dtype=torch.int, device="cuda")
 
     print(f"[Rank {rank}] LOAD: Input tensors:", flush=True)
     print(f"[Rank {rank}] LOAD:   x address = {hex(x.data_ptr())}, shape = {x.shape}", flush=True)
-    print(f"[Rank {rank}] LOAD:   x[0, :5] = {x[0, :5].tolist()} (expect {rank * 1000 + 0})", flush=True)
-    print(f"[Rank {rank}] LOAD:   x[1, :5] = {x[1, :5].tolist()} (expect {rank * 1000 + 1})", flush=True)
+    print(
+        f"[Rank {rank}] LOAD:   x[0, :5] = {x[0, :5].tolist()} (expect {rank * 1000 + 0})",
+        flush=True,
+    )
+    print(
+        f"[Rank {rank}] LOAD:   x[1, :5] = {x[1, :5].tolist()} (expect {rank * 1000 + 1})",
+        flush=True,
+    )
     print(f"[Rank {rank}] LOAD:   topk_idx address = {hex(topk_idx.data_ptr())}", flush=True)
     print(f"[Rank {rank}] LOAD:   topk_idx[:3] = {topk_idx[:3].tolist()}", flush=True)
 
     # Warmup - this loads DeepEP kernels and registers them as warmup handles
     print(f"[Rank {rank}] LOAD: Running kernel warmup (registers DeepEP modules)", flush=True)
     warmup_result = buffer.low_latency_dispatch(
-        x, topk_idx, num_tokens, num_experts,
+        x,
+        topk_idx,
+        num_tokens,
+        num_experts,
         use_fp8=False,  # Must match SAVE
         round_scale=False,
         use_ue8m0=False,
@@ -453,20 +559,39 @@ def _run_load(local_rank: int, num_processes: int):
     # Unpack and verify warmup result
     recv_x, recv_topk_idx, recv_src_idx, num_recv, *rest = warmup_result
     print(f"[Rank {rank}] LOAD: Warmup dispatch result:", flush=True)
-    print(f"[Rank {rank}] LOAD:   recv_x address = {hex(recv_x.data_ptr()) if recv_x is not None else 'None'}", flush=True)
-    print(f"[Rank {rank}] LOAD:   recv_x shape = {recv_x.shape if recv_x is not None else 'None'}", flush=True)
+    print(
+        f"[Rank {rank}] LOAD:   recv_x address = {hex(recv_x.data_ptr()) if recv_x is not None else 'None'}",
+        flush=True,
+    )
+    print(
+        f"[Rank {rank}] LOAD:   recv_x shape = {recv_x.shape if recv_x is not None else 'None'}",
+        flush=True,
+    )
     print(f"[Rank {rank}] LOAD:   num_recv = {num_recv}", flush=True)
 
     # Verify warmup results
-    _verify_dispatch_result(recv_x, recv_topk_idx, recv_src_idx, num_recv,
-                           rank, num_ranks, num_tokens, hidden, num_experts, "LOAD-warmup")
+    _verify_dispatch_result(
+        recv_x,
+        recv_topk_idx,
+        recv_src_idx,
+        num_recv,
+        rank,
+        num_ranks,
+        num_tokens,
+        hidden,
+        num_experts,
+        "LOAD-warmup",
+    )
 
     dist.barrier(group)
     print(f"[Rank {rank}] LOAD: Warmup completed", flush=True)
 
     # Debug: print warmup recv_x address vs what graph expects
     print(f"[Rank {rank}] LOAD: Warmup recv_x at {hex(recv_x.data_ptr())}", flush=True)
-    print(f"[Rank {rank}] LOAD: This is where DeepEP outputs during warmup - graph replay should use same addresses", flush=True)
+    print(
+        f"[Rank {rank}] LOAD: This is where DeepEP outputs during warmup - graph replay should use same addresses",
+        flush=True,
+    )
 
     # Load graph from per-rank archive
     graph_json = os.path.join(rank_archive, "deepep_dispatch_graph.json")
@@ -479,13 +604,19 @@ def _run_load(local_rank: int, num_processes: int):
     if output_tensors is not None:
         if isinstance(output_tensors, (list, tuple)):
             for i, t in enumerate(output_tensors):
-                if hasattr(t, 'data_ptr'):
-                    print(f"[Rank {rank}] LOAD: Loaded output[{i}] address = {hex(t.data_ptr())}, shape = {t.shape}", flush=True)
+                if hasattr(t, "data_ptr"):
+                    print(
+                        f"[Rank {rank}] LOAD: Loaded output[{i}] address = {hex(t.data_ptr())}, shape = {t.shape}",
+                        flush=True,
+                    )
                     # First tensor should be recv_x
                     if i == 0:
                         loaded_recv_x = t
-        elif hasattr(output_tensors, 'data_ptr'):
-            print(f"[Rank {rank}] LOAD: Loaded output address = {hex(output_tensors.data_ptr())}, shape = {output_tensors.shape}", flush=True)
+        elif hasattr(output_tensors, "data_ptr"):
+            print(
+                f"[Rank {rank}] LOAD: Loaded output address = {hex(output_tensors.data_ptr())}, shape = {output_tensors.shape}",
+                flush=True,
+            )
             loaded_recv_x = output_tensors
 
     # Replay loaded graph
@@ -511,8 +642,11 @@ def _run_load(local_rank: int, num_processes: int):
                 val = verify_tensor[expert_i, token_i, 0].item()
                 decoded_src_rank = int(val) // 1000
                 decoded_token_id = int(val) % 1000
-                print(f"[Rank {rank}] LOAD:   expert[{expert_i}], token[{token_i}]: "
-                      f"value={val:.1f} (rank={decoded_src_rank}, token={decoded_token_id})", flush=True)
+                print(
+                    f"[Rank {rank}] LOAD:   expert[{expert_i}], token[{token_i}]: "
+                    f"value={val:.1f} (rank={decoded_src_rank}, token={decoded_token_id})",
+                    flush=True,
+                )
 
     print(f"[Rank {rank}] LOAD: Graph replay successful", flush=True)
 
@@ -541,10 +675,10 @@ def _spawn_with_preload(mode: str, num_processes: int):
     """Spawn subprocess with LD_PRELOAD for CGE hook."""
     so_path = _get_hook_so_path()
     env = os.environ.copy()
-    if env.get('LD_PRELOAD'):
-        env['LD_PRELOAD'] = f"{so_path}:{env['LD_PRELOAD']}"
+    if env.get("LD_PRELOAD"):
+        env["LD_PRELOAD"] = f"{so_path}:{env['LD_PRELOAD']}"
     else:
-        env['LD_PRELOAD'] = so_path
+        env["LD_PRELOAD"] = so_path
 
     # # Set NVSHMEM environment variables to disable IBGDA and remote transports
     # env['NVSHMEM_REMOTE_TRANSPORT'] = 'none'
@@ -552,9 +686,10 @@ def _spawn_with_preload(mode: str, num_processes: int):
     # env['NVSHMEM_IB_ENABLE'] = '0'
 
     cmd = [
-        sys.executable, str(Path(__file__).resolve()),
-        f'--{mode}',
-        f'--num-processes={num_processes}',
+        sys.executable,
+        str(Path(__file__).resolve()),
+        f"--{mode}",
+        f"--num-processes={num_processes}",
     ]
     subprocess.check_call(cmd, env=env)
 
@@ -562,7 +697,8 @@ def _spawn_with_preload(mode: str, num_processes: int):
 def _check_deepep_available():
     """Check if DeepEP is available."""
     try:
-        import deep_ep
+        import deep_ep  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -585,10 +721,10 @@ def test_deepep_fabric_graph_save_load():
     _cleanup_archive()
 
     print("[TEST] Running SAVE mode (create buffer, capture graph, save)")
-    _spawn_with_preload('save', num_processes)
+    _spawn_with_preload("save", num_processes)
 
     print("[TEST] Running LOAD mode (load graph, replay)")
-    _spawn_with_preload('load', num_processes)
+    _spawn_with_preload("load", num_processes)
 
     _cleanup_archive()
 
@@ -598,17 +734,19 @@ def test_deepep_fabric_graph_save_load():
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description='Test DeepEP with use_fabric=True and CGE')
-    parser.add_argument('--save', action='store_true', help='Run SAVE mode')
-    parser.add_argument('--load', action='store_true', help='Run LOAD mode')
-    parser.add_argument('--num-processes', type=int, default=2, help='Number of processes')
-    parser.add_argument('--cleanup', action='store_true', help='Clean up archive')
-    parser.add_argument('--run', action='store_true', help='Run full test without pytest')
-    parser.add_argument('--no-fabric', action='store_true', help='Disable fabric (use_fabric=False)')
+    parser = argparse.ArgumentParser(description="Test DeepEP with use_fabric=True and CGE")
+    parser.add_argument("--save", action="store_true", help="Run SAVE mode")
+    parser.add_argument("--load", action="store_true", help="Run LOAD mode")
+    parser.add_argument("--num-processes", type=int, default=2, help="Number of processes")
+    parser.add_argument("--cleanup", action="store_true", help="Clean up archive")
+    parser.add_argument("--run", action="store_true", help="Run full test without pytest")
+    parser.add_argument(
+        "--no-fabric", action="store_true", help="Disable fabric (use_fabric=False)"
+    )
     args = parser.parse_args()
 
     # Store fabric flag in env so spawned processes can access it
-    os.environ['TEST_USE_FABRIC'] = '0' if args.no_fabric else '1'
+    os.environ["TEST_USE_FABRIC"] = "0" if args.no_fabric else "1"
 
     # # Set NVSHMEM environment variables to disable IBGDA and remote transports
     # # This must be set BEFORE any CUDA initialization
@@ -620,7 +758,9 @@ def main():
         _cleanup_archive()
     elif args.save:
         print("[TEST] Running SAVE mode with NVSHMEM env vars:", flush=True)
-        print(f"  NVSHMEM_REMOTE_TRANSPORT={os.environ.get('NVSHMEM_REMOTE_TRANSPORT')}", flush=True)
+        print(
+            f"  NVSHMEM_REMOTE_TRANSPORT={os.environ.get('NVSHMEM_REMOTE_TRANSPORT')}", flush=True
+        )
         print(f"  NVSHMEM_DISABLE_IBGDA={os.environ.get('NVSHMEM_DISABLE_IBGDA')}", flush=True)
         print(f"  NVSHMEM_IB_ENABLE={os.environ.get('NVSHMEM_IB_ENABLE')}", flush=True)
         torch.multiprocessing.spawn(
@@ -630,7 +770,9 @@ def main():
         )
     elif args.load:
         print("[TEST] Running LOAD mode with NVSHMEM env vars:", flush=True)
-        print(f"  NVSHMEM_REMOTE_TRANSPORT={os.environ.get('NVSHMEM_REMOTE_TRANSPORT')}", flush=True)
+        print(
+            f"  NVSHMEM_REMOTE_TRANSPORT={os.environ.get('NVSHMEM_REMOTE_TRANSPORT')}", flush=True
+        )
         print(f"  NVSHMEM_DISABLE_IBGDA={os.environ.get('NVSHMEM_DISABLE_IBGDA')}", flush=True)
         print(f"  NVSHMEM_IB_ENABLE={os.environ.get('NVSHMEM_IB_ENABLE')}", flush=True)
         torch.multiprocessing.spawn(
@@ -653,10 +795,10 @@ def main():
         _cleanup_archive()
 
         print("[TEST] Running SAVE mode")
-        _spawn_with_preload('save', num_processes)
+        _spawn_with_preload("save", num_processes)
 
         print("[TEST] Running LOAD mode")
-        _spawn_with_preload('load', num_processes)
+        _spawn_with_preload("load", num_processes)
 
         _cleanup_archive()
         print("[TEST] PASSED")
@@ -664,13 +806,21 @@ def main():
         parser.print_help()
         print("\nExample commands:")
         print("  # Test without fabric first:")
-        print("  LD_PRELOAD=/path/to/nvshmem/lib/libnvshmem_host.so:build/libcuda_hook.so python tests/test_deepep_fabric.py --save --no-fabric")
-        print("  LD_PRELOAD=/path/to/nvshmem/lib/libnvshmem_host.so:build/libcuda_hook.so python tests/test_deepep_fabric.py --load --no-fabric")
+        print(
+            "  LD_PRELOAD=/path/to/nvshmem/lib/libnvshmem_host.so:build/libcuda_hook.so python tests/test_deepep_fabric.py --save --no-fabric"
+        )
+        print(
+            "  LD_PRELOAD=/path/to/nvshmem/lib/libnvshmem_host.so:build/libcuda_hook.so python tests/test_deepep_fabric.py --load --no-fabric"
+        )
         print()
         print("  # Test with fabric:")
-        print("  LD_PRELOAD=/path/to/nvshmem/lib/libnvshmem_host.so:build/libcuda_hook.so python tests/test_deepep_fabric.py --save")
-        print("  LD_PRELOAD=/path/to/nvshmem/lib/libnvshmem_host.so:build/libcuda_hook.so python tests/test_deepep_fabric.py --load")
+        print(
+            "  LD_PRELOAD=/path/to/nvshmem/lib/libnvshmem_host.so:build/libcuda_hook.so python tests/test_deepep_fabric.py --save"
+        )
+        print(
+            "  LD_PRELOAD=/path/to/nvshmem/lib/libnvshmem_host.so:build/libcuda_hook.so python tests/test_deepep_fabric.py --load"
+        )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

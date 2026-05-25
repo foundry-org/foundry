@@ -22,7 +22,7 @@ struct Generator;
 struct CUDAGeneratorImpl;
 struct CUDAGeneratorState;
 
-}
+}  // namespace at
 
 namespace foundry {
 
@@ -31,23 +31,14 @@ struct BinaryGraphFile;  // forward declaration, defined in BinaryGraphFormat.h
 using MempoolId_t = c10::MempoolId_t;
 using CaptureId_t = c10::CaptureId_t;
 
-enum class OutputTensorType {
-  None,
-  Single,
-  List,
-  Tuple
-};
+enum class OutputTensorType { None, Single, List, Tuple };
 
-using OutputTensors = std::variant<
-    std::monostate,
-    at::Tensor,
-    std::vector<at::Tensor>
->;
+using OutputTensors = std::variant<std::monostate, at::Tensor, std::vector<at::Tensor>>;
 
 struct CUDAGraph;
 struct PendingGraphLoads;
 
-using ReconstructTensorFn = at::Tensor(*)(const boost::json::object&);
+using ReconstructTensorFn = at::Tensor (*)(const boost::json::object&);
 
 struct GraphLoadResult {
   std::shared_ptr<CUDAGraph> graph;
@@ -81,10 +72,10 @@ struct CUDAGraph {
 
   void register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorState> state);
   void register_generator_state(const at::Generator& generator);
-  void register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorState> state, uint64_t wholegraph_increment);
-  void capture_begin(
-      MempoolId_t pool = {0, 0},
-      cudaStreamCaptureMode capture_mode = cudaStreamCaptureModeGlobal);
+  void register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorState> state,
+                                uint64_t wholegraph_increment);
+  void capture_begin(MempoolId_t pool = {0, 0},
+                     cudaStreamCaptureMode capture_mode = cudaStreamCaptureModeGlobal);
   void capture_end();
   void instantiate();
   void replay();
@@ -96,23 +87,20 @@ struct CUDAGraph {
   cudaGraphExec_t raw_cuda_graph_exec();
 
   void analyze_captured_graph();
-  void save(const std::string& json_path,
-            const OutputTensors& output_tensors = std::monostate{},
+  void save(const std::string& json_path, const OutputTensors& output_tensors = std::monostate{},
             OutputTensorType output_type = OutputTensorType::None);
-  void save_binary(const std::string& bin_path,
-                   const boost::json::object& json_root);
+  void save_binary(const std::string& bin_path, const boost::json::object& json_root);
   static GraphLoadResult load(const std::string& json_path, MempoolId_t pool = {0, 0});
 
   // Create graph shell and register generators, but do NOT replay allocator events.
   // Used by start_graph_builds to create shells early before weight loading.
-  static ParsedGraphData prepare_graph_shell(
-      boost::json::value&& root_val, MempoolId_t pool,
-      CUDAGeneratorStateRegistry& registry);
+  static ParsedGraphData prepare_graph_shell(boost::json::value&& root_val, MempoolId_t pool,
+                                             CUDAGeneratorStateRegistry& registry);
   // Template for topology-grouped graph building
   struct GraphTemplate {
-    CUgraph cuGraph;                           // the template CUgraph
-    std::vector<CUgraphNode> ordered_nodes;    // nodes in creation order
-    std::vector<std::string> node_types;       // type of each node
+    CUgraph cuGraph;                         // the template CUgraph
+    std::vector<CUgraphNode> ordered_nodes;  // nodes in creation order
+    std::vector<std::string> node_types;     // type of each node
   };
 
   // Pre-decoded node params for on-demand exec update at replay time.
@@ -181,47 +169,44 @@ struct CUDAGraph {
     std::vector<OnDemandNodeUpdate> updates;
   };
 
-  static GraphLoadResult build_graph_from_parsed(
-      ParsedGraphData&& parsed, CUcontext ctx,
-      ReconstructTensorFn reconstruct_fn,
-      GraphTemplate* out_template = nullptr);
+  static GraphLoadResult build_graph_from_parsed(ParsedGraphData&& parsed, CUcontext ctx,
+                                                 ReconstructTensorFn reconstruct_fn,
+                                                 GraphTemplate* out_template = nullptr);
 
   // Prepare on-demand replay data: parse node params from JSON without
   // building a CUgraph. At replay time, the shared exec is updated.
   // shared_exec can be nullptr — call link_on_demand_shared_exec() later.
-  static void prepare_on_demand_graph(
-      ParsedGraphData& parsed, CUcontext ctx,
-      std::shared_ptr<SharedGraphExec> shared_exec,
-      int graph_id);
+  static void prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
+                                      std::shared_ptr<SharedGraphExec> shared_exec, int graph_id);
 
   // Binary-native overload: reads directly from BinaryGraphFile structs.
   // No JSON parsing, no hex decoding. ~10x faster than JSON path.
-  static void prepare_on_demand_graph_binary(
-      const struct BinaryGraphFile& bin_file,
-      std::shared_ptr<CUDAGraph> graph,
-      CUcontext ctx,
-      std::shared_ptr<SharedGraphExec> shared_exec,
-      int graph_id);
+  static void prepare_on_demand_graph_binary(const struct BinaryGraphFile& bin_file,
+                                             std::shared_ptr<CUDAGraph> graph, CUcontext ctx,
+                                             std::shared_ptr<SharedGraphExec> shared_exec,
+                                             int graph_id);
 
   // Link a SharedGraphExec to an already-prepared on-demand graph.
   // Called after template builds complete to associate on-demand data
   // with the template's shared exec.
-  static void link_on_demand_shared_exec(
-      CUDAGraph& graph,
-      std::shared_ptr<SharedGraphExec> shared_exec);
+  static void link_on_demand_shared_exec(CUDAGraph& graph,
+                                         std::shared_ptr<SharedGraphExec> shared_exec);
 
   // Transfer graph/exec ownership to a SharedGraphExec.
   // After this call, the CUDAGraph no longer owns graph_ or graph_exec_.
-  void transfer_to_shared_exec(std::shared_ptr<SharedGraphExec> shared,
-                               GraphTemplate&& tmpl);
+  void transfer_to_shared_exec(std::shared_ptr<SharedGraphExec> shared, GraphTemplate&& tmpl);
 
   // Split load API: start builds early to overlap with weight loading.
   static std::shared_ptr<PendingGraphLoads> start_graph_builds(
-      const std::vector<std::string>& json_paths,
-      MempoolId_t pool = {0, 0}, int num_threads = 4);
+      const std::vector<std::string>& json_paths, MempoolId_t pool = {0, 0}, int num_threads = 4);
   // Split load API: finish with allocator replay + output tensor reconstruction.
   static std::vector<GraphLoadResult> finish_graph_loads(
       std::shared_ptr<PendingGraphLoads> pending);
+  // Per-graph variant: finish one entry by index. Waits on background build
+  // on first call (idempotent for shared_future). Caller must walk indices in
+  // the same order SAVE captured them so VMM cursor advances stay monotonic.
+  static GraphLoadResult finish_one_graph_load(std::shared_ptr<PendingGraphLoads> pending,
+                                               size_t index);
 
  protected:
   cudaGraph_t graph_ = nullptr;
@@ -261,4 +246,4 @@ struct CUDAGraph {
   std::unique_ptr<OnDemandData> on_demand_data_;
 };
 
-} // namespace foundry
+}  // namespace foundry

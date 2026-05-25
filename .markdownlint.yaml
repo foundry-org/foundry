@@ -1,0 +1,13 @@
+MD007:
+  indent: 4
+MD013: false   # disable line-length limit
+MD024:
+  siblings_only: true
+MD031:
+  list_items: false
+MD033: false   # allow inline HTML (mermaid blocks etc.)
+MD040: false   # allow code fences without an explicit language tag
+MD046: false   # allow either fenced or indented code blocks
+MD052: false   # allow link-style references without definitions (issue tags)
+MD059: false
+MD060: false   # don't enforce a specific table-pipe spacing style

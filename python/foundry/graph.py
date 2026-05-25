@@ -1,16 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 from __future__ import annotations
 
-import gc
 import json
 import os
+from typing import TYPE_CHECKING
+
 import torch
-from typing import Optional, Union, List, Tuple, TYPE_CHECKING
+
 from . import ops
 
 if TYPE_CHECKING:
     from torch.cuda import _POOL_HANDLE
 
-OutputTensors = Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, ...]]
+OutputTensors = torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
 
 
 class CUDAGraph(ops.CUDAGraph):
@@ -18,7 +21,7 @@ class CUDAGraph(ops.CUDAGraph):
         return super().__new__(cls, keep_graph)
 
     def capture_begin(
-        self, pool: Optional[_POOL_HANDLE] = None, capture_error_mode: str = "global"
+        self, pool: _POOL_HANDLE | None = None, capture_error_mode: str = "global"
     ) -> None:
         super().capture_begin(pool=pool, capture_error_mode=capture_error_mode)
 
@@ -49,18 +52,14 @@ class CUDAGraph(ops.CUDAGraph):
     def raw_cuda_graph_exec(self) -> int:
         return super().raw_cuda_graph_exec()
 
-    def save(
-        self,
-        json_path: str,
-        output_tensors: Optional[OutputTensors] = None
-    ) -> None:
+    def save(self, json_path: str, output_tensors: OutputTensors | None = None) -> None:
         return super().save(json_path, output_tensors)
 
     @staticmethod
     def load(
         json_path: str,
-        pool: Optional[tuple[int, int]] = None,
-    ) -> Union["CUDAGraph", Tuple["CUDAGraph", OutputTensors]]:
+        pool: tuple[int, int] | None = None,
+    ) -> CUDAGraph | tuple[CUDAGraph, OutputTensors]:
         if graph.default_capture_stream is None:
             graph.default_capture_stream = torch.cuda.Stream()
 
@@ -76,8 +75,8 @@ class CUDAGraph(ops.CUDAGraph):
 
     @staticmethod
     def start_graph_builds(
-        json_paths: List[str],
-        pool: Optional[tuple[int, int]] = None,
+        json_paths: list[str],
+        pool: tuple[int, int] | None = None,
         num_threads: int = 4,
     ):
         """Parse graph JSONs and start template building in background.
@@ -102,22 +101,35 @@ class CUDAGraph(ops.CUDAGraph):
     @staticmethod
     def finish_graph_loads(
         pending,
-    ) -> List[Tuple["CUDAGraph", Optional[OutputTensors]]]:
+    ) -> list[tuple[CUDAGraph, OutputTensors | None]]:
         """Finish graph loads: replay allocator events and reconstruct output tensors.
 
         Takes the PendingGraphLoads handle from start_graph_builds().
         """
         return ops.CUDAGraph.finish_graph_loads(pending)
 
+    @staticmethod
+    def finish_one_graph_load(
+        pending,
+        index: int,
+    ) -> tuple[CUDAGraph, OutputTensors | None]:
+        """Finish a single graph by index. Interleaves allocator replay with
+        between-capture work so the VMM cursor on LOAD walks the same
+        trajectory it did on SAVE. First call waits on background build
+        completion (idempotent thereafter). Caller must invoke in the same
+        order SAVE captured the graphs.
+        """
+        return ops.CUDAGraph.finish_one_graph_load(pending, index)
+
 
 class graph:
-    default_capture_stream: Optional[torch.cuda.Stream] = None
+    default_capture_stream: torch.cuda.Stream | None = None
 
     def __init__(
         self,
         cuda_graph: CUDAGraph,
-        pool: Optional[_POOL_HANDLE] = None,
-        stream: Optional[torch.cuda.Stream] = None,
+        pool: _POOL_HANDLE | None = None,
+        stream: torch.cuda.Stream | None = None,
         capture_error_mode: str = "global",
     ):
         if self.__class__.default_capture_stream is None:
@@ -135,10 +147,14 @@ class graph:
     def __enter__(self) -> None:
         torch.cuda.synchronize()
 
-        if torch.compiler.config.force_cudagraph_gc:
-            gc.collect()
-
-        torch.cuda.empty_cache()
+        # NOTE(liuxs): no empty_cache here — foundry's allocator offset is
+        # monotonically increasing, freeing between captures unmaps the VMM
+        # range but doesn't rewind the cursor, so the next allocation lands
+        # at a higher cursor and final_alloc_offset inflates past the real
+        # working set (~194 GB observed vs ~80 GB real on Qwen3-30B-A3B EP2).
+        # if torch.compiler.config.force_cudagraph_gc:
+        #     gc.collect()
+        # torch.cuda.empty_cache()
 
         self.stream_ctx.__enter__()
         self.cuda_graph.capture_begin(
@@ -162,8 +178,7 @@ def save_graph_manifest(archive_dir: str) -> None:
     Should be called after all graphs are captured and saved.
     """
     graph_files = sorted(
-        (f for f in os.listdir(archive_dir)
-         if f.startswith("graph_") and f.endswith(".json")),
+        (f for f in os.listdir(archive_dir) if f.startswith("graph_") and f.endswith(".json")),
         key=lambda f: int(f.split("_")[1]),
     )
     if not graph_files:
@@ -184,11 +199,13 @@ def save_graph_manifest(archive_dir: str) -> None:
     groups = []
     templates = set()
     for topo_key, filenames in topology_keys.items():
-        groups.append({
-            "topology_key": topo_key,
-            "template": filenames[0],
-            "members": filenames,
-        })
+        groups.append(
+            {
+                "topology_key": topo_key,
+                "template": filenames[0],
+                "members": filenames,
+            }
+        )
         templates.add(filenames[0])
 
     manifest = {"topology_groups": groups}
@@ -216,6 +233,10 @@ def save_graph_manifest(archive_dir: str) -> None:
     num_templates = len(groups)
     num_on_demand = sum(len(g["members"]) - 1 for g in groups)
     import sys
-    print(f"[foundry] Saved graph_manifest.json: {num_templates} topology groups "
-          f"({num_templates} templates, {num_on_demand} on-demand, "
-          f"{num_stripped} stripped)", file=sys.stderr)
+
+    print(
+        f"[foundry] Saved graph_manifest.json: {num_templates} topology groups "
+        f"({num_templates} templates, {num_on_demand} on-demand, "
+        f"{num_stripped} stripped)",
+        file=sys.stderr,
+    )

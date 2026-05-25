@@ -73,8 +73,12 @@ struct __attribute__((visibility("default"))) KernelNodeMetadata {
   KernelNodeMetadata& operator=(const KernelNodeMetadata&) = delete;
 
   KernelNodeMetadata(KernelNodeMetadata&& other) noexcept
-    : num_params(0), kernelParams(nullptr), extra(nullptr), argBuffer(nullptr),
-      extraSize(0), argBufferSize(nullptr) {
+      : num_params(0),
+        kernelParams(nullptr),
+        extra(nullptr),
+        argBuffer(nullptr),
+        extraSize(0),
+        argBufferSize(nullptr) {
     *this = std::move(other);
   }
 
@@ -193,22 +197,16 @@ struct EventWaitNodeMetadata {
   CUevent event;
 };
 
-struct EmptyNodeMetadata {
-};
+struct EmptyNodeMetadata {};
 
 struct GraphDependency {
   int from_index;
   int to_index;
 };
 
-using GraphNodeMetadata = std::variant<
-  KernelNodeMetadata,
-  MemsetNodeMetadata,
-  MemcpyNodeMetadata,
-  EventRecordNodeMetadata,
-  EventWaitNodeMetadata,
-  EmptyNodeMetadata
->;
+using GraphNodeMetadata =
+    std::variant<KernelNodeMetadata, MemsetNodeMetadata, MemcpyNodeMetadata,
+                 EventRecordNodeMetadata, EventWaitNodeMetadata, EmptyNodeMetadata>;
 
 struct GraphNode {
   size_t index;
@@ -216,4 +214,4 @@ struct GraphNode {
   GraphNodeMetadata metadata;
 };
 
-}
+}  // namespace foundry

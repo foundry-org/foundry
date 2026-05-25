@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Foundry SGLang integration configuration."""
 
 from __future__ import annotations
 
 import enum
 import importlib.util
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+
+import tomllib
 
 
 class CUDAGraphExtensionMode(str, enum.Enum):
@@ -28,16 +30,12 @@ class CUDAGraphExtensionConfig:
     scratch_space_size: str = "64MB"
 
     @classmethod
-    def from_toml(cls, path: str | Path) -> "CUDAGraphExtensionConfig":
+    def from_toml(cls, path: str | Path) -> CUDAGraphExtensionConfig:
         with open(path, "rb") as f:
             data = tomllib.load(f)
 
         base_addr_value = data.get("base_addr", cls.base_addr)
-        base_addr = (
-            int(base_addr_value, 0)
-            if isinstance(base_addr_value, str)
-            else base_addr_value
-        )
+        base_addr = int(base_addr_value, 0) if isinstance(base_addr_value, str) else base_addr_value
 
         hook_library_path = data.get("hook_library_path")
         if hook_library_path is None:
@@ -50,9 +48,7 @@ class CUDAGraphExtensionConfig:
             base_addr=base_addr,
             region_size=data.get("region_size", cls.region_size),
             workspace_root=data.get("workspace_root", cls.workspace_root),
-            scratch_space_size=data.get(
-                "scratch_space_size", cls.scratch_space_size
-            ),
+            scratch_space_size=data.get("scratch_space_size", cls.scratch_space_size),
         )
 
     @staticmethod
@@ -106,5 +102,8 @@ def compute_workspace_rank(server_args, tp_rank: int, pp_rank: int, dp_rank: int
     if getattr(server_args, "enable_dp_attention", False):
         return pp_rank * server_args.tp_size + tp_rank
     dp_index = dp_rank or 0
-    return dp_index * server_args.tp_size * server_args.pp_size + pp_rank * server_args.tp_size + tp_rank
-
+    return (
+        dp_index * server_args.tp_size * server_args.pp_size
+        + pp_rank * server_args.tp_size
+        + tp_rank
+    )

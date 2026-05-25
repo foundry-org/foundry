@@ -27,9 +27,12 @@ vllm serve "$MODEL_NAME" \
     --max-num-seqs 512 \
     --attention-config.backend FLASH_ATTN \
     --compilation-config.cudagraph_mode FULL_DECODE_ONLY \
-    --compilation-config.cudagraph_num_of_warmups 0 \
     --compilation-config.graph_extension_config_path "$FOUNDRY_TOML"
 ```
+
+> **Note:** Don't pass `--compilation-config.cudagraph_num_of_warmups N`. vLLM's `VllmConfig.__post_init__` hard-overrides this to `1` whenever cudagraph mode is enabled (`vllm/config/vllm.py:1052`), ignoring whatever you pass. Foundry then stomps it back to `0` inside `install_hooks` because the warmup `_dummy_run(cudagraph_runtime_mode=NONE, force_attention=True)` would invoke `CUDAGraphWrapper.runnable()` outside the capture window and break SAVE/LOAD allocation parity. See [`overview.md`](overview.md#2-cudagraph_num_of_warmups-must-be-0-in-foundry-mode).
+>
+> `VLLM_USE_AOT_COMPILE` defaults to `False` in `vllm/envs.py` and is not touched by `install_hooks`. If a future vLLM bumps the default to `True`, we'd need to force-set it back (an AOT cache-hit forward would otherwise produce non-deterministic allocations between SAVE and LOAD).
 
 ### Why pre-launch `LD_PRELOAD`
 
@@ -90,11 +93,12 @@ SAVE (success):
 
 ```
 [foundry] install_hooks: mode=save workspace=foundry_archive_qwen_1.7b
-[CGE TIMING] subprocess spawn → install_hooks: ... ms
+[foundry TIMING] subprocess spawn → install_hooks: ... ms
 [foundry] all patches installed
 …
-[CGE] start_graph_builds returned in 0.xs (building in background)   ← on LOAD only
-[CGE] finish_graph_loads completed in 0.xs (N graphs)                ← on LOAD only
+[foundry] start_graph_builds returned in 0.xs (building in background)   ← on LOAD only
+[foundry TIMING] init_nvshmem_for_loaded_modules: 0.xs (N modules)       ← on LOAD only
+(per-graph replay happens inline during capture_model on LOAD)       ← no separate "finish_graph_loads" log line
 …
 [foundry] capture_final_alloc_offset = … bytes                       ← on SAVE
 INFO:     Application startup complete.
@@ -106,9 +110,10 @@ LOAD (success):
 [foundry] install_hooks: mode=load workspace=foundry_archive_qwen_1.7b
 …
 [foundry] preallocate_for_load_mode = … MB
-[CGE] start_graph_builds returned in 0.xs (building in background)
+[foundry] start_graph_builds returned in 0.xs (building in background)
+[foundry TIMING] init_nvshmem_for_loaded_modules: 0.xs (N modules)
 …
-[CGE] finish_graph_loads completed in 0.xs (N graphs)
+(per-graph replay happens inline during capture_model — no separate log line)
 …
 INFO:     Application startup complete.
 ```
@@ -125,7 +130,7 @@ A correct LOAD:
 | Symptom | Likely cause |
 |---|---|
 | `[HOOK] ERROR: Memory offset mismatch during replay` | An asymmetric allocation between SAVE pass 2 and LOAD. The watermark logs identify which lifecycle phase. |
-| LOAD aborts at first inference with `Called CUDAGraph::replay without a preceding successful capture or load` | On-demand graph lost its template link. Should not happen — vLLM always loads all paths through `preload_all_graphs`; if it does, check `_patch_capture_model`. |
+| LOAD aborts at first inference with `Called CUDAGraph::replay without a preceding successful capture or load` | On-demand graph lost its template link. Should not happen — `start_graph_builds` loads all paths in a single C++ call; if it does, check `_patch_capture_model` and that `_pending_graph_builds.identifier_to_index` covers every BatchDescriptor visited by the capture loop. |
 | `_initialize_kv_caches` complains about missing fields on LOAD | `warmup_state.json` not written by SAVE pass 1. Re-run pass 1, then pass 2. |
 | Hangs in NCCL bring-up | `setup_graph_extension` may have set up the VMM region after NCCL already touched memory. Verify `_patch_init_worker_distributed_environment` is wrapping the correct upstream symbol (vLLM renames sometimes). |
 | Workers crash with `module not found` | foundry not installed in worker venv; pip install editable in the same env, or use the serve script's PYTHONPATH approach. |

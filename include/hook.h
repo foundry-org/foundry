@@ -43,12 +43,13 @@ void clear_hook_events();
 boost::json::object save_hook_events_to_json();
 void replay_hook_events_from_json(const boost::json::object& events_obj);
 
-std::variant<CUfunction, CUkernel> query_function_handle(uint64_t binary_hash, const std::string& function_name);
+std::variant<CUfunction, CUkernel> query_function_handle(uint64_t binary_hash,
+                                                         const std::string& function_name);
 uint64_t query_binary_hash(std::variant<CUmodule, CUlibrary> handle);
 void mark_binary_used(uint64_t binary_hash);
 void load_cuda_modules_and_libraries(const std::string& archive_dir);
 
-}
+}  // namespace foundry
 #endif
 
 #endif

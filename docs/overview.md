@@ -43,8 +43,8 @@ flowchart BT
 ## What both integrations share
 
 - **SAVE→LOAD cycle.** SAVE runs the full cold-start path once, captures CUDA graphs + kernel fatbins + a warmup-state JSON, and writes them to a per-rank workspace. LOAD restores from the workspace, skipping graph capture and kernel warmup.
-- **Deterministic VMM region.** Both integrations call `foundry::set_allocation_region(base_addr, region_size)` before NCCL / distributed init. Every allocation inside the region (model weights, KV pool, attention workspaces, captured-graph alloc events) lands at a byte-deterministic offset, so SAVE and LOAD address the same VMM offsets.
-- **`final_alloc_offset` watermark.** SAVE records the final cursor position; LOAD preallocates the same range via a single `cuMemCreate+cuMemMap`, then bump-allocates within it.
+- **Deterministic VMM region.** Both integrations call `foundry::set_allocation_region(base_addr, region_size)` before NCCL / distributed init. Every allocation inside the region (model weights, KV pool, attention workspaces, captured-graph alloc events) lands at a byte-deterministic offset, so SAVE and LOAD address the same VMM offsets. Only memory *referenced by captured CUDA graphs* needs the region; the vLLM integration now calls `foundry::stop_allocation_region()` at the end of `capture_model` so subsequent runtime allocations (sampler warmup, scheduler buffers, inference workspaces) fall back to the standard CUDA caching allocator instead of paying VMM overhead. The SGLang side will follow.
+- **`final_alloc_offset` watermark.** SAVE records the final cursor position; LOAD preallocates the same range via a single `cuMemCreate+cuMemMap`, then bump-allocates within it. Because `stop_allocation_region` fires before sampler warmup, the watermark reflects only the VMM-tracked working set, not transient post-capture allocations.
 - **Manifest-driven graph load.** Captured graphs are grouped into topology equivalence classes; one graph per group is built as a *template* and the rest become *on-demand* graphs that share the template's executor via per-graph node updates.
 - **Spawn-time `LD_PRELOAD`.** `libcuda_hook.so` must be in `LD_PRELOAD` before any CUDA call so its `cuMemAlloc_v2` / `cuModuleLoad*` interposers run in every process. The integrations set the env var before child spawn; the serve scripts also export it from the shell as defense-in-depth.
 
@@ -53,11 +53,13 @@ flowchart BT
 | Aspect | vLLM | SGLang |
 |---|---|---|
 | Graph capture seam | `CUDAGraphWrapper.__call__` (per piecewise wrapper) | `CudaGraphRunner.capture` (centralized full-graph) |
-| Pre-graph warmup | `kernel_warmup`, `_dummy_run`, sampler warmup | `kernel_warmup` + 2 in-place warmup forwards inside `capture_one_batch_size` |
+| Pre-graph warmup | `kernel_warmup` (no-op), compile-warmup `_dummy_run` loop (empty under our config), sampler-warmup full forward (skipped via signature-targeted `_dummy_run` patch — see vllm/hooks.md §3) | `kernel_warmup` + 2 in-place warmup forwards inside `capture_one_batch_size` |
 | Profile forward | yes (`memory_profiling` runs full forward) → two-pass SAVE required | no (only `_profile_available_bytes` samples free memory) → single-pass SAVE |
 | Compile interaction | `torch.compile` integrated; disabled on LOAD via `do_not_compile=True` | `torch.compile` is the piecewise path; force-disabled via `disable_piecewise_cuda_graph=True` |
 | Per-bs metadata | allocated **inside** captured graph (recorded as alloc events) | allocated **outside** captured graph (FlashInfer wrappers) → pre-pass init + `reuse_pre_pass_init` shim needed |
-| MoE / EP | first-class with `moe.py` (quant metadata, DeepEP fabric, NVSHMEM) | coming soon |
+| MoE / EP | DeepEP all2all + NVSHMEM module init handled in `hooks.py` (`_patch_deepep` forces `use_fabric=True`, `_patch_prepare_comm_buffer` post-hook flushes `init_nvshmem_for_loaded_modules`) | coming soon |
+| DP empty-shard phantom | `_patch_dummy_runs` lets `Worker.execute_dummy_batch`'s `_dummy_run(uniform_decode=True)` pass through to the real forward so the empty shard joins `coordinate_batch_across_dp` and the EP all2all (see [`vllm/hooks.md`](vllm/hooks.md) §3 and `claude-doc/invariants.md` §5) | n/a |
+| Async graph builds | kicked off **after** weight load (driver contention with `load_weights` was net-negative); overlaps with KV-cache + scheduler bring-up instead | timing-independent: launched inside the capture context |
 | Process model | uniproc / MP / Ray executors | `spawn`-based `mp.Process`; needs per-child `install_hooks` |
 | Direct edits in host repo | 5 files, ~97 lines | 4 files, ~47 lines |
 

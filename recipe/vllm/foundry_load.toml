@@ -1,0 +1,6 @@
+mode = "load"
+base_addr = 0x600000000000
+region_size = "256GB"
+workspace_root = "foundry_archive"
+scratch_space_size = "4096MB"
+# nvshmem_host_path = "/path/to/vllm/tools/ep_kernels/ep_kernels_workspace/nvshmem/lib/libnvshmem_host.so"

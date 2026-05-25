@@ -1,15 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 import os
-import sys
-import subprocess
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import torch
 import torch.nn as nn
 
-
-BASE_ADDR = 0x7f0000000000
+BASE_ADDR = 0x7F0000000000
 GRAPH_BASE_ADDR = 0x80000000000
 REGION_SIZE_STR = "1GB"
 ARCHIVE_DIR = "test_archive"
@@ -18,15 +19,16 @@ HOOK_ARCHIVE_DIR = "hook_archive"
 
 def _get_hook_so_path():
     import importlib.util
-    spec = importlib.util.find_spec('foundry.ops')
+
+    spec = importlib.util.find_spec("foundry.ops")
     if not spec or not spec.origin:
-        raise RuntimeError('foundry.ops not found; ensure setup.py develop/pip install completed')
+        raise RuntimeError("foundry.ops not found; ensure setup.py develop/pip install completed")
 
     ops_so_path = Path(spec.origin).resolve()
-    hook_so_path = ops_so_path.parent / 'libcuda_hook.so'
+    hook_so_path = ops_so_path.parent / "libcuda_hook.so"
 
     if not hook_so_path.exists():
-        raise RuntimeError(f'libcuda_hook.so not found at {hook_so_path}')
+        raise RuntimeError(f"libcuda_hook.so not found at {hook_so_path}")
 
     return str(hook_so_path)
 
@@ -41,7 +43,7 @@ def _run_saving_run():
     import foundry as fdry
 
     torch.cuda.init()
-    device = torch.device('cuda:0')
+    device = torch.device("cuda:0")
     torch.set_default_device(device)
 
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
@@ -95,7 +97,7 @@ def _run_loading_run():
     import foundry as fdry
 
     torch.cuda.init()
-    device = torch.device('cuda:0')
+    device = torch.device("cuda:0")
     torch.set_default_device(device)
     torch.cuda.set_device(device)
 
@@ -123,8 +125,12 @@ def _run_loading_run():
     fdry.set_allocation_region(GRAPH_BASE_ADDR, region_size)
     graph, output_tensor = fdry.CUDAGraph.load(graph_json)
 
-    print(f"[TEST] Loading Run: Reconstructed output tensor address: {hex(output_tensor.data_ptr())}")
-    print(f"[TEST] Loading Run: Output tensor shape: {output_tensor.shape}, dtype: {output_tensor.dtype}")
+    print(
+        f"[TEST] Loading Run: Reconstructed output tensor address: {hex(output_tensor.data_ptr())}"
+    )
+    print(
+        f"[TEST] Loading Run: Output tensor shape: {output_tensor.shape}, dtype: {output_tensor.dtype}"
+    )
 
     print("[TEST] Loading Run: Replaying graph")
     graph.replay()
@@ -155,16 +161,16 @@ def _cleanup_archive():
 def _spawn_with_preload(launch_mode):
     so_path = _get_hook_so_path()
     env = os.environ.copy()
-    if env.get('LD_PRELOAD'):
-        env['LD_PRELOAD'] = f"{so_path}:{env['LD_PRELOAD']}"
+    if env.get("LD_PRELOAD"):
+        env["LD_PRELOAD"] = f"{so_path}:{env['LD_PRELOAD']}"
     else:
-        env['LD_PRELOAD'] = so_path
+        env["LD_PRELOAD"] = so_path
 
-    cmd = [sys.executable, str(Path(__file__).resolve()), f'--{launch_mode}']
+    cmd = [sys.executable, str(Path(__file__).resolve()), f"--{launch_mode}"]
     subprocess.check_call(cmd, env=env)
 
 
-@pytest.mark.filterwarnings('ignore:TORCH_CUDA_ARCH_LIST is not set')
+@pytest.mark.filterwarnings("ignore:TORCH_CUDA_ARCH_LIST is not set")
 def test_graph_save_and_load():
     """Test CUDA graph save/load with binary dumping and allocator replay"""
     print("\n[TEST] Starting test_graph_save_and_load")
@@ -172,22 +178,22 @@ def test_graph_save_and_load():
     _cleanup_archive()
 
     print("[TEST] Running saving run (capture and save)")
-    _spawn_with_preload('saving-run')
+    _spawn_with_preload("saving-run")
 
     print("[TEST] Running loading run (load and replay)")
-    _spawn_with_preload('loading-run')
+    _spawn_with_preload("loading-run")
 
     _cleanup_archive()
 
     print("[TEST] test_graph_save_and_load PASSED")
 
 
-if __name__ == '__main__':
-    if '--saving-run' in sys.argv:
+if __name__ == "__main__":
+    if "--saving-run" in sys.argv:
         _run_saving_run()
-    elif '--loading-run' in sys.argv:
+    elif "--loading-run" in sys.argv:
         _run_loading_run()
-    elif '--cleanup' in sys.argv:
+    elif "--cleanup" in sys.argv:
         _cleanup_archive()
     else:
         test_graph_save_and_load()

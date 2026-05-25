@@ -1,0 +1,4 @@
+# formatting / pre-commit toolchain. Install with
+#   pip install -r requirements/lint.txt
+# then bootstrap the hooks once with `pre-commit install`.
+pre-commit>=4.5.1

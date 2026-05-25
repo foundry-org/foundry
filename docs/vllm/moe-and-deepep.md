@@ -1,26 +1,12 @@
 # MoE / DeepEP Support
 
-vLLM-side MoE / expert-parallelism support is what makes the integration interesting beyond dense decode. The core problem: MoE weight packing depends on a per-expert quant config that's computed during weight load, and DeepEP all-to-all communicator buffers must be set up in fabric mode for foundry to interpose them.
+vLLM-side MoE / expert-parallelism support is what makes the integration interesting beyond dense decode. The remaining MoE-specific concern is that DeepEP all-to-all communicator buffers must be set up in fabric mode for foundry to interpose them, and NVSHMEM module init must fire after the runtime is bootstrapped.
 
-The dense-only baseline doesn't exercise any of this; turn it on by running an MoE model (e.g. DeepSeek-V2 with EP).
+The dense-only baseline doesn't exercise any of this; turn it on by running an MoE model with EP.
 
-## MoE quant metadata
+## MoE weight packing
 
-### Problem
-
-`load_model` reads the model checkpoint and, for MoE layers, packs expert weights using a quant config derived from the checkpoint. The quant config can vary slightly across runs because of non-determinism in fp8 calibration paths or numerical thresholds that fall right on a boundary. If SAVE pass 1's packed weights differ from LOAD's, the captured graph's kernel args reference one packing and LOAD has the other — silent wrong output.
-
-### Solution
-
-`foundry.integration.vllm.moe`:
-
-1. **SAVE pass 1**: after `loader.load_model()`, call `collect_moe_quant_metadata(model)` to extract the resolved quant config per MoE layer. Serialize into `WarmupState.moe_quant_metadata`.
-
-2. **SAVE pass 2 / LOAD**: before `loader.load_model()`, call `inject_moe_quant_metadata(model, ws.moe_quant_metadata)` so the loader uses the saved config instead of re-deriving.
-
-3. **After load**: `reinit_moe_quant_config(model)` is called on both SAVE and LOAD to re-bind any per-layer state that depends on the now-known quant config (e.g. compiled expert routing kernels).
-
-This is wrapped in `_load_model_with_cge_overlap` in `foundry/integration/vllm/hooks.py::_patch_load_model`. The dense path skips all of this and falls through to a simpler overlap.
+vLLM's recent versions use modular kernels for both quantized and unquantized MoE — the same `model_loader.load_model()` path produces deterministic packing regardless of foundry mode. Foundry's integration takes the unified preallocate → `start_graph_builds` → weight-load → `prepare_communication_buffer_for_model` path for all MoE variants (and for dense models), so no quant-metadata roundtrip through `WarmupState` is needed. The earlier `collect_moe_quant_metadata` / `inject_moe_quant_metadata` / `reset_moe_quant_config` / `reinit_moe_quant_config` / `split_load_model` ceremony has been removed.
 
 ## DeepEP fabric mode
 
@@ -53,11 +39,15 @@ Forces every foundry-mode DeepEP setup onto the fabric path. The patch lives beh
 
 NVSHMEM modules must be loaded into device code memory **before** any captured graph that references NVSHMEM kernels is replayed.
 
-`runtime.setup_graph_extension(...)` on LOAD calls `cge.set_skip_fatbin_processing(True)` and `cge.load_cuda_modules_and_libraries(workspace_dir)` early. Subsequently, `preload_all_graphs(...)` calls `cge.init_nvshmem_for_loaded_modules()` before `finish_graph_loads(...)` runs the captured kernels.
+1. `runtime.setup_graph_extension(...)` on LOAD calls `fops.set_skip_fatbin_processing(True)` then `fops.load_cuda_modules_and_libraries(workspace_dir)`. The loader queues each NVSHMEM-using module into `pending_nvshmem_init` but does not flush it (the NVSHMEM runtime isn't up yet).
 
-If NVSHMEM init runs after `finish_graph_loads`, the first captured graph that calls into NVSHMEM aborts with `cuLaunchKernel` errors because the kernel handles don't resolve yet.
+2. `_load_model_with_overlap` runs `preallocate_for_load_mode()` and `start_graph_builds()`, then calls `do_original_load()` which eventually invokes `prepare_communication_buffer_for_model(model)`. The orig call constructs the DeepEP `Buffer`, which bootstraps the NVSHMEM runtime.
 
-For dense single-GPU models the NVSHMEM count is 0 and these calls are no-ops; they're kept in the LOAD path for EP parity.
+3. `_patch_prepare_comm_buffer`'s post-orig hook then calls `fops.init_nvshmem_for_loaded_modules()` to flush the queue — well before any captured graph that uses NVSHMEM symbols is replayed by `finish_one_graph_load` inside `capture_model`.
+
+If NVSHMEM init runs after the first `finish_one_graph_load`, the captured graph that calls into NVSHMEM aborts with `cuLaunchKernel` errors because the kernel handles don't resolve yet. If it runs *before* `prepare_communication_buffer_for_model` (the bug we hit when init was placed inside `start_graph_builds`), `nvshmemx_cumodule_init` silently no-ops because the runtime is not bootstrapped, and replay later sees uninitialized modules — also fatal.
+
+For dense single-GPU models the NVSHMEM count is 0 and the call is a no-op; the post-orig hook is kept on all paths for parity.
 
 ## Validation
 

@@ -44,4 +44,3 @@
 
 - [ ] Dynamic EP size adjustment by reusing templates and updating rank-dependent communication state
 - [ ] Instant EP scale-up/scale-down without full graph recapture
-

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Runtime state and VMM setup for the Foundry SGLang integration."""
 
 from __future__ import annotations
@@ -129,9 +130,7 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
     elif cfg.mode == CUDAGraphExtensionMode.LOAD:
         cge.set_skip_fatbin_processing(True)
         if not workspace_dir.exists():
-            raise RuntimeError(
-                f"Foundry workspace for rank {rank} does not exist: {workspace_dir}"
-            )
+            raise RuntimeError(f"Foundry workspace for rank {rank} does not exist: {workspace_dir}")
         cge.load_cuda_modules_and_libraries(str(workspace_dir))
 
     region_size = parse_size(cfg.region_size)
@@ -220,5 +219,5 @@ def setup_ld_preload_env() -> None:
         os.environ["LD_PRELOAD"] = current
     mode = get_graph_extension_mode()
     if mode != CUDAGraphExtensionMode.NONE:
-        os.environ["CGE_MODE"] = mode.value
+        os.environ["FOUNDRY_MODE"] = mode.value
     os.environ["FOUNDRY_SPAWN_T0_NS"] = str(time.perf_counter_ns())

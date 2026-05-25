@@ -104,8 +104,8 @@ Persisting the resolved `MemoryPoolConfig` (via `dataclasses.asdict`) and re-app
 - Computes the per-rank workspace path (`{workspace_root}/rank_{compute_workspace_rank(...)}`)
 - On SAVE: removes the rank workspace if it exists, then creates it fresh
 - On LOAD:
-  - `cge.set_skip_fatbin_processing(True)`
-  - `cge.load_cuda_modules_and_libraries(workspace_dir)` — restores the fatbins SAVE wrote, into device code memory
+    - `cge.set_skip_fatbin_processing(True)`
+    - `cge.load_cuda_modules_and_libraries(workspace_dir)` — restores the fatbins SAVE wrote, into device code memory
 - `cge.set_allocation_region(cfg.base_addr, parse_size(cfg.region_size))` — reserves a VMM address range; the cursor starts at `base_addr`
 - `torch._C._cuda_getCurrentBlasHandle()` — eager cuBLAS handle so the workspace it wants lands in scratch instead of post-scratch territory
 - creates the `CUDAGraphExtensionState` singleton
@@ -117,4 +117,3 @@ After upstream `init_torch_distributed` returns, `skip_to_scratch_boundary` forc
 `capture_final_alloc_offset` runs after the SAVE-side capture loop completes (after `save_graph_manifest` and `pack_fatbins`). It writes `final_alloc_offset` to both `rank_{N}/final_alloc_offset.json` and the shared `warmup_state.json`.
 
 `preallocate_for_load_mode` uses this to call `cge.preallocate_region(final - current)` so the entire deterministic range is mapped to physical memory in one shot. The cursor is **not** advanced — preallocate just pre-maps; the cursor advances naturally as cuMemAllocs land within the preallocated range (fast-path: pointer bump, no driver calls).
-

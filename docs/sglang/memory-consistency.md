@@ -28,7 +28,9 @@ LOAD never calls `_capture_graph`, so nothing flipped the region off. LOAD's per
 
 ### Fix
 
-Removed both calls in `CUDAGraph::capture_begin/end`. Only the hook recording window (`start_hook_record` / `end_hook_record`) brackets each capture. The region stays ON for the entire SGLang capture loop.
+Removed both calls in `CUDAGraph::capture_begin/end`. Only the hook recording window (`start_hook_record` / `end_hook_record`) brackets each capture. Region toggling is now each integration's responsibility, and both SGLang and vLLM keep the region ON across the whole capture loop.
+
+(vLLM initially tried a Python-side `resume/stop_allocation_region` bracket around each capture to suppress the `final_alloc_offset` inflation seen on Qwen3-30B-A3B EP2 — ~194 GB observed vs ~80 GB actual. That was wrong: any tensor a between-capture allocation produced that was later referenced by a captured kernel would have ended up outside the deterministic region, so LOAD's preallocation couldn't recreate it at the right address. The actual root cause was the `empty_cache()` inside `foundry/graph.py:CUDAGraph.__enter__`, which dropped torch caching-allocator segments and forced subsequent inter-capture allocations to take a fresh `cuMemAlloc_v2` path. Removing it brought `final_alloc_offset` back down to ~80 GB. The vLLM integration now also wraps the whole capture loop in `torch.cuda.use_mem_pool(graph_pool)` so SAVE-2 ↔ LOAD caching state stays symmetric for the per-graph `finish_one_graph_load` replay path.)
 
 ## Bug 2 — Pre-capture warmup forwards on SAVE only
 

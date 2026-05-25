@@ -148,4 +148,3 @@ INFO:     Application startup complete.
 ```
 
 The `after_load_all_graphs` value **must** equal SAVE's `final_alloc_offset`. If it doesn't, see [`memory-consistency.md`](memory-consistency.md).
-

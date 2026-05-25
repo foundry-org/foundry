@@ -1,13 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 import os
-import sys
-import subprocess
 import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
 import torch
-
 
 BASE_ADDR = 0x2F0000000000
 REGION_SIZE_STR = "2GB"
@@ -23,15 +24,16 @@ NUM_MLP_LAYERS = 4  # Stack multiple layers per graph for more kernel nodes
 
 def _get_hook_so_path():
     import importlib.util
-    spec = importlib.util.find_spec('foundry.ops')
+
+    spec = importlib.util.find_spec("foundry.ops")
     if not spec or not spec.origin:
-        raise RuntimeError('foundry.ops not found; ensure setup.py develop/pip install completed')
+        raise RuntimeError("foundry.ops not found; ensure setup.py develop/pip install completed")
 
     ops_so_path = Path(spec.origin).resolve()
-    hook_so_path = ops_so_path.parent / 'libcuda_hook.so'
+    hook_so_path = ops_so_path.parent / "libcuda_hook.so"
 
     if not hook_so_path.exists():
-        raise RuntimeError(f'libcuda_hook.so not found at {hook_so_path}')
+        raise RuntimeError(f"libcuda_hook.so not found at {hook_so_path}")
 
     return str(hook_so_path)
 
@@ -88,7 +90,7 @@ def _simulate_foreground_work():
         print(f"  [FG] Processed fake weight {size}x{size} on CPU")
 
     elapsed = time.perf_counter() - t0
-    print(f"  [FG] Foreground work done in {elapsed*1000:.1f}ms")
+    print(f"  [FG] Foreground work done in {elapsed * 1000:.1f}ms")
 
 
 def _run_saving_run():
@@ -98,7 +100,7 @@ def _run_saving_run():
     print("[SAVE] Starting saving run")
 
     torch.cuda.init()
-    device = torch.device('cuda:0')
+    device = torch.device("cuda:0")
     torch.set_default_device(device)
 
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
@@ -147,7 +149,7 @@ def _run_loading_run():
     print("[LOAD] Starting loading run")
 
     torch.cuda.init()
-    device = torch.device('cuda:0')
+    device = torch.device("cuda:0")
     torch.set_default_device(device)
 
     if not os.path.exists(ARCHIVE_DIR):
@@ -170,9 +172,7 @@ def _run_loading_run():
         init_cublas()
     print("[LOAD] cuBLAS initialized")
 
-    graph_paths = [
-        os.path.join(ARCHIVE_DIR, f"graph_{i}.json") for i in range(NUM_GRAPHS)
-    ]
+    graph_paths = [os.path.join(ARCHIVE_DIR, f"graph_{i}.json") for i in range(NUM_GRAPHS)]
 
     # --- Phase 1: start_graph_builds (returns immediately) ---
     num_threads = 6
@@ -193,9 +193,7 @@ def _run_loading_run():
     finish_ms = (time.perf_counter() - t_finish) * 1000
     print(f"[LOAD] finish_graph_loads completed in {finish_ms:.1f}ms")
 
-    assert len(results) == NUM_GRAPHS, (
-        f"Expected {NUM_GRAPHS} results, got {len(results)}"
-    )
+    assert len(results) == NUM_GRAPHS, f"Expected {NUM_GRAPHS} results, got {len(results)}"
 
     # Output tensors are available after finish_graph_loads
     for i, (graph, output) in enumerate(results):
@@ -219,8 +217,10 @@ def _run_loading_run():
         print(f"  Graph {i} (bs={bs}): replay {replay_ms:.1f}ms — PASSED")
 
     total_ms = (time.perf_counter() - t_start) * 1000
-    print(f"\n[LOAD] All {NUM_GRAPHS} graphs verified. "
-          f"Total: {total_ms:.1f}ms (phase1={phase1_ms:.1f}ms, finish={finish_ms:.1f}ms)")
+    print(
+        f"\n[LOAD] All {NUM_GRAPHS} graphs verified. "
+        f"Total: {total_ms:.1f}ms (phase1={phase1_ms:.1f}ms, finish={finish_ms:.1f}ms)"
+    )
 
     fdry.stop_allocation_region()
     print("[LOAD] Loading run completed")
@@ -236,17 +236,17 @@ def _cleanup_archive():
 def _spawn_with_preload(launch_mode):
     so_path = _get_hook_so_path()
     env = os.environ.copy()
-    if env.get('LD_PRELOAD'):
-        env['LD_PRELOAD'] = f"{so_path}:{env['LD_PRELOAD']}"
+    if env.get("LD_PRELOAD"):
+        env["LD_PRELOAD"] = f"{so_path}:{env['LD_PRELOAD']}"
     else:
-        env['LD_PRELOAD'] = so_path
+        env["LD_PRELOAD"] = so_path
     env["TORCH_CUBLASLT_UNIFIED_WORKSPACE"] = "1"
 
-    cmd = [sys.executable, str(Path(__file__).resolve()), f'--{launch_mode}']
+    cmd = [sys.executable, str(Path(__file__).resolve()), f"--{launch_mode}"]
     subprocess.check_call(cmd, env=env)
 
 
-@pytest.mark.filterwarnings('ignore:TORCH_CUDA_ARCH_LIST is not set')
+@pytest.mark.filterwarnings("ignore:TORCH_CUDA_ARCH_LIST is not set")
 def test_async_graph_load():
     """Test async CUDA graph loading with foreground work overlap."""
     print("\n[TEST] Starting test_async_graph_load")
@@ -254,22 +254,22 @@ def test_async_graph_load():
     _cleanup_archive()
 
     print(f"[TEST] Step 1: Saving run (capture {NUM_GRAPHS} graphs, {NUM_MLP_LAYERS} layers each)")
-    _spawn_with_preload('saving-run')
+    _spawn_with_preload("saving-run")
 
     print("[TEST] Step 2: Loading run (async load + foreground overlap + verify)")
-    _spawn_with_preload('loading-run')
+    _spawn_with_preload("loading-run")
 
     _cleanup_archive()
 
     print("[TEST] test_async_graph_load PASSED")
 
 
-if __name__ == '__main__':
-    if '--saving-run' in sys.argv:
+if __name__ == "__main__":
+    if "--saving-run" in sys.argv:
         _run_saving_run()
-    elif '--loading-run' in sys.argv:
+    elif "--loading-run" in sys.argv:
         _run_loading_run()
-    elif '--cleanup' in sys.argv:
+    elif "--cleanup" in sys.argv:
         _cleanup_archive()
     else:
         test_async_graph_load()
