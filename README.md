@@ -30,8 +30,8 @@ Foundry intercepts three classes of CUDA driver calls and routes each through it
 flowchart LR
     subgraph APP["Application calls"]
         direction TB
-        A1["cudaMemAlloc_v2<br/>cudaMemFree_v2"]
-        A2["cudaModuleLoadData<br/>cudaLibraryLoadData"]
+        A1["cudaMemXXX"]
+        A2["cudaModuleLoadXXX<br/>cudaLibraryLoadXXX"]
         A3["cudaGraph capture<br/>cudaGraphLaunch"]
     end
 
