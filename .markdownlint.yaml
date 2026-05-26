@@ -6,6 +6,7 @@ MD024:
 MD031:
   list_items: false
 MD033: false   # allow inline HTML (mermaid blocks etc.)
+MD041: false   # README opens with a centered <div> header, not a bare # heading
 MD040: false   # allow code fences without an explicit language tag
 MD046: false   # allow either fenced or indented code blocks
 MD052: false   # allow link-style references without definitions (issue tags)

@@ -1,4 +1,13 @@
-# Foundry
+<div align="center">
+  <h1>Foundry</h1>
+  <p><em>Instantaneous CUDA graph restoration via execution context materialization.</em></p>
+
+  <p>
+    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.12-blue"></a>
+    <a href="https://arxiv.org/abs/2604.06664"><img alt="arXiv" src="https://img.shields.io/badge/arXiv-2604.06664-b31b1b?logo=arxiv&logoColor=white&labelColor=555555"></a>
+    <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-green.svg"></a>
+  </p>
+</div>
 
 Foundry is a system that persists CUDA graph states through *template-based context materialization*. It materializes both the structure and execution context of captured CUDA graphs, making graph restoration kernel-agnostic and eliminating the need for hand-crafted patching rules. By intercepting CUDA driver calls, Foundry enforces a **deterministic memory layout** and automatically detects and serializes the **binaries of kernels** used in the CUDA graphs.
 
@@ -6,9 +15,12 @@ With Foundry, LLM serving engines can directly reload CUDA states from disk and 
 
 ## Foundry in Action
 
-![Foundry vs. baseline vLLM cold start](assets/foundry_demo.gif)
+Demonstration of serving `Qwen/Qwen3-30B-A3B-FP8` with expert parallel size = 2.
 
-**Baseline vLLM (top) vs. vLLM + Foundry (bottom)**. Foundry reconstructs 256 graphs in **<u>1 sec</u>** (plus ~2 sec sampler warmup + API server init), while orginal vLLM spends around **<u>30 sec</u>** to warmup and capture graphs.
+<div align="center">
+  <img src="assets/foundry_demo.gif" alt="Foundry vs. baseline vLLM cold start" />
+  <p><strong>Baseline vLLM (top) vs. vLLM + Foundry (bottom)</strong>. Foundry reconstructs 256 graphs in <strong><u>1 sec</u></strong> (plus ~2 sec sampler warmup + API server init), while original vLLM spends around <strong><u>30 sec</u></strong> to warmup and capture graphs.</p>
+</div>
 
 ## How it works
 
