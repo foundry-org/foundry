@@ -82,7 +82,7 @@ Foundry ships engine integrations under `foundry/python/foundry/integration/`. P
 | Engine | Single GPU | DP | TP | EP |
 |---|:---:|:---:|:---:|:---:|
 | vLLM | ✅ | ✅ | 🚧 | ✅ |
-| SGLang | ✅ | 🚧 | 🚧 | 🚧 |
+| SGLang | ✅ | ✅ | 🚧 | ✅ |
 | TensorRT-LLM | 🚧 | 🚧 | 🚧 | 🚧 |
 
 ✅ validated end-to-end (SAVE → LOAD → query) &nbsp;·&nbsp; 🚧 not yet

@@ -178,6 +178,76 @@ def preload_all_graphs() -> None:
         state.loaded_graphs[meta["key"]] = (graph, _unpack_output(tensors))
 
 
+def bootstrap_deepep_buffer(cuda_graph_runner) -> bool:
+    """Force the singleton DeepEP ``Buffer`` (NVSHMEM runtime + symmetric heap)
+    to be created BEFORE the cuda-graph capture loop.
+
+    sglang creates the DeepEP buffer lazily on the first MoE dispatch — normally
+    during the two pre-capture warmup forwards. Foundry suppresses those warmups
+    (for allocation determinism), which would push buffer creation into the
+    captured forward, where ``deep_ep_cpp.Buffer(...)`` aborts with
+    ``operation not permitted when stream is capturing``.
+
+    Triggering it here (outside any stream capture) creates only the NVSHMEM
+    runtime + symmetric heap — no model activations — so it stays symmetric
+    across SAVE and LOAD and lands at the same VMM offset on both. The buffer is
+    a process-wide singleton (``DeepEPBuffer._buffer``), so one creation per rank
+    is enough. It is a collective over the EP group, so every rank must reach
+    this point together — which they do, since ``capture`` runs on all ranks.
+
+    Returns True if a buffer was (or already is) created, False if DeepEP is off.
+    """
+    try:
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if not get_moe_a2a_backend().is_deepep():
+            return False
+    except Exception:
+        return False
+
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPBuffer,
+        DeepEPDispatcher,
+    )
+
+    if DeepEPBuffer._buffer is not None:
+        return True
+
+    model = cuda_graph_runner.model_runner.model
+    for module in model.modules():
+        dispatcher = getattr(module, "dispatcher", None)
+        if dispatcher is None:
+            continue
+        # ``module.dispatcher`` is normally a MaybeTboDeepEPDispatcher wrapper
+        # whose ``_inners`` hold the real DeepEPDispatcher(s); unwrap it. (Also
+        # handle a bare DeepEPDispatcher for safety.)
+        candidates = [dispatcher, *getattr(dispatcher, "_inners", [])]
+        deepep = next((d for d in candidates if isinstance(d, DeepEPDispatcher)), None)
+        if deepep is None:
+            continue
+        # Prefer the low-latency impl (the mode foundry captures); the buffer
+        # is sized for whichever impls exist, so either bootstraps the shared
+        # singleton.
+        impl = getattr(deepep, "_low_latency_dispatcher", None) or getattr(
+            deepep, "_normal_dispatcher", None
+        )
+        if impl is None:
+            continue
+        t0 = time.perf_counter()
+        impl._get_buffer()
+        logger.info(
+            "[Foundry] Bootstrapped DeepEP buffer pre-capture in %.3fs",
+            time.perf_counter() - t0,
+        )
+        return True
+
+    logger.warning(
+        "[Foundry] DeepEP backend active but no DeepEPDispatcher found on the "
+        "model; buffer not bootstrapped (capture may fail inside stream capture)."
+    )
+    return False
+
+
 def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int) -> None:
     """Populate ``decode_cuda_graph_metadata[bs]`` for runtime replay.
 

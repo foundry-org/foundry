@@ -1,4 +1,81 @@
-# Foundry 0.0.1
+# Foundry 0.0.2
+
+SGLang graduates to a fully validated engine. This release brings the SGLang
+integration to parity with vLLM across single GPU, data parallel, and expert
+parallel — with a self-contained recipe and no vLLM build dependency for EP.
+
+## Highlights
+
+- **SGLang single GPU / DP / EP all validated end-to-end.**
+  SAVE → LOAD → query verified on single-GPU Qwen3-1.7B / 4B / 14B,
+  data-parallel (DP=2) Qwen3-1.7B, and expert-parallel (EP=2, DeepEP
+  low-latency) Qwen3-30B-A3B-FP8. Foundry-restored decode graphs match baseline
+  throughput within run-to-run noise; cold start drops from ~30 s of capture to
+  a ~0.4 s restore.
+- **NVSHMEM auto-detection — no manual path, no vLLM ep_kernels.**
+  Foundry now resolves DeepEP's `libnvshmem_host.so` from the `nvidia-nvshmem`
+  wheel (a `torch` dependency) the same way it auto-detects `libcuda_hook.so`.
+  DeepEP installs via SGLang's own `ci_install_deepep.sh`; the vLLM EP-kernel
+  helper is no longer required.
+- **Minimal SGLang fork — 47 lines, activation only.**
+  The fork carries just a CLI flag, a config field, and three `apply_server_args`
+  call sites (`server_args.py`, `foundry_shim.py`, `scheduler.py`,
+  `data_parallel_controller.py`). All save/load logic lives in the integration
+  layer; the edits are inert unless `--foundry-graph-extension-config-path` is set.
+
+## Engine integrations
+
+- **SGLang** — integration for SGLang v0.5.13. Working configurations: single
+  GPU, data parallel (DP), expert parallel (EP, DeepEP low-latency + DP-attention with fa3). Self-contained recipes under `recipe/sglang/` (shared TOML pair +
+  per-config serve scripts, mirroring `recipe/vllm/`) for Qwen3-1.7B (single),
+  Qwen3-1.7B (DP), and Qwen3-30B-A3B-FP8 (EP). TP attention stays unsupported
+  (NCCL all-reduce vs the VMM region) — EP uses DP-attention instead. EP requires
+  SGLang's pinned kernels — DeepEP `9af0e0d` (not vLLM's `29d31c0`),
+  `sgl-deep-gemm >= 0.1.2`, and `flash-attn-3` (fa3 sidesteps a FlashInfer
+  ragged-prefill off-by-one under this config).
+
+- **Manual DeepEP / NVSHMEM bootstrap (SGLang has no `prepare_comm_buffer`).**
+  vLLM exposes `prepare_communication_buffer_for_model`, a clean upstream site
+  where foundry brings up the NVSHMEM runtime. SGLang has no equivalent — it
+  creates the singleton DeepEP `Buffer` lazily on the first MoE dispatch, inside
+  the warmup forwards foundry suppresses, which would push `Buffer(...)` into the
+  captured stream ("operation not permitted when stream is capturing"). Foundry
+  instead walks the model to the `DeepEPDispatcher` and forces buffer creation
+  (`bootstrap_deepep_buffer`) before the capture loop on SAVE and before replay
+  on LOAD, with `init_nvshmem_for_loaded_modules` run once on LOAD before any
+  NVSHMEM-kernel graph replays.
+
+## Fixes
+
+- **Per-rank VMM device binding (DP/TP/EP).** `set_allocation_region` binds to
+  the current CUDA device, so the integration now calls `set_device(gpu_id)`
+  before reserving the region — rank > 0 previously reserved on `cuda:0` and
+  faulted.
+- **Set the main CUDA context on graph-build pool workers (C++).** EP graphs
+  carry `NODE_EVENT_RECORD`/`WAIT` nodes, so on-demand prep calls `cuEventCreate`
+  on `SimpleThreadPool` workers that had no current context. Added
+  `cuCtxSetCurrent(main_ctx)` as the first call on those workers (mirroring the
+  background thread) — without it LOAD faulted with "invalid device context".
+  Dense graphs never hit this path, which is why it surfaced only on SGLang EP.
+- **EP capture/load correctness.** A SAVE-only warmup pass (triggers DeepGEMM
+  per-shape JIT + lazy init outside the captured graph), `deepep_adapter` mode
+  init on LOAD (replay asserts on `_captured_deepep_mode`, which the replaced
+  capture loop never sets), and the FlashInfer per-bs pre-pass gated off for fa3
+  while still populating `decode_cuda_graph_metadata` post-load for replay.
+
+## Docs
+
+- New `docs/sglang/` set (overview, direct-edits, hooks, memory-lifecycle,
+  save-load-workflow, memory-consistency) and a self-contained `recipe/sglang/`
+  README with install, run, performance, and troubleshooting.
+- Top-level README parallelism status table updated to mark SGLang single GPU,
+  DP, and EP as validated.
+
+---
+
+## Previous Releases
+
+## Foundry 0.0.1
 
 First public release of Foundry — a CUDA-graph persistence library that
 captures an entire model's CUDA graphs (plus their device context: modules,

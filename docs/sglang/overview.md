@@ -2,7 +2,41 @@
 
 Foundry persists SGLang's `CudaGraphRunner` graphs to disk on SAVE and restores them on LOAD, skipping graph capture, kernel warmup, and the per-batch-size attention metadata setup costs.
 
-Tested on single-GPU Qwen3-1.7B / 4B / 14B with the FlashInfer attention backend.
+Tested on single-GPU Qwen3-1.7B / 4B / 14B and **data-parallel (DP=2)** Qwen3-1.7B with the FlashInfer attention backend.
+
+## Parallelism
+
+| Mode | Status | Notes |
+|---|:---:|---|
+| Single GPU | ✅ | Qwen3-1.7B / 4B / 14B |
+| Data parallel (DP) | ✅ | One full replica per rank; validated DP=2. Requires the per-rank device binding (below) and `NCCL_CUMEM_ENABLE=0` / `NCCL_NVLS_ENABLE=0`. |
+| Tensor parallel (TP) | 🚧 | Deterministic NCCL memory layout is under construction. |
+| Expert parallel (DeepEP) | ✅ | Validated EP=2 on Qwen3-30B-A3B-FP8 (SAVE/SAVE2/LOAD/query); restored decode graphs match baseline throughput. See **Expert parallel** below. |
+
+**Expert parallel (DeepEP).** EP runs DP-attention (each rank its own attention — no
+NCCL all-reduce) + DeepEP for the MoE all-to-all (NVSHMEM, foundry-compatible). The
+serve script is `recipe/sglang/serve_qwen3-30ba3bfp8_ep.sh
+<ep_size> [--save|--load]` with: `--enable-dp-attention --moe-a2a-backend deepep
+--deepep-mode low_latency --moe-runner-backend deep_gemm --attention-backend fa3
+--disable-custom-all-reduce`. Required kernel builds in the env: `deep_ep` at sglang's
+pinned commit (`9af0e0d`, not vLLM's), `sgl-deep-gemm>=0.1.2` (0.1.0 lacks
+`m_grouped_bf16_gemm_nt_masked`), `flash-attn-3`. `fa3` is required because the
+flashinfer ragged-prefill path has an off-by-one (`q.shape != qo_indptr`) under this
+config. DeepEP low-latency caps dispatch at
+`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` (default 128); raise it (+ chunk
+prefill) for larger batches and keep it identical across SAVE/LOAD. Foundry-specific
+EP handling is in [`hooks.md`](hooks.md): a DeepEP buffer pre-capture bootstrap, a
+SAVE-only warmup pass (triggers DeepGEMM JIT + buffer creation outside the capture
+stream), `deepep_adapter` mode init on LOAD, the FlashInfer pre-pass gated off for
+fa3, and a C++ fix binding the CUDA context on the graph-build pool workers.
+
+**Per-rank device binding (DP/TP/EP).** Foundry's `set_allocation_region` binds the
+VMM region to the CUDA device current at call time. Upstream sets the device
+*inside* `init_torch_distributed`, which the integration wraps and front-runs, so
+the hook explicitly calls `set_device(self.gpu_id)` before reserving the region —
+otherwise rank > 0 reserves on `cuda:0` and faults. See [`hooks.md`](hooks.md) §1.
+The DP serve script lives at `recipe/sglang/serve_qwen3-1.7b_dp.sh`
+(`<dp_size> [--save|--load]`); pick GPUs with `CUDA_VISIBLE_DEVICES`.
 
 ## How to use
 
@@ -12,31 +46,31 @@ Tested on single-GPU Qwen3-1.7B / 4B / 14B with the FlashInfer attention backend
 pushd foundry && pip install -e . --no-build-isolation && popd
 ```
 
-Or run from source; the serve scripts in `experimental/single-gpu/` already export `PYTHONPATH=…/foundry/python:…/sglang/python` so an editable install is not strictly required.
+An editable install (`pip install -e .`) is the supported path — the recipe serve scripts set no `PYTHONPATH` and rely on `foundry` being importable. To run straight from a source checkout, export `PYTHONPATH=…/foundry/python:…/sglang/python` yourself.
 
 ### 2. Write a TOML config
 
 ```toml
-# experimental/single-gpu/save_qwen_1.7b.toml
+# recipe/sglang/foundry_save.toml
 mode = "save"
 base_addr = 0x600000000000
 region_size = "256GB"
-workspace_root = "foundry_archive_qwen_1.7b"
+workspace_root = "foundry_archive"
 scratch_space_size = "1024MB"
 ```
 
-The matching `load_qwen_1.7b.toml` just changes `mode = "load"`. See [`memory-lifecycle.md`](memory-lifecycle.md) for what each field controls.
+The matching `foundry_load.toml` just changes `mode = "load"`. See [`memory-lifecycle.md`](memory-lifecycle.md) for what each field controls.
 
 ### 3. Run SAVE, then LOAD
 
 ```bash
 # SAVE
-rm -rf foundry_archive_qwen_1.7b
-bash experimental/single-gpu/serve_sglang_qwen_1.7b.sh --save
+rm -rf foundry_archive
+bash recipe/sglang/serve_qwen3-mini.sh --save
 # Wait for "Application startup complete", then SIGTERM the server.
 
 # LOAD
-bash experimental/single-gpu/serve_sglang_qwen_1.7b.sh --load
+bash recipe/sglang/serve_qwen3-mini.sh --load
 
 # Query
 curl -s http://0.0.0.0:12000/v1/completions \
@@ -47,8 +81,6 @@ curl -s http://0.0.0.0:12000/v1/completions \
 ```
 
 A single SAVE pass is enough — SGLang doesn't run a profile-forward at startup, so there is no non-determinism that requires a second pass.
-
-The scripts pre-load `libcuda_hook.so` from the foundry build via `LD_PRELOAD` and propagate it (and `CGE_MODE`) into every child process via `setup_ld_preload_env()`.
 
 ## What the integration does
 

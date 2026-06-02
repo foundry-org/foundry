@@ -10,14 +10,10 @@ HOST="0.0.0.0"
 PORT=12000
 MEM_FRACTION_STATIC=0.6
 
-# Pre-launch LD_PRELOAD of libcuda_hook.so so the hook interposes CUDA
-# in the parent process and is inherited by every child.
-FOUNDRY_HOOK="$(cd "${SCRIPT_DIR}/../../foundry/python/foundry" && pwd)/libcuda_hook.so"
-export LD_PRELOAD="${FOUNDRY_HOOK}${LD_PRELOAD:+:$LD_PRELOAD}"
-
-# Make in-tree foundry + sglang importable from a venv that hasn't pip-installed them.
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-export PYTHONPATH="${REPO_ROOT}/foundry/python:${REPO_ROOT}/sglang/python${PYTHONPATH:+:${PYTHONPATH}}"
+# No LD_PRELOAD / PYTHONPATH here: foundry + the sglang fork are pip-installed, and
+# foundry's setup_ld_preload_env auto-detects libcuda_hook.so and LD_PRELOADs it
+# into every worker at spawn time. (Running from a source checkout instead? Export
+# PYTHONPATH=.../foundry/python:.../sglang/python yourself.)
 
 sglang serve \
     --model-path "$MODEL_NAME" \
@@ -35,32 +31,32 @@ sglang serve \
 
 ## TOML configs
 
-`experimental/single-gpu/save_qwen_1.7b.toml`:
+`recipe/sglang/foundry_save.toml`:
 
 ```toml
 mode = "save"
 base_addr = 0x600000000000
 region_size = "256GB"
-workspace_root = "foundry_archive_qwen_1.7b"
+workspace_root = "foundry_archive"
 scratch_space_size = "1024MB"
 ```
 
-`load_qwen_1.7b.toml` is identical except `mode = "load"`. See [`memory-lifecycle.md`](memory-lifecycle.md) for the field semantics.
+`foundry_load.toml` is identical except `mode = "load"`. See [`memory-lifecycle.md`](memory-lifecycle.md) for the field semantics.
 
 ## Run sequence
 
 ```bash
-cd /path/to/foundry-org
+cd /path/to/foundry/recipe/sglang
 
 # 1. Clean any prior workspace
-rm -rf foundry_archive_qwen_1.7b
+rm -rf foundry_archive
 
 # 2. SAVE
-bash experimental/single-gpu/serve_sglang_qwen_1.7b.sh --save
+bash serve_qwen3-mini.sh --save
 # wait for "Application startup complete", then Ctrl-C / SIGTERM
 
 # 3. LOAD
-bash experimental/single-gpu/serve_sglang_qwen_1.7b.sh --load
+bash serve_qwen3-mini.sh --load
 # wait for "Application startup complete"
 
 # 4. Query
@@ -81,7 +77,7 @@ A single SAVE pass is sufficient. SGLang does not run a profile-forward at start
 ## Per-rank workspace layout
 
 ```
-foundry_archive_qwen_1.7b/
+foundry_archive/
   warmup_state.json                       # shared; MemoryPoolConfig + final_alloc_offset
   rank_0/
     graph_{0..N-1}_FULL_t{bs}_r{bs}_UX_pcN.json       # one per captured graph

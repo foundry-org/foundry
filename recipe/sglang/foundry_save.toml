@@ -1,0 +1,9 @@
+mode = "save"
+base_addr = 0x600000000000
+region_size = "256GB"
+workspace_root = "foundry_archive"
+scratch_space_size = "1024MB"
+# EP needs DeepEP's NVSHMEM host lib preloaded. Foundry auto-detects it from the
+# torch-bundled nvidia-nvshmem wheel (like it auto-detects libcuda_hook.so), so
+# leave this unset. Set it only to override that with a custom NVSHMEM build:
+# nvshmem_host_path = "/abs/path/to/libnvshmem_host.so.3"

@@ -17,7 +17,23 @@ In install order:
 
 ### 1. `ModelRunner.init_torch_distributed`
 
-Before upstream: `setup_graph_extension(...)` reserves the VMM region, loads cached fatbins (LOAD only via `load_cuda_modules_and_libraries`), and eagerly initializes the cuBLAS handle into scratch space.
+**Bind the device first (multi-GPU correctness).** Upstream `init_torch_distributed`
+calls `torch.get_device_module(self.device).set_device(self.gpu_id)` *inside*
+itself. But `setup_graph_extension` reserves the VMM region with
+`set_allocation_region`, which binds to **whatever CUDA device is current at call
+time** — and we call it *before* upstream. For DP/TP/EP rank > 0 the current
+device is still `cuda:0` at that point, so without intervention the region lands
+on the wrong GPU and the rank's later allocations fault with an **async illegal
+memory access** that surfaces at an unrelated op (e.g. the first
+`torch.cuda.Stream()` in `ModelRunner.__init__`). The patch therefore mirrors
+upstream's `set_device(self.gpu_id)` up front (guarded on `self.device == "cuda"`)
+before reserving the region. Single-GPU and rank 0 are unaffected (`gpu_id == 0`),
+which is why this only appeared once DP was exercised.
+
+Before upstream: `set_device(self.gpu_id)`, then `setup_graph_extension(...)`
+reserves the VMM region, loads cached fatbins (LOAD only via
+`load_cuda_modules_and_libraries`), and eagerly initializes the cuBLAS handle into
+scratch space.
 
 After upstream: `skip_to_scratch_boundary()` forces the cursor to `cfg.scratch_space_size`.
 
@@ -26,6 +42,13 @@ After upstream: `skip_to_scratch_boundary()` forces the cursor to `cfg.scratch_s
 [Foundry] SGLang alloc_offset[after_init_torch_dist]=…
 [Foundry] SGLang alloc_offset[after_scratch_skip]=…
 ```
+
+Validated on DP=2 (Qwen3-1.7B, one full replica per rank): both ranks reach an
+identical `final_alloc_offset` across both SAVE passes and LOAD replays each
+rank's graphs at that offset. Multi-rank runs also export
+`NCCL_CUMEM_ENABLE=0` / `NCCL_NVLS_ENABLE=0` from the serve script — the CUMEM
+P2P and NVLS multicast fast paths `cuMemMap` with driver-capability flags the
+foundry VMM region doesn't carry.
 
 ### 2. `ModelRunnerKVCacheMixin.init_memory_pool`
 
@@ -147,7 +170,40 @@ def patched_start(self, *args, **kwargs):
     return orig_start(self, *args, **kwargs)
 ```
 
-`setup_ld_preload_env()` prepends `libcuda_hook.so` (and optionally `libnvshmem_host.so`) to `os.environ["LD_PRELOAD"]`, sets `CGE_MODE`, and records a wall-clock marker. All children spawned from these methods inherit the env.
+`setup_ld_preload_env()` prepends `libcuda_hook.so` (and optionally `libnvshmem_host.so`) to `os.environ["LD_PRELOAD"]`, sets `FOUNDRY_MODE`, and records a wall-clock marker (`FOUNDRY_SPAWN_T0_NS`). All children spawned from these methods inherit the env.
+
+## Expert parallel (DeepEP) additions
+
+Active only when `moe_a2a_backend == deepep`. EP runs DP-attention + DeepEP (NCCL-free);
+TP attention is unsupported (its NCCL all-reduce is incompatible with the VMM region).
+
+- **DeepEP buffer pre-capture bootstrap** (`bootstrap_deepep_buffer`, graph_ops). sglang
+  creates the singleton NVSHMEM `Buffer` lazily on the first MoE dispatch — normally
+  during the warmup forwards foundry suppresses, which would push creation *inside* the
+  captured stream (`deep_ep_cpp.Buffer(...)` → "operation not permitted when stream is
+  capturing"). The hook forces it before the capture loop, unwrapping the
+  `MaybeTboDeepEPDispatcher._inners` to reach a `DeepEPDispatcher`. Runs on SAVE and LOAD.
+- **SAVE-only warmup pass** (`_run_warmup_pass`, `capture()` patch). Reuses the upstream
+  capture loop with graph capture neutered (run forwards only) to trigger every
+  pre-capture lazy init — DeepGEMM per-shape JIT (`stream.synchronize()` is illegal in
+  capture), buffer creation, etc. — outside the captured stream. LOAD doesn't need it
+  (preallocate + replay place allocations at recorded offsets; bootstrap covers NVSHMEM).
+- **`deepep_adapter` mode on LOAD.** LOAD replaces the capture loop, so the adapter's
+  `_captured_deepep_mode` is never set; replay asserts on it. The hook calls
+  `deepep_adapter.capture(is_extend_in_batch=False)` after load.
+- **FlashInfer pre-pass gated to FlashInfer.** The §5d pre-pass + `reuse_pre_pass_init`
+  shim handle FlashInfer's per-bs wrappers. fa3 (`FlashAttentionBackend`) uses a single
+  fixed `init_cuda_graph_state` workspace, so the shim is skipped (detected via absence of
+  `indices_updater_decode`); but fa3's per-bs `decode_cuda_graph_metadata[bs]` is still
+  populated post-load for the replay lookup.
+- **C++: bind context on graph-build pool workers** (`CUDAGraphParallel.cpp`). EP graphs
+  carry `NODE_EVENT_RECORD/WAIT` nodes → `cuEventCreate` during on-demand prep, which runs
+  on `SimpleThreadPool` workers that never `cuCtxSetCurrent(main_ctx)`. Added that call
+  (mirrors the bg thread). Dense graphs never hit it (no event nodes), which is why it
+  surfaced only on sglang EP.
+
+See [`../../recipe/sglang/README.md`](../../recipe/sglang/README.md) for the EP serve
+config and required kernel versions (deep_ep `9af0e0d`, sgl-deep-gemm ≥0.1.2, fa3).
 
 ## Patch idiom
 

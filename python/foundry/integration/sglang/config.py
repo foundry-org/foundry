@@ -41,10 +41,14 @@ class CUDAGraphExtensionConfig:
         if hook_library_path is None:
             hook_library_path = cls._detect_hook_so_path()
 
+        nvshmem_host_path = data.get("nvshmem_host_path")
+        if nvshmem_host_path is None:
+            nvshmem_host_path = cls._detect_nvshmem_host_path()
+
         return cls(
             mode=CUDAGraphExtensionMode(data.get("mode", cls.mode.value)),
             hook_library_path=hook_library_path,
-            nvshmem_host_path=data.get("nvshmem_host_path"),
+            nvshmem_host_path=nvshmem_host_path,
             base_addr=base_addr,
             region_size=data.get("region_size", cls.region_size),
             workspace_root=data.get("workspace_root", cls.workspace_root),
@@ -59,6 +63,35 @@ class CUDAGraphExtensionConfig:
             hook_so_path = ops_so_path.parent / "libcuda_hook.so"
             if hook_so_path.exists():
                 return str(hook_so_path)
+        return None
+
+    @staticmethod
+    def _detect_nvshmem_host_path() -> str | None:
+        """Locate DeepEP's NVSHMEM host lib from the installed wheel.
+
+        ``nvidia-nvshmem-cuXX`` ships ``libnvshmem_host.so.3`` (cu13 ``torch``
+        pulls it as a dependency), but its ``site-packages/nvidia/nvshmem/lib``
+        dir is not on the loader search path — ``deep_ep`` reaches it only via
+        an RPATH. Foundry's hook must interpose NVSHMEM's module-init symbols,
+        so it has to ``LD_PRELOAD`` the lib by absolute path. Resolve that path
+        from the wheel here, mirroring ``_detect_hook_so_path``; an explicit
+        ``nvshmem_host_path`` in the TOML still overrides this. Returns None when
+        the wheel isn't installed (non-EP runs simply don't preload it).
+        """
+        try:
+            spec = importlib.util.find_spec("nvidia.nvshmem")
+        except (ImportError, ValueError):
+            return None
+        if spec is None:
+            return None
+        roots = list(spec.submodule_search_locations or [])
+        if spec.origin:
+            roots.append(str(Path(spec.origin).parent))
+        for root in roots:
+            for name in ("libnvshmem_host.so.3", "libnvshmem_host.so"):
+                candidate = Path(root) / "lib" / name
+                if candidate.exists():
+                    return str(candidate)
         return None
 
 
