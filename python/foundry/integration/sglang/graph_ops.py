@@ -218,6 +218,8 @@ def bootstrap_deepep_buffer(cuda_graph_runner) -> bool:
     # resurface as a native abort when the capture forward retries lazily.
     if backend.is_deepep_v2():
         return _bootstrap_deepep_v2_buffer(cuda_graph_runner)
+    if backend.is_mooncake():
+        return _bootstrap_mooncake_buffer(cuda_graph_runner)
     if not backend.is_deepep():
         return False
 
@@ -262,6 +264,47 @@ def bootstrap_deepep_buffer(cuda_graph_runner) -> bool:
     logger.warning(
         "[Foundry] DeepEP backend active but no DeepEPDispatcher found on the "
         "model; buffer not bootstrapped (capture may fail inside stream capture)."
+    )
+    return False
+
+
+def _bootstrap_mooncake_buffer(cuda_graph_runner) -> bool:
+    """Mooncake EP counterpart (elastic EP): create the process-wide mooncake
+    ``Buffer`` (RDMA-registered EP buffer) before capture / graph load, for the
+    same SAVE/LOAD allocation-sequence parity reasons as DeepEP. Without it the
+    first MoE dispatch -- and the torch.compile / DeepGEMM lazy init around it
+    -- runs inside the captured forward on SAVE."""
+    from sglang.srt.layers.moe.token_dispatcher.mooncake import (
+        EPBuffer,
+        MooncakeEPDispatcher,
+    )
+
+    if EPBuffer.get_existing_buffer() is not None:
+        return True
+
+    model = cuda_graph_runner.model_runner.model
+    for module in model.modules():
+        dispatcher = getattr(module, "dispatcher", None)
+        if dispatcher is None:
+            continue
+        candidates = [dispatcher, *getattr(dispatcher, "_inners", [])]
+        mk = next((d for d in candidates if isinstance(d, MooncakeEPDispatcher)), None)
+        if mk is None:
+            continue
+        impl = getattr(mk, "_low_latency_dispatcher", None)
+        if impl is None:
+            continue
+        t0 = time.perf_counter()
+        impl._get_buffer()
+        logger.info(
+            "[Foundry] Bootstrapped Mooncake EP buffer pre-capture in %.3fs",
+            time.perf_counter() - t0,
+        )
+        return True
+
+    logger.warning(
+        "[Foundry] Mooncake a2a backend active but no MooncakeEPDispatcher found; "
+        "buffer not bootstrapped (capture may fail inside stream capture)."
     )
     return False
 

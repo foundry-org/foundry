@@ -38,13 +38,14 @@ _INSTALLED = False
 
 
 def _ep_lazy_init_needed() -> bool:
-    """True when the DeepEP all-to-all backend is active, so pre-capture lazy
+    """True when a DeepEP-family all-to-all backend (DeepEP, DeepEP v2,
+    Mooncake EP) is active, so pre-capture lazy
     init (NVSHMEM buffer, DeepGEMM JIT) must be warmed up outside stream capture."""
     try:
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
         backend = get_moe_a2a_backend()
-        return backend.is_deepep() or backend.is_deepep_v2()
+        return backend.is_deepep() or backend.is_deepep_v2() or backend.is_mooncake()
     except Exception:
         return False
 
