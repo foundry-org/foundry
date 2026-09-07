@@ -83,16 +83,32 @@ def create_warmup_state(memory_pool_config: dict | None = None) -> WarmupState:
 
 
 def save_warmup_state(state: WarmupState) -> None:
+    """Write the rank's warmup state into its own workspace dir, plus the
+    workspace-root copy (written once, by whichever rank gets there first).
+
+    The memory pool config is per rank: ranks on the same node can see
+    different free memory (the launcher / DP controller context sits on the
+    first visible GPU), so a single shared file forced the wrong KV pool size
+    onto the other rank on LOAD and its restored graphs read a pool shifted by
+    that difference (elastic-EP recover, 2026-09-07)."""
     workspace_root = _workspace_root()
     if workspace_root is None:
         return
+    payload = asdict(state)
+    rank_dir = _workspace_dir()
+    if rank_dir is not None:
+        os.makedirs(rank_dir, exist_ok=True)
+        rank_path = os.path.join(rank_dir, "warmup_state.json")
+        with open(rank_path, "w") as f:
+            json.dump(payload, f, indent=2)
+        logger.info("[Foundry] Saved SGLang warmup state to %s", rank_path)
     ext_state = get_state()
     path = os.path.join(workspace_root, "warmup_state.json")
     if ext_state is not None and ext_state.rank != 0 and os.path.exists(path):
         return
     os.makedirs(workspace_root, exist_ok=True)
     with open(path, "w") as f:
-        json.dump(asdict(state), f, indent=2)
+        json.dump(payload, f, indent=2)
     logger.info("[Foundry] Saved SGLang warmup state to %s", path)
 
 
@@ -101,6 +117,9 @@ def load_warmup_state() -> WarmupState:
     if workspace_root is None:
         raise RuntimeError("Foundry workspace_root is not initialized")
     path = os.path.join(workspace_root, "warmup_state.json")
+    rank_dir = _workspace_dir()
+    if rank_dir is not None and os.path.exists(os.path.join(rank_dir, "warmup_state.json")):
+        path = os.path.join(rank_dir, "warmup_state.json")  # per-rank state wins
     if not os.path.exists(path):
         raise RuntimeError(f"Foundry warmup state file not found: {path}")
     with open(path) as f:
