@@ -83,4 +83,6 @@ site of `materialize_on_demand_exec` differs.
 |---|---|---|
 | `graph_templates = true/false` | SAVE TOML | group graphs into templates (default) or store every graph in full |
 | `FOUNDRY_LAZY_GRAPH_EXEC=1` | LOAD env | defer member instantiation to first replay |
+| `FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0` | SAVE env | group graphs that differ only in per-node cluster *dimensions* (deep_gemm picks the cluster size by M): Qwen3-30B-A3B EP2 goes from 26 to 10 templates, Phase 2 2.26 s -> 1.74 s. Members set their own cluster dims before instantiation (`apply_on_demand_updates` neutralises the template's dims first so the params update passes the driver's grid/cluster check). Default keeps the exact dims in the key. |
+| `FOUNDRY_MMAP_ARCHIVE=1` | LOAD env | mmap `fatbin_image_packed.img` instead of reading it into memory before `cuLibraryLoadData` (images are loaded with `CU_LIBRARY_BINARY_IS_PRESERVED`, so the mapping stays alive). EP archives carry ~5 GB of sgl-kernel FlashAttention-3 fatbins (sm_80 + sm_86 + sm_90a, of which the driver parses only what it uses): `setup_graph_extension` drops from 3.1 s to 0.16 s on Qwen3-30B-A3B EP2. |
 | `FOUNDRY_DEBUG` build | compile flag | logs per-graph edge verification and template/member decisions |

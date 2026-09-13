@@ -515,6 +515,26 @@ void CUDAGraph::apply_on_demand_updates() {
     switch (u.type) {
       case OnDemandNodeUpdate::Kernel: {
         // Update kernel params on the graph node (not exec)
+        // A member may launch a different cluster shape than its template (deep_gemm picks the
+        // cluster size by M; FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0 puts such graphs in one group).
+        // cuGraphKernelNodeSetParams validates the new grid against the node's *current* cluster
+        // dims, so neutralise them to 1x1x1 first when they differ; the member's own dims are
+        // applied right after the params update below.
+        if (u.kernel_attrs.has_cluster_dim) {
+          CUkernelNodeAttrValue cur;
+          memset(&cur, 0, sizeof(cur));
+          const unsigned wx = u.kernel_attrs.clusterDimX > 0 ? u.kernel_attrs.clusterDimX : 1;
+          const unsigned wy = u.kernel_attrs.clusterDimY > 0 ? u.kernel_attrs.clusterDimY : 1;
+          const unsigned wz = u.kernel_attrs.clusterDimZ > 0 ? u.kernel_attrs.clusterDimZ : 1;
+          if (cuGraphKernelNodeGetAttribute(node, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION,
+                                            &cur) == CUDA_SUCCESS &&
+              (cur.clusterDim.x != wx || cur.clusterDim.y != wy || cur.clusterDim.z != wz)) {
+            CUkernelNodeAttrValue one;
+            memset(&one, 0, sizeof(one));
+            one.clusterDim.x = one.clusterDim.y = one.clusterDim.z = 1;
+            cuGraphKernelNodeSetAttribute(node, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &one);
+          }
+        }
         CUresult sp = cuGraphKernelNodeSetParams(node, &u.kernel_params);
         if (sp != CUDA_SUCCESS && u.kernel_params.kern && !u.kernel_params.func) {
           // Re-targeting a node to another CUkernel can be rejected; retry
@@ -1626,8 +1646,21 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
             cdz = fa.at("required_cluster_depth").to_number<unsigned int>();
         }
         if (cdx > 0 || cdy > 0 || cdz > 0) {
-          topology_key +=
-              ":C" + std::to_string(cdx) + "_" + std::to_string(cdy) + "_" + std::to_string(cdz);
+          // FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0: key only records *whether* a node launches
+          // clusters, not the dims. Safe now that every member instantiates its own exec after
+          // apply_on_demand_updates() sets its cluster dims per node (no cuGraphExecUpdate on the
+          // path); it merges the groups that differ only by deep_gemm's per-M cluster size
+          // (EP2: 26 -> ~3 templates). Default keeps the exact dims (previous behaviour).
+          static const bool cluster_values_in_key = [] {
+            const char* e = std::getenv("FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES");
+            return !(e && (std::string(e) == "0" || std::string(e) == "false"));
+          }();
+          if (cluster_values_in_key) {
+            topology_key +=
+                ":C" + std::to_string(cdx) + "_" + std::to_string(cdy) + "_" + std::to_string(cdz);
+          } else {
+            topology_key += ":C";
+          }
         } else {
           topology_key += ":0";
         }
