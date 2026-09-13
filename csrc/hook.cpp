@@ -23,11 +23,14 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <cstddef>
 #include <cerrno>
 #include <thread>
+#include <chrono>
 #include <boost/unordered/concurrent_flat_map.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/crc.hpp>
@@ -2869,10 +2872,51 @@ CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
   return real_func(ptr, size);
 }
 
+// glibc resolves dlsym(RTLD_DEFAULT) / dlsym(RTLD_NEXT) relative to the object
+// that *called* dlsym (its link-map scope). Once dlsym is interposed, the caller
+// of the real dlsym is always this library, so a lookup issued from inside an
+// RTLD_LOCAL dlopen'd tree - every Python extension module together with its
+// DT_NEEDED libraries, e.g. mooncake -> libibverbs - stops seeing that tree:
+// dlsym(RTLD_DEFAULT, "ibv_reg_mr_iova2") fails with "libcuda_hook.so:
+// undefined symbol" and the caller silently degrades (mooncake then registers
+// RDMA memory without IBV_ACCESS_RELAXED_ORDERING, which made post-recovery
+// expert relocation ~6x slower under the hook). Recover the original semantics
+// by re-issuing a failed lookup against the calling module's own handle, whose
+// dependency closure is exactly the scope glibc would have searched.
+static void* dlsym_in_caller_scope(void* handle, const char* symbol, void* caller_addr) {
+  Dl_info caller_info;
+  if (caller_addr == nullptr || dladdr(caller_addr, &caller_info) == 0 ||
+      caller_info.dli_fname == nullptr || caller_info.dli_fname[0] == '\0') {
+    return nullptr;
+  }
+  void* caller_handle = dlopen(caller_info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+  if (caller_handle == nullptr) {
+    return nullptr;
+  }
+  void* result = real_dlsym(caller_handle, symbol);
+  dlclose(caller_handle);  // only drops the RTLD_NOLOAD reference; the object stays loaded
+  if (result != nullptr && handle == RTLD_NEXT) {
+    // RTLD_NEXT must skip the caller's own definition.
+    Dl_info result_info;
+    if (dladdr(result, &result_info) != 0 && result_info.dli_fbase == caller_info.dli_fbase) {
+      return nullptr;
+    }
+  }
+  if (result != nullptr) {
+    dlerror();  // clear the error left behind by the failed scope-less lookup
+#ifdef FOUNDRY_DEBUG
+    fprintf(stderr, "[HOOK] dlsym(%s, \"%s\") resolved via caller scope of %s\n",
+            handle == RTLD_NEXT ? "RTLD_NEXT" : "RTLD_DEFAULT", symbol, caller_info.dli_fname);
+#endif
+  }
+  return result;
+}
+
 void* dlsym(void* handle, const char* symbol) {
   if (!real_dlsym) {
     get_real_dlsym();
   }
+  void* caller_addr = __builtin_return_address(0);
   if (symbol && strncmp(symbol, "cu", 2) == 0) {
     if (strcmp(symbol, "cuModuleLoadData") == 0) {
       return (void*)cuModuleLoadData;
@@ -2920,7 +2964,16 @@ void* dlsym(void* handle, const char* symbol) {
     }
   }
 
-  return real_dlsym(handle, symbol);
+  void* result = real_dlsym(handle, symbol);
+  if (result == nullptr && symbol != nullptr && (handle == RTLD_DEFAULT || handle == RTLD_NEXT)) {
+    result = dlsym_in_caller_scope(handle, symbol, caller_addr);
+    if (result == nullptr) {
+      // The fallback's own dlopen/dlclose reset the thread's dlerror state;
+      // fail the original lookup again so the caller still sees its message.
+      result = real_dlsym(handle, symbol);
+    }
+  }
+  return result;
 }
 
 // =============================================================================
@@ -4466,11 +4519,90 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
       std::vector<std::string> entry_names;
       // For device-linked binaries
       std::vector<std::vector<uint8_t>> linked_segments;
+      const uint8_t* view =
+          nullptr;  // zero-copy view into the mmapped packed image (FOUNDRY_MMAP_ARCHIVE=1)
+      size_t view_size = 0;
     };
-
     std::vector<BinaryEntry> binaries;
-
-    while (img_file) {
+    auto bin_ptr = [](const BinaryEntry& b) -> const uint8_t* {
+      return b.view ? b.view : b.data.data();
+    };
+    auto bin_size = [](const BinaryEntry& b) -> size_t {
+      return b.view ? b.view_size : b.data.size();
+    };
+    // FOUNDRY_MMAP_ARCHIVE=1: map fatbin_image_packed.img instead of reading it into memory.
+    // The recorded images are loaded with CU_LIBRARY_BINARY_IS_PRESERVED, so the driver keeps
+    // referring to the mapping (never unmapped); it only faults in the pages it actually parses,
+    // so a 5 GB EP archive (four ~1 GB FlashAttention-3 fatbins with three architectures each)
+    // no longer costs a 5 GB read before the first cuLibraryLoadData.
+    const uint8_t* map_base = nullptr;
+    size_t map_len = 0;
+    {
+      const char* e = std::getenv("FOUNDRY_MMAP_ARCHIVE");
+      if (e && (std::string(e) == "1" || std::string(e) == "true")) {
+        int fd = open(packed_img_path.string().c_str(), O_RDONLY);
+        struct stat st;
+        if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0) {
+          void* m = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+          if (m != MAP_FAILED) {
+            map_base = static_cast<const uint8_t*>(m);
+            map_len = st.st_size;
+          } else {
+            fprintf(stderr, "[HOOK] WARNING: mmap of %s failed (%s); reading it instead\n",
+                    packed_img_path.string().c_str(), strerror(errno));
+          }
+        }
+        if (fd >= 0)
+          close(fd);
+      }
+    }
+    if (map_base) {
+      size_t cur = 0;
+      auto take = [&](void* dst, size_t k) {
+        if (cur + k > map_len) {
+          fprintf(stderr, "[HOOK] ERROR: packed image truncated at %zu (+%zu of %zu)\n", cur, k,
+                  map_len);
+          abort();
+        }
+        memcpy(dst, map_base + cur, k);
+        cur += k;
+      };
+      while (cur + sizeof(uint64_t) + sizeof(size_t) <= map_len) {
+        BinaryEntry entry;
+        size_t size = 0;
+        take(&entry.hash, sizeof(uint64_t));
+        take(&size, sizeof(size_t));
+        if (size == 0) {
+          size_t num_segments = 0;
+          take(&num_segments, sizeof(size_t));
+          if (num_segments == 0) {
+            fprintf(stderr, "[HOOK] ERROR: Invalid segment count for device-linked binary\n");
+            abort();
+          }
+          for (size_t i = 0; i < num_segments; i++) {
+            size_t seg_size = 0;
+            take(&seg_size, sizeof(size_t));
+            if (seg_size == 0 || cur + seg_size > map_len) {
+              fprintf(stderr, "[HOOK] ERROR: Invalid segment size\n");
+              abort();
+            }
+            entry.linked_segments.emplace_back(map_base + cur, map_base + cur + seg_size);
+            cur += seg_size;
+          }
+        } else {
+          if (cur + size > map_len) {
+            fprintf(stderr, "[HOOK] ERROR: packed image truncated inside binary %016llx\n",
+                    (unsigned long long)entry.hash);
+            abort();
+          }
+          entry.view = map_base + cur;
+          entry.view_size = size;
+          cur += size;
+        }
+        binaries.push_back(std::move(entry));
+      }
+    }
+    while (!map_base && img_file) {
       uint64_t hash = 0;
       size_t size = 0;
 
@@ -4614,7 +4746,10 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
     auto link_destroy =
         (cuLinkDestroy_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLinkDestroy);
 
+    const auto t_load0 = std::chrono::steady_clock::now();
+    size_t total_bytes = 0;
     for (auto& binary : binaries) {
+      total_bytes += bin_size(binary);
       if (binary.options.base_func_name == "cuLibraryLoadData") {
         CUlibrary library = nullptr;
         CUjit_option* jit_opts =
@@ -4696,11 +4831,11 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
 #ifdef FOUNDRY_DEBUG
           fprintf(stderr,
                   "[HOOK] DEBUG: Loading library hash %016llx, size: %zu bytes, %zu kernels\n",
-                  (unsigned long long)binary.hash, binary.data.size(), binary.entry_names.size());
+                  (unsigned long long)binary.hash, bin_size(binary), binary.entry_names.size());
 #endif
 
-          res = library_load_data(&library, binary.data.data(), jit_opts, jit_vals, num_jit,
-                                  lib_opts, lib_vals, num_lib);
+          res = library_load_data(&library, bin_ptr(binary), jit_opts, jit_vals, num_jit, lib_opts,
+                                  lib_vals, num_lib);
           if (res != CUDA_SUCCESS || !library) {
             fprintf(stderr, "[HOOK] ERROR: Failed to load library for hash %016llx, error=%d\n",
                     (unsigned long long)binary.hash, res);
@@ -4718,8 +4853,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
                               : binary.options.jit_option_values.data();
         unsigned int num_jit = binary.options.jit_options.size();
 
-        CUresult res =
-            module_load_data_ex(&module, binary.data.data(), num_jit, jit_opts, jit_vals);
+        CUresult res = module_load_data_ex(&module, bin_ptr(binary), num_jit, jit_opts, jit_vals);
         if (res != CUDA_SUCCESS || !module) {
           fprintf(stderr, "[HOOK] ERROR: Failed to load module (Ex) for hash %016llx, error=%d\n",
                   (unsigned long long)binary.hash, res);
@@ -4729,7 +4863,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
                                  binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
       } else if (binary.options.base_func_name == "cuModuleLoadData") {
         CUmodule module = nullptr;
-        CUresult res = module_load_data(&module, binary.data.data());
+        CUresult res = module_load_data(&module, bin_ptr(binary));
         if (res != CUDA_SUCCESS || !module) {
           fprintf(stderr, "[HOOK] ERROR: Failed to load module for hash %016llx, error=%d\n",
                   (unsigned long long)binary.hash, res);
@@ -4739,7 +4873,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
                                  binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
       } else if (binary.options.base_func_name == "cuModuleLoadFatBinary") {
         CUmodule module = nullptr;
-        CUresult res = module_load_fatbinary(&module, binary.data.data());
+        CUresult res = module_load_fatbinary(&module, bin_ptr(binary));
         if (res != CUDA_SUCCESS || !module) {
           fprintf(stderr, "[HOOK] ERROR: Failed to load fatbinary for hash %016llx, error=%d\n",
                   (unsigned long long)binary.hash, res);
@@ -4760,7 +4894,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
           fprintf(stderr, "[HOOK] ERROR: Failed to create temporary file for module loading\n");
           abort();
         }
-        temp_file.write(reinterpret_cast<const char*>(binary.data.data()), binary.data.size());
+        temp_file.write(reinterpret_cast<const char*>(bin_ptr(binary)), bin_size(binary));
         temp_file.close();
 
         CUmodule module = nullptr;
@@ -4789,7 +4923,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
           fprintf(stderr, "[HOOK] ERROR: Failed to create temporary file for library loading\n");
           abort();
         }
-        temp_file.write(reinterpret_cast<const char*>(binary.data.data()), binary.data.size());
+        temp_file.write(reinterpret_cast<const char*>(bin_ptr(binary)), bin_size(binary));
         temp_file.close();
 
         CUlibrary library = nullptr;
@@ -4827,6 +4961,13 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
       }
     }
 
+    {
+      const double ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_load0)
+              .count();
+      fprintf(stderr, "[HOOK] loaded %zu recorded binaries (%.0f MB%s) in %.0f ms\n",
+              binaries.size(), total_bytes / 1e6, map_base ? ", mmapped" : "", ms);
+    }
     bool expected = false;
     if (!binary_loaded.compare_exchange_strong(expected, true)) {
       fprintf(stderr, "[HOOK] ERROR: Binary already loaded by another thread\n");
