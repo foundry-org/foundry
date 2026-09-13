@@ -270,6 +270,40 @@ def _patch_cuda_graph_capture() -> None:
         self._outputs[shape_key] = out
         save_graph(graph, out, shape_key)
 
+    def _warmup_pass_barrier():
+        """File-based barrier before the SAVE warmup pass (no device allocations, so the SAVE/LOAD
+        allocation sequences stay identical). The warmup forwards run the elastic-EP all-to-all;
+        nodes that reach them tens of seconds apart trip the a2a fault timeout, which forced SAVE
+        to use a long timeout. That timeout is a kernel argument baked into the captured graphs,
+        so LOAD-restored ranks then hang for the long timeout on the first step after a real fault
+        (~70 s to detect a fault with a 30 s SAVE timeout vs 2 s). With the barrier, SAVE can run
+        with the serving timeout. FOUNDRY_WARMUP_BARRIER_DIR: directory shared by the participating
+        processes; FOUNDRY_WARMUP_BARRIER_COUNT: number of ranks that run the warmup pass (default:
+        torch world size)."""
+        d = os.environ.get("FOUNDRY_WARMUP_BARRIER_DIR")
+        if not d:
+            return
+        import torch.distributed as dist
+
+        n = int(os.environ.get("FOUNDRY_WARMUP_BARRIER_COUNT", "0") or 0)
+        if n <= 0 and dist.is_initialized():
+            n = dist.get_world_size()
+        if n <= 1:
+            return
+        rank = dist.get_rank() if dist.is_initialized() else os.getpid()
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, f"warmup_ready_{rank}"), "w").close()
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < 600:
+            if len([f for f in os.listdir(d) if f.startswith("warmup_ready_")]) >= n:
+                break
+            time.sleep(0.2)
+        logger.info(
+            "[Foundry] warmup-pass barrier: %d ranks ready after %.1f s",
+            n,
+            time.perf_counter() - t0,
+        )
+
     def _run_warmup_pass(self):
         """Foundry-driven pre-capture warmup for the DeepEP/EP path.
 
@@ -281,6 +315,7 @@ def _patch_cuda_graph_capture() -> None:
         replays recorded allocations at absolute offsets and must not re-enter
         graph_capture() (it breaks the threaded finish_graph_loads with
         "invalid device context")."""
+        _warmup_pass_barrier()
         warmup_active[0] = True
         t0 = time.perf_counter()
         try:
