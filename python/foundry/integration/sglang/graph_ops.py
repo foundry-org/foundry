@@ -33,14 +33,12 @@ _GRAPH_FILENAME_RE = re.compile(r"^graph_(?P<index>\d+)_FULL_t(?P<bs>\d+)_r\d+_U
 def _batch_size_from_key(key: Any) -> int:
     if isinstance(key, int):
         return key
-    # ShapeKey(size, stream_idx, variant_label, dsa_variant): phase 1 persists
-    # only plain single-stream decode graphs, where size == bs.
+    # ShapeKey(size, stream_idx, variant_label, attention_variant) -- the last
+    # field was called dsa_variant before sglang #39176. Phase 1 persists only
+    # plain single-stream decode graphs, where size == bs.
     if hasattr(key, "size"):
-        if (
-            key.stream_idx is not None
-            or key.variant_label is not None
-            or key.dsa_variant is not None
-        ):
+        variant = getattr(key, "attention_variant", None) or getattr(key, "dsa_variant", None)
+        if key.stream_idx is not None or key.variant_label is not None or variant is not None:
             raise ValueError(f"Foundry SGLang save/load does not support graph variants: {key!r}")
         return key.size
     key_str = str(key)
