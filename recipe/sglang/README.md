@@ -3,10 +3,11 @@
 End-to-end serve scripts for SAVE / LOAD of CUDA graphs through the foundry SGLang
 integration.
 
-Current target: the fork's **`foundry`** branch — foundry v0.0.3 pairs with commit
-`f1d688e52`; the 0.0.2-era integration is kept on `foundry-0.0.2` (integration rebased onto
-upstream-synced `main`, post-0.5.18), which pins **torch 2.13.0+cu130** and ships the
-whole kernel stack as wheels. Foundry `dev >= ac6104f` builds against torch 2.11 and
+Current target: the fork's **`foundry`** branch at `6272eb04c5` — upstream `main`
+`03ea13a545` (2026-09-16) plus one 8-file integration commit; it pins **torch 2.13.0+cu130**,
+sglang-kernel 0.4.7, sgl-deep-ep 0.1.2, sgl-deep-gemm 0.2.0 and ships the whole kernel stack as
+wheels. The previous pairing (foundry v0.0.3 with `f1d688e52`) is kept as branch `foundry-0.0.3`;
+the 0.0.2-era integration on `foundry-0.0.2`. Foundry `dev >= ac6104f` builds against torch 2.11 and
 2.13 alike (version-guarded csrc). Validated on this pairing (see **Validation**):
 single GPU, DP=2, TP=2, EP=2 with DeepEP low-latency and with DeepEP v2 —
 save/load, TPOT and greedy-output parity against plain SGLang. The 0.0.2-era
