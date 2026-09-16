@@ -37,6 +37,10 @@ class WarmupState:
     gpu_name: str = ""
     gpu_total_memory: int = 0
     memory_pool_config: dict = field(default_factory=dict)
+    # Runtime-context overrides the memory-pool resolver made on SAVE
+    # ([source, {field: value}] entries, e.g. the Mamba cache size of hybrid
+    # models); LOAD skips the resolver and replays them instead.
+    context_overrides: list = field(default_factory=list)
     final_alloc_offset: int = 0
 
 
@@ -65,7 +69,9 @@ def _workspace_root() -> str | None:
     return None if cfg is None else cfg.workspace_root
 
 
-def create_warmup_state(memory_pool_config: dict | None = None) -> WarmupState:
+def create_warmup_state(
+    memory_pool_config: dict | None = None, context_overrides: list | None = None
+) -> WarmupState:
     try:
         from sglang.version import __version__ as sglang_version
     except Exception:
@@ -79,6 +85,7 @@ def create_warmup_state(memory_pool_config: dict | None = None) -> WarmupState:
         gpu_name=props.name,
         gpu_total_memory=props.total_memory,
         memory_pool_config=memory_pool_config or {},
+        context_overrides=list(context_overrides or []),
     )
 
 

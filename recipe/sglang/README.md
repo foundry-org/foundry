@@ -49,9 +49,8 @@ appends extra `sglang serve` flags verbatim, e.g.
 `SGL_EXTRA_ARGS="--cuda-graph-backend-prefill disabled"` to give a baseline the same
 prefill-graph policy as a foundry LOAD (foundry restores decode graphs only).
 
-The scripts use `--cuda-graph-max-bs` (deprecated alias of
-`--cuda-graph-max-bs-decode` on the current fork) so the scripts also run on the
-0.0.2-era fork branch `foundry-0.0.2`.
+The scripts use `--cuda-graph-max-bs-decode`; the pre-0.5.18 alias `--cuda-graph-max-bs` was
+removed upstream, so they no longer run on the 0.0.2-era fork branch as-is.
 
 A single SAVE pass is enough — SGLang has no startup profile-forward, so there is no
 non-determinism that requires a two-pass save (unlike the vLLM recipe).
@@ -220,7 +219,7 @@ restored graphs sit inside SGLang's own run-to-run noise.
 
 With the recipes' default graph sets (20–52 decode graphs) capture is only a few
 seconds, so time-to-health is dominated by weight loading and the differences above
-are small; with all 256 decode graphs (`--cuda-graph-max-bs 256 --disable-cuda-graph-padding`)
+are small; with all 256 decode graphs (`--cuda-graph-max-bs-decode 256 --disable-cuda-graph-padding`)
 restore saves 25–50 s per engine start (see the top-level README's Performance table).
 
 ## DeepEP v2 (NCCL)

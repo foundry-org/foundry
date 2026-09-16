@@ -147,10 +147,33 @@ def _patch_alloc_memory_pool() -> None:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
     orig_resolve = kvc_mod.KVCacheConfigurator._resolve_memory_pool_config
+    # Context overrides the resolver issued on SAVE (get_context().override,
+    # e.g. max_mamba_cache_size for hybrid Mamba/GDN/KDA models); the pool
+    # factories read them from the bags, so LOAD must replay them when it skips
+    # the resolver. Filled by patched_resolve, persisted by patched_alloc.
+    resolve_overrides: list = []
+
+    def _json_safe(value):
+        if isinstance(value, (bool, int, float, str)) or value is None:
+            return True
+        if isinstance(value, (list, tuple)):
+            return all(_json_safe(v) for v in value)
+        return False
 
     @functools.wraps(orig_resolve)
     def patched_resolve(self, pre_model_load_memory):
-        if get_graph_extension_mode() != CUDAGraphExtensionMode.LOAD:
+        mode = get_graph_extension_mode()
+        if mode == CUDAGraphExtensionMode.SAVE:
+            from sglang.srt.runtime_context import get_context
+
+            before = len(get_context().overrides_log())
+            config = orig_resolve(self, pre_model_load_memory)
+            resolve_overrides[:] = [
+                [source, {k: v for k, v in fields.items() if _json_safe(v)}]
+                for source, fields in get_context().overrides_log()[before:]
+            ]
+            return config
+        if mode != CUDAGraphExtensionMode.LOAD:
             return orig_resolve(self, pre_model_load_memory)
         import torch
 
@@ -168,7 +191,15 @@ def _patch_alloc_memory_pool() -> None:
         config = MemoryPoolConfig(
             **{k: v for k, v in state.memory_pool_config.items() if k in valid}
         )
-        logger.info("[Foundry] SGLang reused saved memory pool config")
+        if state.context_overrides:
+            from sglang.srt.runtime_context import get_context
+
+            for source, fields in state.context_overrides:
+                get_context().override(f"foundry_replay:{source}", **fields)
+        logger.info(
+            "[Foundry] SGLang reused saved memory pool config (%d context overrides replayed)",
+            len(state.context_overrides),
+        )
         return config
 
     kvc_mod.KVCacheConfigurator._resolve_memory_pool_config = patched_resolve
@@ -190,7 +221,9 @@ def _patch_alloc_memory_pool() -> None:
         result = orig_alloc(self, *args, **kwargs)
         rt.log_alloc_offset("after_init_memory_pool")
         if mode == CUDAGraphExtensionMode.SAVE:
-            state = rt.create_warmup_state(asdict(self.memory_pool_config))
+            state = rt.create_warmup_state(
+                asdict(self.memory_pool_config), context_overrides=resolve_overrides
+            )
             rt.save_warmup_state(state)
         return result
 

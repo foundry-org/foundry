@@ -79,6 +79,6 @@ sglang serve \
     --disable-custom-all-reduce \
     --chunked-prefill-size 256 \
     --attention-backend fa3 \
-    --cuda-graph-max-bs 128 \
+    --cuda-graph-max-bs-decode 128 \
     "${FOUNDRY_ARGS[@]}" \
     ${SGL_EXTRA_ARGS:-}

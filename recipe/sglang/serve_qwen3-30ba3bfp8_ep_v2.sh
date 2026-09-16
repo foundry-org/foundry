@@ -67,6 +67,6 @@ sglang serve \
     --disable-custom-all-reduce \
     --chunked-prefill-size 256 \
     --attention-backend fa3 \
-    --cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS" \
+    --cuda-graph-max-bs-decode "$CUDA_GRAPH_MAX_BS" \
     "${FOUNDRY_ARGS[@]}" \
     ${SGL_EXTRA_ARGS:-}
