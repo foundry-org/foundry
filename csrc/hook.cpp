@@ -93,6 +93,7 @@ enum CudaDriverAPIIndex {
   CUDA_ENTRY_cuModuleGetGlobal,
   CUDA_ENTRY_cuLibraryGetGlobal,
   CUDA_ENTRY_cuPointerSetAttribute,
+  CUDA_ENTRY_cuCtxSynchronize,
   CUDA_ENTRY_END
 };
 
@@ -140,6 +141,7 @@ static cuda_driver_entry_t cuda_driver_entry_table[] = {{nullptr, "cuModuleLoadD
                                                         {nullptr, "cuModuleGetGlobal_v2"},
                                                         {nullptr, "cuLibraryGetGlobal"},
                                                         {nullptr, "cuPointerSetAttribute"},
+                                                        {nullptr, "cuCtxSynchronize"},
                                                         {nullptr, nullptr}};
 
 #define CUDA_DRIVER_CALL(table, idx) (table[idx].fn_ptr)
@@ -2689,6 +2691,20 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
       typedef CUresult (*cuMemAddressFree_t)(CUdeviceptr, size_t);
       auto mem_addr_free_func = (cuMemAddressFree_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
                                                                      CUDA_ENTRY_cuMemAddressFree);
+
+      // The stock cuMemFree synchronizes the device before it releases the
+      // memory, and torch's caching allocator relies on that: empty_cache()
+      // returns blocks whose kernels may still be in flight (gpt-oss mxfp4
+      // postprocess frees each layer's raw weights right after launching the
+      // swizzle kernels that read them). Unmapping without that fence leaves
+      // those kernels reading an unmapped range (illegal address on a later
+      // launch), so keep the contract before the mapping goes away.
+      typedef CUresult (*cuCtxSynchronize_t)(void);
+      auto ctx_sync_func = (cuCtxSynchronize_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
+                                                                CUDA_ENTRY_cuCtxSynchronize);
+      if (ctx_sync_func != nullptr) {
+        ctx_sync_func();
+      }
 
       mem_unmap_func(metadata.ptr, metadata.size);
       mem_release_func(metadata.handle);

@@ -219,8 +219,17 @@ def preallocate_for_load_mode() -> None:
     if final <= 0:
         final = load_warmup_state().final_alloc_offset
     remaining = final - cge.get_current_alloc_offset()
-    if remaining > 0:
-        cge.preallocate_region(remaining)
+    if remaining > 0 and not cge.preallocate_region(remaining):
+        import torch
+
+        free, total = torch.cuda.mem_get_info()
+        raise RuntimeError(
+            f"Foundry LOAD could not reserve the remaining {remaining / 2**20:.0f} MB of the "
+            f"recorded allocation range ({free / 2**20:.0f} MB of {total / 2**20:.0f} MB free): "
+            "LOAD keeps the recorded kernel images resident and reserves the graph range in one "
+            "step, so it needs a few GB more headroom than SAVE. Lower --mem-fraction-static (for "
+            "SAVE and LOAD alike) or capture fewer graphs."
+        )
 
 
 def log_alloc_offset(label: str) -> None:
