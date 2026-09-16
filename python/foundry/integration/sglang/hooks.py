@@ -355,6 +355,15 @@ def _patch_cuda_graph_capture() -> None:
             orig_capture(self)
         finally:
             warmup_active[0] = False
+        # The eager forwards leave their activations cached in torch's allocator
+        # (11 GB at EP8 with 256 shapes); graph capture allocates from its own
+        # pool and cannot reuse them, so the largest configurations ran out of
+        # memory mid-capture. Return them to the driver before capture starts.
+        # SAVE-only, so the SAVE/LOAD allocation sequence is unaffected.
+        import torch
+
+        gc.collect()
+        torch.cuda.empty_cache()
         logger.info(
             "[Foundry] SGLang EP warmup pass (lazy-init) completed in %.3fs",
             time.perf_counter() - t0,
