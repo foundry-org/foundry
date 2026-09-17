@@ -51,8 +51,11 @@ class SuspendAllocationRegion {
  private:
   bool was_enabled_;
 };
+// LOAD-side preallocation of the span the cursor replays through: contiguous
+// (preallocate_region) or only the ranges that were still live at the end of
+// SAVE (preallocate_ranges, from get_live_region_ranges). Allocations that land
+// in an unbacked hole of the span are backed on demand.
 bool preallocate_region(size_t size);
-// Sparse LOAD-side preallocation: map only the live ranges SAVE recorded.
 std::vector<std::pair<size_t, size_t>> get_live_region_ranges();
 bool preallocate_ranges(const std::vector<std::pair<size_t, size_t>>& ranges, size_t end_offset);
 void free_preallocated_region();
