@@ -4,9 +4,56 @@
 // Not part of the public API.
 
 #include "CUDAGraph.h"
+#include <cuda.h>
+#include <cstdio>
 #include <future>
 
 namespace foundry {
+
+// Kernels that launch with more than 48 KB of dynamic shared memory need the
+// MAX_DYNAMIC_SHARED_SIZE opt-in on the handle the graph API validates
+// against. cuGraphAddKernelNode / cuGraphKernelNodeSetParams check the
+// per-context CUfunction, which does not inherit a CUkernel attribute, and
+// the recorded func_attrs may be smaller than the launch actually used
+// (DeepGEMM raises the limit on its own CUfunction right before launching).
+// Force the opt-in to at least the node's sharedMemBytes on every handle the
+// node may resolve to, and say so when a driver call refuses.
+inline void ensure_dynamic_smem_optin(const CUDA_KERNEL_NODE_PARAMS& p, CUdevice dev,
+                                      const char* where) {
+  if (p.sharedMemBytes <= 48 * 1024) {
+    return;
+  }
+  const int need = static_cast<int>(p.sharedMemBytes);
+  if (p.kern != nullptr) {
+    CUresult r =
+        cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, need, p.kern, dev);
+    if (r != CUDA_SUCCESS) {
+      fprintf(stderr, "[foundry %s] cuKernelSetAttribute(max dyn smem=%d) failed: %d\n", where,
+              need, (int)r);
+    }
+    CUfunction ctx_func = nullptr;
+    r = cuKernelGetFunction(&ctx_func, p.kern);
+    if (r != CUDA_SUCCESS || ctx_func == nullptr) {
+      fprintf(stderr,
+              "[foundry %s] cuKernelGetFunction failed (%d): dynamic smem opt-in (%d B) not "
+              "applied to the per-context function\n",
+              where, (int)r, need);
+    } else {
+      r = cuFuncSetAttribute(ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, need);
+      if (r != CUDA_SUCCESS) {
+        fprintf(stderr, "[foundry %s] cuFuncSetAttribute(max dyn smem=%d) failed: %d\n", where,
+                need, (int)r);
+      }
+    }
+  }
+  if (p.func != nullptr) {
+    CUresult r = cuFuncSetAttribute(p.func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, need);
+    if (r != CUDA_SUCCESS) {
+      fprintf(stderr, "[foundry %s] cuFuncSetAttribute(max dyn smem=%d) failed: %d\n", where, need,
+              (int)r);
+    }
+  }
+}
 
 // Holds deferred metadata for the split start/finish graph loading flow.
 // Returned by start_graph_builds_impl, consumed by finish_graph_loads_impl.

@@ -535,6 +535,7 @@ void CUDAGraph::apply_on_demand_updates() {
             cuGraphKernelNodeSetAttribute(node, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &one);
           }
         }
+        ensure_dynamic_smem_optin(u.kernel_params, capture_dev_, "ON-DEMAND");
         CUresult sp = cuGraphKernelNodeSetParams(node, &u.kernel_params);
         if (sp != CUDA_SUCCESS && u.kernel_params.kern && !u.kernel_params.func) {
           // Re-targeting a node to another CUkernel can be rejected; retry
@@ -2127,6 +2128,7 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
         node_params.extra = extra_config.data();
       }
 
+      ensure_dynamic_smem_optin(node_params, graph->capture_dev_, "LOAD");
       CUresult kernel_result = cuGraphAddKernelNode(&cuNode, cuGraph, nullptr, 0, &node_params);
       if (kernel_result != CUDA_SUCCESS) {
         std::string function_name = params.at("function_name").as_string().c_str();

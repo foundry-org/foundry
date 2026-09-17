@@ -517,6 +517,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       }
 
       // Add kernel node
+      ensure_dynamic_smem_optin(node_params, graph->capture_dev_, "LOAD");
       CUresult kernel_result = cuGraphAddKernelNode(&cuNode, cuGraph, nullptr, 0, &node_params);
       if (kernel_result != CUDA_SUCCESS) {
         fprintf(stderr,
