@@ -12,6 +12,7 @@
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/driver_api.h>
+#include <algorithm>
 #include <atomic>
 #include <limits>
 #include <mutex>
@@ -543,8 +544,7 @@ void CUDAGraph::apply_on_demand_updates() {
           CUDA_KERNEL_NODE_PARAMS alt = u.kernel_params;
           alt.kern = nullptr;
           if (cuKernelGetFunction(&alt.func, u.kernel_params.kern) == CUDA_SUCCESS && alt.func) {
-            raise_dynamic_smem_optin(nullptr, alt.func, capture_dev_, (int)alt.sharedMemBytes,
-                                     "ON-DEMAND");
+            ensure_dynamic_smem_optin(alt, capture_dev_, "ON-DEMAND");
             CUresult sp2 = cuGraphKernelNodeSetParams(node, &alt);
             fprintf(stderr,
                     "[foundry ON-DEMAND] graph %d node %zu: kern-based SetParams failed (%d), "
@@ -1486,14 +1486,21 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
       params["kernel_source_binary_hash"] = binary_hash;
 
       json::object func_attrs;
-      func_attrs["max_dynamic_shared_size_bytes"] = static_cast<int>(metadata.sharedMemBytes);
 
+      // The function's dynamic-smem cap as it stands at capture. It is a
+      // function attribute, not a node property: several kernels launch with
+      // batch-dependent dynamic smem (FlashMLA's metadata kernel, DeepGEMM's
+      // fp8 GEMMs), and recording this node's own sharedMemBytes here made
+      // LOAD lower the shared cap under another graph's node.
+      int max_dynamic_shared = 0;
       int preferred_carveout = 0;
       int cluster_scheduling = 0;
       int cluster_width = 0;
       int cluster_height = 0;
       int cluster_depth = 0;
       if (kern != nullptr) {
+        cuKernelGetAttribute(&max_dynamic_shared, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                             kern, capture_dev_);
         cuKernelGetAttribute(&preferred_carveout,
                              CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, kern,
                              capture_dev_);
@@ -1507,6 +1514,8 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
         cuKernelGetAttribute(&cluster_depth, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH, kern,
                              capture_dev_);
       } else if (func != nullptr) {
+        cuFuncGetAttribute(&max_dynamic_shared, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                           func);
         cuFuncGetAttribute(&preferred_carveout, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
                            func);
         cuFuncGetAttribute(&cluster_scheduling,
@@ -1515,6 +1524,10 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
         cuFuncGetAttribute(&cluster_height, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT, func);
         cuFuncGetAttribute(&cluster_depth, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH, func);
       }
+      // The cap cannot be below what this node launched with; a driver that
+      // reports 0 for a function without an explicit opt-in is floored there.
+      func_attrs["max_dynamic_shared_size_bytes"] =
+          std::max(max_dynamic_shared, static_cast<int>(metadata.sharedMemBytes));
       func_attrs["preferred_shared_memory_carveout"] = preferred_carveout;
       func_attrs["cluster_scheduling_policy_preference"] = cluster_scheduling;
       // Save cluster dimensions - these are required when reconstructing the graph for kernels that
@@ -2004,40 +2017,8 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
             cluster_depth = attr_depth;
         }
 
-        if (std::holds_alternative<CUkernel>(func_handle_variant)) {
-          CUkernel kern = std::get<CUkernel>(func_handle_variant);
-          if (max_shared > 0) {
-            raise_dynamic_smem_optin(kern, nullptr, graph->capture_dev_, max_shared, "LOAD");
-          }
-          if (preferred_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
-                                     preferred_carveout, kern, graph->capture_dev_));
-          }
-          // NOTE: Skip cluster_scheduling on load - it can cause cudaErrorInvalidClusterSize
-          // if the kernel's compiled cluster requirements don't match the saved preference.
-          // The preference is just a hint and the kernel will still work without it.
-          // if (cluster_scheduling > 0) {
-          //   C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
-          //       CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, cluster_scheduling, kern,
-          //       graph->capture_dev_));
-          // }
-        } else {
-          CUfunction func = std::get<CUfunction>(func_handle_variant);
-          if (max_shared > 0) {
-            raise_dynamic_smem_optin(nullptr, func, graph->capture_dev_, max_shared, "LOAD");
-          }
-          if (preferred_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                func, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, preferred_carveout));
-          }
-          // NOTE: Skip cluster_scheduling on load - see comment above
-          // if (cluster_scheduling > 0) {
-          //   C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-          //       func, CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE,
-          //       cluster_scheduling));
-          // }
-        }
+        apply_saved_function_attributes(func_handle_variant, graph->capture_dev_, max_shared,
+                                        preferred_carveout, "LOAD");
         // NOTE: We do not set CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH,
         // CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH,
         // and CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED because these are
@@ -2421,6 +2402,105 @@ std::vector<GraphLoadResult> CUDAGraph::finish_graph_loads(
 GraphLoadResult CUDAGraph::finish_one_graph_load(std::shared_ptr<PendingGraphLoads> pending,
                                                  size_t index) {
   return finish_one_graph_load_impl(std::move(pending), index, reconstruct_tensor_from_metadata);
+}
+
+// ---- Kernel function attributes (contract in CUDAGraphInternal.h) ----------
+
+namespace {
+
+std::mutex g_smem_cap_mutex;
+// CUkernel / CUfunction handle -> MAX_DYNAMIC_SHARED_SIZE_BYTES this process set on it.
+std::unordered_map<const void*, int> g_smem_cap_high_water;
+
+// Raise one handle's cap to `need` unless it is already there. Caller holds
+// g_smem_cap_mutex. A failed set is reported and leaves the mark unchanged so
+// the next node with the same need retries.
+template <typename SetFn>
+void raise_smem_cap_locked(const void* key, int need, SetFn&& set, const char* where) {
+  int& cap = g_smem_cap_high_water[key];
+  if (cap >= need) {
+    return;
+  }
+  CUresult r = set();
+  if (r != CUDA_SUCCESS) {
+    fprintf(stderr, "[foundry %s] setting MAX_DYNAMIC_SHARED_SIZE_BYTES=%d failed: %d\n", where,
+            need, (int)r);
+    return;
+  }
+  cap = need;
+}
+
+void raise_dynamic_smem_cap(CUkernel kern, CUfunction func, CUdevice dev, int need,
+                            const char* where) {
+  if (need <= 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_smem_cap_mutex);
+  if (kern != nullptr) {
+    raise_smem_cap_locked(
+        kern, need,
+        [&] {
+          return cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, need, kern,
+                                      dev);
+        },
+        where);
+    CUfunction ctx_func = nullptr;
+    CUresult r = cuKernelGetFunction(&ctx_func, kern);
+    if (r != CUDA_SUCCESS || ctx_func == nullptr) {
+      fprintf(stderr,
+              "[foundry %s] cuKernelGetFunction failed (%d): dynamic smem cap %d not applied to "
+              "the per-context function\n",
+              where, (int)r, need);
+    } else {
+      raise_smem_cap_locked(
+          ctx_func, need,
+          [&] {
+            return cuFuncSetAttribute(ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                      need);
+          },
+          where);
+    }
+  }
+  if (func != nullptr) {
+    raise_smem_cap_locked(
+        func, need,
+        [&] {
+          return cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, need);
+        },
+        where);
+  }
+}
+
+}  // namespace
+
+void apply_saved_function_attributes(const std::variant<CUfunction, CUkernel>& handle, CUdevice dev,
+                                     int max_dynamic_shared_size_bytes,
+                                     int preferred_shared_memory_carveout, const char* where) {
+  // CLUSTER_SCHEDULING_POLICY_PREFERENCE is recorded but not reapplied: it is
+  // only a hint and fails with cudaErrorInvalidClusterSize when the kernel's
+  // compiled cluster requirements differ from the saved preference.
+  if (std::holds_alternative<CUkernel>(handle)) {
+    CUkernel kern = std::get<CUkernel>(handle);
+    raise_dynamic_smem_cap(kern, nullptr, dev, max_dynamic_shared_size_bytes, where);
+    if (preferred_shared_memory_carveout >= 0) {
+      C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                                                 preferred_shared_memory_carveout, kern, dev));
+    }
+  } else {
+    CUfunction func = std::get<CUfunction>(handle);
+    raise_dynamic_smem_cap(nullptr, func, dev, max_dynamic_shared_size_bytes, where);
+    if (preferred_shared_memory_carveout >= 0) {
+      C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(func,
+                                               CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                                               preferred_shared_memory_carveout));
+    }
+  }
+}
+
+void ensure_dynamic_smem_optin(const CUDA_KERNEL_NODE_PARAMS& params, CUdevice dev,
+                               const char* where) {
+  raise_dynamic_smem_cap(params.kern, params.func, dev, static_cast<int>(params.sharedMemBytes),
+                         where);
 }
 
 }  // namespace foundry

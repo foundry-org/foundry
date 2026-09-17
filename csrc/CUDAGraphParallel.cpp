@@ -411,26 +411,8 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
             cluster_depth = v;
         }
 
-        if (std::holds_alternative<CUkernel>(func_handle_variant)) {
-          CUkernel kern = std::get<CUkernel>(func_handle_variant);
-          if (max_shared > 0) {
-            raise_dynamic_smem_optin(kern, nullptr, graph->capture_dev_, max_shared, "LOAD");
-          }
-          if (preferred_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
-                                     preferred_carveout, kern, graph->capture_dev_));
-          }
-        } else {
-          CUfunction func = std::get<CUfunction>(func_handle_variant);
-          if (max_shared > 0) {
-            raise_dynamic_smem_optin(nullptr, func, 0, max_shared, "LOAD");
-          }
-          if (preferred_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                func, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, preferred_carveout));
-          }
-        }
+        apply_saved_function_attributes(func_handle_variant, graph->capture_dev_, max_shared,
+                                        preferred_carveout, "LOAD");
       }
 
       // Decode kernelParams
@@ -1009,26 +991,8 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
             cluster_depth = v;
         }
 
-        if (std::holds_alternative<CUkernel>(func_handle_variant)) {
-          CUkernel kern = std::get<CUkernel>(func_handle_variant);
-          CUdevice dev = parsed.graph->capture_dev_;
-          if (max_shared > 0) {
-            raise_dynamic_smem_optin(kern, nullptr, dev, max_shared, "LOAD");
-          }
-          if (preferred_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
-                CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, preferred_carveout, kern, dev));
-          }
-        } else {
-          CUfunction func = std::get<CUfunction>(func_handle_variant);
-          if (max_shared > 0) {
-            raise_dynamic_smem_optin(nullptr, func, 0, max_shared, "LOAD");
-          }
-          if (preferred_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                func, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, preferred_carveout));
-          }
-        }
+        apply_saved_function_attributes(func_handle_variant, parsed.graph->capture_dev_, max_shared,
+                                        preferred_carveout, "LOAD");
       }
 
       // Resolve kernel node attributes: start from common, override with per-node
@@ -1353,29 +1317,9 @@ void CUDAGraph::prepare_on_demand_graph_binary(const BinaryGraphFile& bin_file,
           u.kernel_params.func = std::get<CUfunction>(func_handle_variant);
         }
 
-        // Set function attributes
-        if (std::holds_alternative<CUkernel>(func_handle_variant)) {
-          CUkernel kern = std::get<CUkernel>(func_handle_variant);
-          CUdevice dev = graph->capture_dev_;
-          if (k.max_dynamic_shared_size_bytes > 0) {
-            raise_dynamic_smem_optin(kern, nullptr, dev, k.max_dynamic_shared_size_bytes, "LOAD");
-          }
-          if (k.preferred_shared_memory_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
-                                     k.preferred_shared_memory_carveout, kern, dev));
-          }
-        } else {
-          CUfunction func = std::get<CUfunction>(func_handle_variant);
-          if (k.max_dynamic_shared_size_bytes > 0) {
-            raise_dynamic_smem_optin(nullptr, func, 0, k.max_dynamic_shared_size_bytes, "LOAD");
-          }
-          if (k.preferred_shared_memory_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
-                                   k.preferred_shared_memory_carveout));
-          }
-        }
+        apply_saved_function_attributes(func_handle_variant, graph->capture_dev_,
+                                        k.max_dynamic_shared_size_bytes,
+                                        k.preferred_shared_memory_carveout, "LOAD");
 
         // Kernel node attrs: start from common, override with per-node
         u.kernel_attrs = common_attrs;
