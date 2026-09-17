@@ -259,7 +259,7 @@ foundry_archive/
     ├── graph_*.json + .cugraph    # one pair per captured graph
     ├── graph_manifest.json        # topology groups + template assignments
     ├── fatbin_image_packed.img    # packed CUDA modules
-    └── final_alloc_offset.json    # per-rank VMM watermark
+    └── region_layout.json         # per-rank layout: start offset, watermark, live ranges
 ```
 
 For DP / EP each rank gets its own `rank_<N>/`.

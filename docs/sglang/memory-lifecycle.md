@@ -112,8 +112,11 @@ Persisting the resolved `MemoryPoolConfig` (via `dataclasses.asdict`) and re-app
 
 After upstream `init_torch_distributed` returns, `skip_to_scratch_boundary` forces the cursor to `cfg.scratch_space_size` (default 1 GiB). Allocations below that line are scratch and don't need to be deterministic.
 
-## Final watermark
+## Region layout
 
-`capture_final_alloc_offset` runs after the SAVE-side capture loop completes (after `save_graph_manifest` and `pack_fatbins`). It writes `final_alloc_offset` to both `rank_{N}/final_alloc_offset.json` and the shared `warmup_state.json`.
+Two SAVE-side calls describe the deterministic range for LOAD:
 
-`preallocate_for_load_mode` uses this to call `cge.preallocate_region(final - current)` so the entire deterministic range is mapped to physical memory in one shot. The cursor is **not** advanced — preallocate just pre-maps; the cursor advances naturally as cuMemAllocs land within the preallocated range (fast-path: pointer bump, no driver calls).
+- `mark_layout_start` runs at the sequence point where LOAD will preallocate (after the DeepEP bootstrap and the SAVE-only EP warmup pass). It records the cursor as `start_offset`.
+- `record_region_layout` runs after the capture loop completes (after `save_graph_manifest` and `pack_fatbins`). It writes `rank_{N}/region_layout.json` with `start_offset`, the `final_alloc_offset` watermark and `live_ranges` — the `(offset, size)` ranges still mapped at that point (`cge.get_live_region_ranges`). `final_alloc_offset` is also mirrored into the shared `warmup_state.json`.
+
+`preallocate_for_load_mode` reads the layout. If LOAD's cursor is behind `start_offset` (the warmup pass ran only on SAVE) it is moved up to it, so the range the warmup pass consumed is skipped and later allocations (the FlashInfer metadata pre-pass) land at SAVE's offsets. It then calls `cge.preallocate_ranges(live_ranges, final_alloc_offset)`, which maps only the live ranges — one physical handle per coalesced segment — instead of the whole span; the warmup pass frees several GB inside the span that no graph references, and mapping all of it made LOAD need that much more free memory than SAVE. The cursor is **not** advanced by the preallocation; allocations that land in the span are pointer bumps (no driver calls). An allocation that lands in an unbacked hole of the span is backed on demand by the hook and logged (`mapped N MB on demand`), which means the SAVE and LOAD sequences diverged there.

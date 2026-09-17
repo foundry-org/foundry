@@ -124,7 +124,7 @@ finally:
     attn_backend.init_forward_metadata_capture_cuda_graph = real_init
 save_graph_manifest()
 pack_fatbins()
-capture_final_alloc_offset()
+record_region_layout()
 ```
 
 `initialize_all_attention_metadata` walks `reversed(self.capture_bs)` and pre-allocates every per-bs FlashInfer wrapper. The wrappers are stored in `attn_backend.decode_cuda_graph_metadata[bs]`.
@@ -143,7 +143,7 @@ No allocation. The captured graph references the pre-pass wrapper's address; LOA
 if cgr.get_global_graph_memory_pool() is None:
     cgr.set_global_graph_memory_pool(self.device_module.graph_pool_handle())
 set_graph_pool_id(cgr.get_global_graph_memory_pool())
-preallocate_for_load_mode()                         # cuMemCreate+cuMemMap up to final_alloc_offset
+preallocate_for_load_mode()                         # cursor to start_offset; map live ranges up to final_alloc_offset
 initialize_all_attention_metadata(self)             # pre-pass (same as SAVE)
 load_all_graphs(self)                               # ONE start_graph_builds + finish_graph_loads
 self.graphs = {k: v[0] for k, v in state.loaded_graphs.items()}

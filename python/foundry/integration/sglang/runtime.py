@@ -52,6 +52,11 @@ class CUDAGraphExtensionState:
 
 
 _state: CUDAGraphExtensionState | None = None
+
+# Per-rank record of the deterministic allocation layout, written at the end
+# of SAVE and consumed by LOAD's preallocation (see record_region_layout).
+_LAYOUT_FILE = "region_layout.json"
+_layout_start_offset: int | None = None
 _final_alloc_offset: int = 0
 
 
@@ -186,28 +191,50 @@ def skip_to_scratch_boundary() -> None:
     logger.info("[Foundry] SGLang skipped allocator to scratch boundary %d", scratch)
 
 
-def capture_final_alloc_offset() -> int:
+def mark_layout_start() -> None:
+    """SAVE: remember the cursor at the point LOAD will preallocate from.
+
+    Everything SAVE allocates before this point, LOAD allocates too (same
+    sequence); everything after it is either replayed at recorded absolute
+    offsets (graph memory) or must be allocated at the same offset on both
+    sides (the FlashInfer metadata pre-pass). The SAVE-only EP warmup pass
+    sits before this mark, so LOAD's cursor is moved up to it and the range
+    the warmup pass consumed is simply skipped."""
+    global _layout_start_offset
+    cfg = get_config()
+    if cfg is None or cfg.mode != CUDAGraphExtensionMode.SAVE:
+        return
+    _layout_start_offset = cge.get_current_alloc_offset()
+    logger.info("[Foundry] SGLang layout start offset=%d", _layout_start_offset)
+
+
+def record_region_layout() -> int:
+    """SAVE: persist the rank's allocation layout for LOAD.
+
+    ``final_alloc_offset`` is the cursor watermark; ``live_ranges`` are the
+    (offset, size) ranges still mapped at this point. LOAD backs only the live
+    ranges: the pre-capture warmup pass allocates and frees several GB that no
+    graph references, and mapping the whole span made LOAD need that much more
+    free memory than SAVE."""
     global _final_alloc_offset
     cfg = get_config()
     if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
         return 0
     _final_alloc_offset = cge.get_current_alloc_offset()
     if cfg.workspace_dir is not None:
-        path = os.path.join(cfg.workspace_dir, "final_alloc_offset.json")
-        with open(path, "w") as f:
-            json.dump({"final_alloc_offset": _final_alloc_offset}, f)
-        # Ranges still mapped at the end of SAVE. LOAD backs only these (plus
-        # nothing else): the pre-capture warmup pass allocates and frees several
-        # GB that no graph references, and mapping the whole recorded span made
-        # LOAD need that much more free memory than SAVE.
         ranges = cge.get_live_region_ranges()
-        with open(os.path.join(cfg.workspace_dir, "live_ranges.json"), "w") as f:
-            json.dump({"ranges": ranges}, f)
+        layout = {
+            "start_offset": _layout_start_offset,
+            "final_alloc_offset": _final_alloc_offset,
+            "live_ranges": ranges,
+        }
+        with open(os.path.join(cfg.workspace_dir, _LAYOUT_FILE), "w") as f:
+            json.dump(layout, f)
         logger.info(
-            "[Foundry] SGLang live ranges at SAVE end: %d ranges, %.0f MB of the %.0f MB span",
+            "[Foundry] SGLang region layout: %d live ranges, %.0f MB of the %.0f MB span",
             len(ranges),
             sum(r[1] for r in ranges) / 2**20,
-            _final_alloc_offset / 2**20,
+            (_final_alloc_offset - (_layout_start_offset or 0)) / 2**20,
         )
     if cfg.workspace_root is not None:
         warmup_state_path = os.path.join(cfg.workspace_root, "warmup_state.json")
@@ -220,43 +247,54 @@ def capture_final_alloc_offset() -> int:
 
 
 def preallocate_for_load_mode() -> None:
+    """LOAD: back the recorded layout ahead of the graph restore.
+
+    Moves the cursor up to SAVE's layout start when LOAD is behind it (the
+    SAVE-only warmup pass), then maps the live ranges of [start, final) in one
+    step. Allocations that land inside the span are pointer bumps; a hole is
+    backed on demand by the hook and logged, since it means the sequences
+    diverged."""
     cfg = get_config()
     if cfg is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
         return
-    final = 0
-    if cfg.workspace_dir is not None:
-        path = os.path.join(cfg.workspace_dir, "final_alloc_offset.json")
-        if os.path.exists(path):
-            with open(path) as f:
-                final = json.load(f).get("final_alloc_offset", 0)
-    if final <= 0:
-        final = load_warmup_state().final_alloc_offset
+    if cfg.workspace_dir is None:
+        raise RuntimeError("Foundry workspace_dir is not initialized")
+    path = os.path.join(cfg.workspace_dir, _LAYOUT_FILE)
+    if not os.path.exists(path):
+        raise RuntimeError(
+            f"Foundry region layout not found: {path} (re-save the archive with this version)"
+        )
+    with open(path) as f:
+        layout = json.load(f)
+    final = int(layout["final_alloc_offset"])
+    start = layout.get("start_offset")
     current = cge.get_current_alloc_offset()
-    remaining = final - current
-    if remaining <= 0:
+    if start is not None and current < start:
+        cge.set_current_alloc_offset(start)
+        logger.info("[Foundry] SGLang cursor moved %d -> %d to SAVE's layout start", current, start)
+        current = start
+    elif start is not None and current > start:
+        logger.warning(
+            "[Foundry] SGLang LOAD cursor %d is past SAVE's layout start %d: the allocation "
+            "sequences diverged before the graph restore",
+            current,
+            start,
+        )
+    if final <= current:
         return
-    live_path = None
-    if cfg.workspace_dir is not None:
-        candidate = os.path.join(cfg.workspace_dir, "live_ranges.json")
-        if os.path.exists(candidate):
-            live_path = candidate
-    if live_path is not None:
-        with open(live_path) as f:
-            ranges = [tuple(r) for r in json.load(f).get("ranges", [])]
-        ranges = [r for r in ranges if r[0] + r[1] > current and r[0] < final]
-        ok = cge.preallocate_ranges(ranges, final)
-    else:
-        ok = cge.preallocate_region(remaining)
-    if not ok:
-        import torch
-
+    ranges = [
+        (int(off), int(size))
+        for off, size in layout.get("live_ranges", [])
+        if off + size > current and off < final
+    ]
+    if not cge.preallocate_ranges(ranges, final):
         free, total = torch.cuda.mem_get_info()
         raise RuntimeError(
-            f"Foundry LOAD could not reserve the remaining {remaining / 2**20:.0f} MB of the "
-            f"recorded allocation range ({free / 2**20:.0f} MB of {total / 2**20:.0f} MB free): "
-            "LOAD keeps the recorded kernel images resident and reserves the graph range in one "
-            "step, so it needs a few GB more headroom than SAVE. Lower --mem-fraction-static (for "
-            "SAVE and LOAD alike) or capture fewer graphs."
+            f"Foundry LOAD could not back the {(final - current) / 2**20:.0f} MB layout span "
+            f"({free / 2**20:.0f} MB of {total / 2**20:.0f} MB free): LOAD keeps the recorded "
+            "kernel images resident and maps the span in one step, so it needs more headroom "
+            "than SAVE. Lower --mem-fraction-static (for SAVE and LOAD alike) or capture fewer "
+            "graphs."
         )
 
 

@@ -393,6 +393,9 @@ def _patch_cuda_graph_capture() -> None:
                 _run_warmup_pass(self)
                 rt.log_alloc_offset("after_warmup_pass")
 
+        # Same sequence point as LOAD's preallocate_for_load_mode below.
+        rt.mark_layout_start()
+
         if mode == CUDAGraphExtensionMode.LOAD:
             import torch
 
@@ -543,7 +546,7 @@ def _patch_cuda_graph_capture() -> None:
 
         save_graph_manifest()
         pack_fatbins()
-        rt.capture_final_alloc_offset()
+        rt.record_region_layout()
         return result
 
     # LOAD-mode WAR barrier: restored graphs carry no usable in-graph
