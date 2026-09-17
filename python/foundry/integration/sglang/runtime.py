@@ -196,6 +196,19 @@ def capture_final_alloc_offset() -> int:
         path = os.path.join(cfg.workspace_dir, "final_alloc_offset.json")
         with open(path, "w") as f:
             json.dump({"final_alloc_offset": _final_alloc_offset}, f)
+        # Ranges still mapped at the end of SAVE. LOAD backs only these (plus
+        # nothing else): the pre-capture warmup pass allocates and frees several
+        # GB that no graph references, and mapping the whole recorded span made
+        # LOAD need that much more free memory than SAVE.
+        ranges = cge.get_live_region_ranges()
+        with open(os.path.join(cfg.workspace_dir, "live_ranges.json"), "w") as f:
+            json.dump({"ranges": ranges}, f)
+        logger.info(
+            "[Foundry] SGLang live ranges at SAVE end: %d ranges, %.0f MB of the %.0f MB span",
+            len(ranges),
+            sum(r[1] for r in ranges) / 2**20,
+            _final_alloc_offset / 2**20,
+        )
     if cfg.workspace_root is not None:
         warmup_state_path = os.path.join(cfg.workspace_root, "warmup_state.json")
         if os.path.exists(warmup_state_path):
@@ -218,8 +231,23 @@ def preallocate_for_load_mode() -> None:
                 final = json.load(f).get("final_alloc_offset", 0)
     if final <= 0:
         final = load_warmup_state().final_alloc_offset
-    remaining = final - cge.get_current_alloc_offset()
-    if remaining > 0 and not cge.preallocate_region(remaining):
+    current = cge.get_current_alloc_offset()
+    remaining = final - current
+    if remaining <= 0:
+        return
+    live_path = None
+    if cfg.workspace_dir is not None:
+        candidate = os.path.join(cfg.workspace_dir, "live_ranges.json")
+        if os.path.exists(candidate):
+            live_path = candidate
+    if live_path is not None:
+        with open(live_path) as f:
+            ranges = [tuple(r) for r in json.load(f).get("ranges", [])]
+        ranges = [r for r in ranges if r[0] + r[1] > current and r[0] < final]
+        ok = cge.preallocate_ranges(ranges, final)
+    else:
+        ok = cge.preallocate_region(remaining)
+    if not ok:
         import torch
 
         free, total = torch.cuda.mem_get_info()
@@ -237,11 +265,19 @@ def log_alloc_offset(label: str) -> None:
     if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
         return
     offset = cge.get_current_alloc_offset()
+    # Free device memory alongside the region offset: LOAD ends with less free
+    # memory than SAVE at identical offsets (resident kernel images, reserved
+    # ranges SAVE had already freed), and this trail is how that gap is measured.
+    try:
+        free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
+    except Exception:
+        free_mb = float("nan")
     logger.info(
-        "[Foundry] SGLang alloc_offset[%s]=%d (%.2f MB)",
+        "[Foundry] SGLang alloc_offset[%s]=%d (%.2f MB) free=%.0f MB",
         label,
         offset,
         offset / (1024 * 1024),
+        free_mb,
     )
 
 

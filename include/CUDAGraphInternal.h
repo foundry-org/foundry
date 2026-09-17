@@ -5,40 +5,58 @@
 
 #include "CUDAGraph.h"
 #include <cuda.h>
+#include <mutex>
+#include <unordered_map>
+#include <algorithm>
 #include <cstdio>
 #include <future>
 
 namespace foundry {
 
-// Kernels that launch with more than 48 KB of dynamic shared memory need the
-// MAX_DYNAMIC_SHARED_SIZE opt-in on the handle the graph API validates
-// against. cuGraphAddKernelNode / cuGraphKernelNodeSetParams check the
-// per-context CUfunction, which does not inherit a CUkernel attribute, and
-// the recorded func_attrs may be smaller than the launch actually used
-// (DeepGEMM raises the limit on its own CUfunction right before launching).
-// Force the opt-in to at least the node's sharedMemBytes on every handle the
-// node may resolve to, and say so when a driver call refuses.
-inline void ensure_dynamic_smem_optin(const CUDA_KERNEL_NODE_PARAMS& p, CUdevice dev,
-                                      const char* where) {
-  if (p.sharedMemBytes <= 48 * 1024) {
+// Dynamic shared memory opt-in, kept monotonic. cuGraphAddKernelNode /
+// cuGraphKernelNodeSetParams validate a node's sharedMemBytes against the
+// MAX_DYNAMIC_SHARED_SIZE attribute of the per-context CUfunction (which does
+// not inherit a CUkernel attribute) at any size, not only above 48 KB. SAVE
+// records each node's own sharedMemBytes as that "attribute", and several
+// kernels launch with batch-dependent dynamic smem (FlashMLA's
+// get_mla_metadata_kernel: 20*bs+4 bytes; DeepGEMM fp8 GEMMs: 101-215 KB), so
+// the template-build thread and the on-demand worker threads used to overwrite
+// the shared attribute with *their* node's value and race each other:
+// CUDA_ERROR_INVALID_VALUE when a smaller value landed between another
+// thread's set and its add. The attribute is a cap, so only ever raise it, and
+// serialize the read-modify-write.
+inline void raise_dynamic_smem_optin(CUkernel kern, CUfunction func, CUdevice dev, int need,
+                                     const char* where) {
+  if (need <= 0) {
     return;
   }
-  const int need = static_cast<int>(p.sharedMemBytes);
-  if (p.kern != nullptr) {
+  static std::mutex mu;
+  static std::unordered_map<const void*, int> high_water;  // per CUkernel / CUfunction handle
+  std::lock_guard<std::mutex> lock(mu);
+  auto raise_key = [&](const void* key) {
+    auto it = high_water.find(key);
+    if (it != high_water.end() && it->second >= need) {
+      return false;
+    }
+    high_water[key] = need;
+    return true;
+  };
+  if (kern != nullptr && raise_key((const void*)kern)) {
     CUresult r =
-        cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, need, p.kern, dev);
+        cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, need, kern, dev);
     if (r != CUDA_SUCCESS) {
       fprintf(stderr, "[foundry %s] cuKernelSetAttribute(max dyn smem=%d) failed: %d\n", where,
               need, (int)r);
     }
     CUfunction ctx_func = nullptr;
-    r = cuKernelGetFunction(&ctx_func, p.kern);
+    r = cuKernelGetFunction(&ctx_func, kern);
     if (r != CUDA_SUCCESS || ctx_func == nullptr) {
       fprintf(stderr,
               "[foundry %s] cuKernelGetFunction failed (%d): dynamic smem opt-in (%d B) not "
               "applied to the per-context function\n",
               where, (int)r, need);
     } else {
+      high_water[(const void*)ctx_func] = std::max(high_water[(const void*)ctx_func], need);
       r = cuFuncSetAttribute(ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, need);
       if (r != CUDA_SUCCESS) {
         fprintf(stderr, "[foundry %s] cuFuncSetAttribute(max dyn smem=%d) failed: %d\n", where,
@@ -46,13 +64,18 @@ inline void ensure_dynamic_smem_optin(const CUDA_KERNEL_NODE_PARAMS& p, CUdevice
       }
     }
   }
-  if (p.func != nullptr) {
-    CUresult r = cuFuncSetAttribute(p.func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, need);
+  if (func != nullptr && raise_key((const void*)func)) {
+    CUresult r = cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, need);
     if (r != CUDA_SUCCESS) {
       fprintf(stderr, "[foundry %s] cuFuncSetAttribute(max dyn smem=%d) failed: %d\n", where, need,
               (int)r);
     }
   }
+}
+
+inline void ensure_dynamic_smem_optin(const CUDA_KERNEL_NODE_PARAMS& p, CUdevice dev,
+                                      const char* where) {
+  raise_dynamic_smem_optin(p.kern, p.func, dev, static_cast<int>(p.sharedMemBytes), where);
 }
 
 // Holds deferred metadata for the split start/finish graph loading flow.

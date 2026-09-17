@@ -414,17 +414,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         if (std::holds_alternative<CUkernel>(func_handle_variant)) {
           CUkernel kern = std::get<CUkernel>(func_handle_variant);
           if (max_shared > 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared,
-                                     kern, graph->capture_dev_));
-            // cuGraphAddKernelNode validates dynamic smem against the
-            // per-context CUfunction, which does not inherit the CUkernel
-            // attribute (>48KB kernels fail with CUDA_ERROR_INVALID_VALUE).
-            CUfunction ctx_func = nullptr;
-            if (cuKernelGetFunction(&ctx_func, kern) == CUDA_SUCCESS && ctx_func) {
-              C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                  ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
-            }
+            raise_dynamic_smem_optin(kern, nullptr, graph->capture_dev_, max_shared, "LOAD");
           }
           if (preferred_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(
@@ -434,8 +424,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         } else {
           CUfunction func = std::get<CUfunction>(func_handle_variant);
           if (max_shared > 0) {
-            C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
+            raise_dynamic_smem_optin(nullptr, func, 0, max_shared, "LOAD");
           }
           if (preferred_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
@@ -1024,13 +1013,7 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
           CUkernel kern = std::get<CUkernel>(func_handle_variant);
           CUdevice dev = parsed.graph->capture_dev_;
           if (max_shared > 0) {
-            C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
-                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared, kern, dev));
-            CUfunction ctx_func = nullptr;  // see binary path: per-context function too
-            if (cuKernelGetFunction(&ctx_func, kern) == CUDA_SUCCESS && ctx_func) {
-              C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                  ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
-            }
+            raise_dynamic_smem_optin(kern, nullptr, dev, max_shared, "LOAD");
           }
           if (preferred_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
@@ -1039,8 +1022,7 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
         } else {
           CUfunction func = std::get<CUfunction>(func_handle_variant);
           if (max_shared > 0) {
-            C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
+            raise_dynamic_smem_optin(nullptr, func, 0, max_shared, "LOAD");
           }
           if (preferred_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
@@ -1376,18 +1358,7 @@ void CUDAGraph::prepare_on_demand_graph_binary(const BinaryGraphFile& bin_file,
           CUkernel kern = std::get<CUkernel>(func_handle_variant);
           CUdevice dev = graph->capture_dev_;
           if (k.max_dynamic_shared_size_bytes > 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                     k.max_dynamic_shared_size_bytes, kern, dev));
-            // cuGraphKernelNodeSetParams validates dynamic smem against the
-            // per-context CUfunction, which does not inherit the CUkernel
-            // attribute; a member kernel unseen by any template hits this.
-            CUfunction ctx_func = nullptr;
-            if (cuKernelGetFunction(&ctx_func, kern) == CUDA_SUCCESS && ctx_func) {
-              C10_CUDA_DRIVER_CHECK(
-                  cuFuncSetAttribute(ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                     k.max_dynamic_shared_size_bytes));
-            }
+            raise_dynamic_smem_optin(kern, nullptr, dev, k.max_dynamic_shared_size_bytes, "LOAD");
           }
           if (k.preferred_shared_memory_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(
@@ -1397,9 +1368,7 @@ void CUDAGraph::prepare_on_demand_graph_binary(const BinaryGraphFile& bin_file,
         } else {
           CUfunction func = std::get<CUfunction>(func_handle_variant);
           if (k.max_dynamic_shared_size_bytes > 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                   k.max_dynamic_shared_size_bytes));
+            raise_dynamic_smem_optin(nullptr, func, 0, k.max_dynamic_shared_size_bytes, "LOAD");
           }
           if (k.preferred_shared_memory_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(

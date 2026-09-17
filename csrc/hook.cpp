@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <cassert>
 #include <atomic>
 #include <mutex>
@@ -285,6 +286,16 @@ static void vmm_ipc_invalidate_export(CUdeviceptr dptr);
 static std::atomic<unsigned long long> g_prealloc_handle{0};
 static std::atomic<uint64_t> g_prealloc_base{0};
 static std::atomic<uint64_t> g_prealloc_size{0};
+// Sparse preallocation (LOAD maps only the ranges that were still live at the
+// end of SAVE): one physical handle per mapped segment, looked up by address
+// for IPC export and released together by free_preallocated_region.
+struct PreallocSegment {
+  CUdeviceptr base;
+  size_t size;
+  CUmemGenericAllocationHandle handle;
+};
+static std::mutex g_prealloc_segs_mutex;
+static std::vector<PreallocSegment> g_prealloc_segs;
 
 struct HookAllocationEvent {
   enum class Type { Alloc, Free, Reserve };
@@ -3266,6 +3277,17 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
       chunk_base = g_prealloc_base.load();
       chunk_size = g_prealloc_size.load();
       export_handle = (CUmemGenericAllocationHandle)g_prealloc_handle.load();
+      {
+        std::lock_guard<std::mutex> lock(g_prealloc_segs_mutex);
+        for (const auto& seg : g_prealloc_segs) {
+          if (dptr >= seg.base && dptr < seg.base + seg.size) {
+            chunk_base = seg.base;
+            chunk_size = seg.size;
+            export_handle = seg.handle;
+            break;
+          }
+        }
+      }
       export_key = (CUdeviceptr)chunk_base;
       if (export_handle == 0 || dptr < chunk_base || dptr >= chunk_base + chunk_size) {
         fprintf(stderr,
@@ -4003,11 +4025,21 @@ void free_preallocated_region() {
   auto mem_release_func =
       (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
 
-  size_t preallocated_size =
-      tls_storage.preallocated_end_addr - tls_storage.preallocated_start_addr;
-
-  mem_unmap_func(tls_storage.preallocated_start_addr, preallocated_size);
-  mem_release_func(tls_storage.preallocated_handle);
+  {
+    std::lock_guard<std::mutex> lock(g_prealloc_segs_mutex);
+    for (const auto& seg : g_prealloc_segs) {
+      mem_unmap_func(seg.base, seg.size);
+      mem_release_func(seg.handle);
+      vmm_ipc_invalidate_export(seg.base);
+    }
+    g_prealloc_segs.clear();
+  }
+  if (tls_storage.preallocated_handle != 0) {
+    size_t preallocated_size =
+        tls_storage.preallocated_end_addr - tls_storage.preallocated_start_addr;
+    mem_unmap_func(tls_storage.preallocated_start_addr, preallocated_size);
+    mem_release_func(tls_storage.preallocated_handle);
+  }
 
   vmm_ipc_invalidate_export((CUdeviceptr)tls_storage.preallocated_start_addr);
   g_prealloc_handle.store(0);
@@ -4018,6 +4050,163 @@ void free_preallocated_region() {
   tls_storage.preallocated_start_addr = 0;
   tls_storage.preallocated_end_addr = 0;
   tls_storage.has_preallocation = false;
+}
+
+std::vector<std::pair<size_t, size_t>> get_live_region_ranges() {
+  // (offset, size) of every allocation still mapped inside this thread's
+  // region, relative to the region base. SAVE writes this at the end so LOAD
+  // can back only these ranges instead of the whole recorded span (the
+  // pre-capture warmup pass allocates and frees several GB that no graph
+  // references).
+  std::vector<std::pair<size_t, size_t>> ranges;
+  if (!tls_storage.region_initialized) {
+    return ranges;
+  }
+  const CUdeviceptr base = (CUdeviceptr)tls_storage.region.base;
+  const CUdeviceptr end = base + tls_storage.region.size;
+  global_alloc_metadata.cvisit_all([&](const std::pair<const CUdeviceptr, AllocMetadata>& kv) {
+    const AllocMetadata& m = kv.second;
+    if (m.ptr >= base && m.ptr < end) {
+      ranges.emplace_back((size_t)(m.ptr - base), m.size);
+    }
+  });
+  std::sort(ranges.begin(), ranges.end());
+  return ranges;
+}
+
+bool preallocate_ranges(const std::vector<std::pair<size_t, size_t>>& ranges, size_t end_offset) {
+  // Sparse counterpart of preallocate_region: map physical memory only for
+  // `ranges` ((offset, size) relative to the region base, taken from
+  // get_live_region_ranges at the end of SAVE) and move the cursor to
+  // `end_offset`. Allocations replayed into the span consume it in the fast
+  // path without further mapping, exactly like the contiguous form.
+  if (!tls_storage.region_initialized) {
+    fprintf(stderr, "[HOOK] ERROR: Cannot preallocate before allocation region is set\n");
+    return false;
+  }
+  if (tls_storage.has_preallocation) {
+    fprintf(stderr, "[HOOK] WARNING: Preallocation already exists, freeing previous allocation\n");
+    free_preallocated_region();
+  }
+  typedef CUresult (*cuCtxGetDevice_t)(CUdevice*);
+  auto get_device_func =
+      (cuCtxGetDevice_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuCtxGetDevice);
+  CUdevice device = 0;
+  get_device_func(&device);
+  size_t granularity = get_allocation_granularity(device);
+  tls_storage.cached_device = device;
+  tls_storage.cached_granularity = granularity;
+  tls_storage.device_cached = true;
+
+  typedef CUresult (*cuMemCreate_t)(CUmemGenericAllocationHandle*, size_t,
+                                    const CUmemAllocationProp*, unsigned long long);
+  auto mem_create_func =
+      (cuMemCreate_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemCreate);
+  typedef CUresult (*cuMemMap_t)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle,
+                                 unsigned long long);
+  auto mem_map_func = (cuMemMap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemMap);
+  typedef CUresult (*cuMemSetAccess_t)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t);
+  auto mem_set_access_func =
+      (cuMemSetAccess_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemSetAccess);
+  typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
+  auto mem_unmap_func =
+      (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
+  typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
+  auto mem_release_func =
+      (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
+
+  CUmemAllocationProp prop = {};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.location.id = device;
+  prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  prop.allocFlags.gpuDirectRDMACapable = 1;
+  CUmemAccessDesc accessDesc = {};
+  accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  accessDesc.location.id = device;
+  accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+
+  const CUdeviceptr region_base = (CUdeviceptr)tls_storage.region.base;
+  const CUdeviceptr region_end = region_base + tls_storage.region.size;
+  const CUdeviceptr start_addr = align_to(tls_storage.current_alloc_base_addr, kAllocAlignment);
+  const CUdeviceptr end_addr = region_base + end_offset;
+  if (end_addr > region_end || end_addr < start_addr) {
+    fprintf(stderr, "[HOOK] ERROR: preallocate_ranges: end offset %zu outside the region\n",
+            end_offset);
+    return false;
+  }
+
+  // Coalesce the sorted, granularity-aligned ranges that lie in [start, end).
+  std::vector<std::pair<CUdeviceptr, size_t>> segs;
+  for (const auto& r : ranges) {
+    CUdeviceptr a = region_base + (r.first / granularity) * granularity;
+    CUdeviceptr b = region_base + align_to(r.first + r.second, granularity);
+    if (b <= start_addr || a >= end_addr) {
+      continue;
+    }
+    a = std::max(a, (CUdeviceptr)start_addr);
+    b = std::min(b, (CUdeviceptr)end_addr);
+    if (!segs.empty() && a <= segs.back().first + segs.back().second) {
+      CUdeviceptr old_end = segs.back().first + segs.back().second;
+      if (b > old_end) {
+        segs.back().second = b - segs.back().first;
+      }
+    } else {
+      segs.emplace_back(a, (size_t)(b - a));
+    }
+  }
+
+  std::vector<PreallocSegment> mapped;
+  size_t mapped_bytes = 0;
+  for (const auto& sg : segs) {
+    CUmemGenericAllocationHandle handle;
+    CUresult r = mem_create_func(&handle, sg.second, &prop, 0);
+    if (r == CUDA_SUCCESS) {
+      r = mem_map_func(sg.first, sg.second, 0, handle, 0);
+      if (r != CUDA_SUCCESS) {
+        mem_release_func(handle);
+      }
+    }
+    if (r == CUDA_SUCCESS) {
+      r = mem_set_access_func(sg.first, sg.second, &accessDesc, 1);
+      if (r != CUDA_SUCCESS) {
+        mem_unmap_func(sg.first, sg.second);
+        mem_release_func(handle);
+      }
+    }
+    if (r != CUDA_SUCCESS) {
+      fprintf(stderr,
+              "[HOOK] ERROR: preallocate_ranges: mapping segment at 0x%llx size=%zu failed with "
+              "error %d after %zu MB were mapped\n",
+              (unsigned long long)sg.first, sg.second, r, mapped_bytes >> 20);
+      for (const auto& m : mapped) {
+        mem_unmap_func(m.base, m.size);
+        mem_release_func(m.handle);
+      }
+      return false;
+    }
+    mapped.push_back({sg.first, sg.second, handle});
+    mapped_bytes += sg.second;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(g_prealloc_segs_mutex);
+    g_prealloc_segs = std::move(mapped);
+    if (!g_prealloc_segs.empty()) {
+      g_prealloc_handle.store((unsigned long long)g_prealloc_segs.front().handle);
+      g_prealloc_base.store((uint64_t)g_prealloc_segs.front().base);
+      g_prealloc_size.store((uint64_t)g_prealloc_segs.front().size);
+    }
+  }
+  tls_storage.preallocated_handle = 0;  // segments carry the handles
+  tls_storage.preallocated_start_addr = start_addr;
+  tls_storage.preallocated_end_addr = end_addr;
+  tls_storage.has_preallocation = true;
+  fprintf(stderr,
+          "[HOOK] INFO: preallocate_ranges: mapped %zu MB in %zu segments of the %llu MB span\n",
+          mapped_bytes >> 20, g_prealloc_segs.size(),
+          (unsigned long long)((end_addr - start_addr) >> 20));
+  return true;
 }
 
 size_t get_current_alloc_offset() {

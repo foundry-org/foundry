@@ -52,6 +52,9 @@ class SuspendAllocationRegion {
   bool was_enabled_;
 };
 bool preallocate_region(size_t size);
+// Sparse LOAD-side preallocation: map only the live ranges SAVE recorded.
+std::vector<std::pair<size_t, size_t>> get_live_region_ranges();
+bool preallocate_ranges(const std::vector<std::pair<size_t, size_t>>& ranges, size_t end_offset);
 void free_preallocated_region();
 size_t get_current_alloc_offset();
 void set_current_alloc_offset(size_t offset);

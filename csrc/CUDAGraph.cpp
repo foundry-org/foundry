@@ -543,8 +543,8 @@ void CUDAGraph::apply_on_demand_updates() {
           CUDA_KERNEL_NODE_PARAMS alt = u.kernel_params;
           alt.kern = nullptr;
           if (cuKernelGetFunction(&alt.func, u.kernel_params.kern) == CUDA_SUCCESS && alt.func) {
-            cuFuncSetAttribute(alt.func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                               alt.sharedMemBytes);
+            raise_dynamic_smem_optin(nullptr, alt.func, capture_dev_, (int)alt.sharedMemBytes,
+                                     "ON-DEMAND");
             CUresult sp2 = cuGraphKernelNodeSetParams(node, &alt);
             fprintf(stderr,
                     "[foundry ON-DEMAND] graph %d node %zu: kern-based SetParams failed (%d), "
@@ -2007,9 +2007,7 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
         if (std::holds_alternative<CUkernel>(func_handle_variant)) {
           CUkernel kern = std::get<CUkernel>(func_handle_variant);
           if (max_shared > 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared,
-                                     kern, graph->capture_dev_));
+            raise_dynamic_smem_optin(kern, nullptr, graph->capture_dev_, max_shared, "LOAD");
           }
           if (preferred_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(
@@ -2027,8 +2025,7 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
         } else {
           CUfunction func = std::get<CUfunction>(func_handle_variant);
           if (max_shared > 0) {
-            C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
+            raise_dynamic_smem_optin(nullptr, func, graph->capture_dev_, max_shared, "LOAD");
           }
           if (preferred_carveout >= 0) {
             C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
