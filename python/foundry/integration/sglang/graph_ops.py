@@ -22,6 +22,7 @@ from foundry.integration.sglang.config import (
     get_config,
     get_graph_extension_mode,
 )
+from foundry.integration.sglang.nvtx import nvtx_range, nvtx_traced
 from foundry.integration.sglang.runtime import get_state
 
 logger = logging.getLogger(__name__)
@@ -33,14 +34,12 @@ _GRAPH_FILENAME_RE = re.compile(r"^graph_(?P<index>\d+)_FULL_t(?P<bs>\d+)_r\d+_U
 def _batch_size_from_key(key: Any) -> int:
     if isinstance(key, int):
         return key
-    # ShapeKey(size, stream_idx, variant_label, dsa_variant): phase 1 persists
-    # only plain single-stream decode graphs, where size == bs.
+    # ShapeKey(size, stream_idx, variant_label, attention_variant) -- the last
+    # field was called dsa_variant before sglang #39176. Phase 1 persists only
+    # plain single-stream decode graphs, where size == bs.
     if hasattr(key, "size"):
-        if (
-            key.stream_idx is not None
-            or key.variant_label is not None
-            or key.dsa_variant is not None
-        ):
+        variant = getattr(key, "attention_variant", None) or getattr(key, "dsa_variant", None)
+        if key.stream_idx is not None or key.variant_label is not None or variant is not None:
             raise ValueError(f"Foundry SGLang save/load does not support graph variants: {key!r}")
         return key.size
     key_str = str(key)
@@ -101,6 +100,7 @@ def create_device_graph():
     return torch.cuda.CUDAGraph()
 
 
+@nvtx_traced("foundry.save.capture_graph")
 def capture_graph(graph, pool, stream, run_once_fn):
     mode = get_graph_extension_mode()
     if mode == CUDAGraphExtensionMode.SAVE:
@@ -118,12 +118,14 @@ def save_graph(graph, output: Any, key: Any) -> None:
     packed_output = _pack_output(output)
     filename = _graph_filename(state.capture_index, key)
     graph_path = os.path.join(cfg.workspace_dir, filename)
-    graph.save(graph_path, packed_output)
+    with nvtx_range("foundry.save.graph_save"):
+        graph.save(graph_path, packed_output)
 
     state.capture_index += 1
     logger.info("[Foundry] Saved SGLang CUDA graph %s key=%s", filename, key)
 
 
+@nvtx_traced("foundry.save.manifest")
 def save_graph_manifest() -> None:
     cfg = get_config()
     if cfg is None or cfg.workspace_dir is None:
@@ -131,14 +133,20 @@ def save_graph_manifest() -> None:
     foundry_pkg.save_graph_manifest(cfg.workspace_dir, enable_templates=cfg.graph_templates)
 
 
+@nvtx_traced("foundry.save.pack_fatbins")
 def pack_fatbins() -> None:
     cfg = get_config()
     if cfg is None or cfg.workspace_dir is None:
         return
+    t0 = time.perf_counter()
     cge.pack_fatbins_to_folder(cfg.workspace_dir)
     cge.set_pack_fatbins_on_exit(False)
+    logger.info(
+        "[Foundry] SAVE packed the recorded binaries in %.1f ms", 1000 * (time.perf_counter() - t0)
+    )
 
 
+@nvtx_traced("foundry.graph_restore.start")
 def start_graph_builds() -> None:
     global _pending_graph_builds
     cfg = get_config()
@@ -160,6 +168,7 @@ def start_graph_builds() -> None:
     )
 
 
+@nvtx_traced("foundry.graph_restore.preload")
 def preload_all_graphs() -> None:
     global _pending_graph_builds
     cfg = get_config()
@@ -177,7 +186,8 @@ def preload_all_graphs() -> None:
     _pending_graph_builds = None
 
     t0 = time.perf_counter()
-    results = FoundryCUDAGraph.finish_graph_loads(pending)
+    with nvtx_range("foundry.graph_restore.finish"):
+        results = FoundryCUDAGraph.finish_graph_loads(pending)
     logger.info(
         "[Foundry] Finished SGLang graph loads for %d graphs in %.3fs",
         len(results),
@@ -187,6 +197,247 @@ def preload_all_graphs() -> None:
     for i, (_index, _filename, meta) in enumerate(graph_files):
         graph, tensors = results[i]
         state.loaded_graphs[meta["key"]] = (graph, _unpack_output(tensors))
+
+
+def bootstrap_collective_connections() -> None:
+    """Connect every NCCL communicator the graphs may use, before capture, on
+    SAVE and LOAD alike.
+
+    NCCL sets a communicator up lazily: the first collective on it allocates
+    its buffers and connects the peers, work that is illegal inside a
+    capturing stream ("operation not permitted when stream is capturing",
+    seen on the attention-TP sub-group's first reduce_scatter of
+    Qwen3.5-35B-A3B attention-TP2 + EP4). Native sglang hides this behind
+    its eager warmup forwards; Foundry runs none, so it issues one small and
+    one large all-reduce, all-gather and reduce-scatter on each initialized
+    group through sglang's own coordinators (so the same communicator
+    objects get connected), plus the WORLD group the DP gather can use. The
+    buffers this allocates go through the hook at the same sequence point on
+    both modes.
+    """
+    import torch
+    import torch.distributed as dist
+
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return
+    from sglang.srt.distributed import parallel_state as ps
+
+    t0 = time.perf_counter()
+    device = torch.device("cuda", torch.cuda.current_device())
+    groups = []
+    for getter in (
+        ps.get_tp_group,
+        ps.get_attn_tp_group,
+        ps.get_moe_ep_group,
+        ps.get_moe_tp_group,
+        ps.get_moe_dp_group,
+    ):
+        try:
+            group = getter()
+        except Exception:
+            continue
+        if group is not None and group.world_size > 1 and group not in groups:
+            groups.append(group)
+    sizes = (16, 4 << 20)  # elements: LL-sized, and ring-sized (8 MB bf16)
+    connected = []
+    for group in groups:
+        ws = group.world_size
+        for n in sizes:
+            group.all_reduce(torch.ones(n, dtype=torch.bfloat16, device=device))
+            group.all_gather_into_tensor(
+                torch.empty(ws * n, dtype=torch.bfloat16, device=device),
+                torch.ones(n, dtype=torch.bfloat16, device=device),
+            )
+            group.reduce_scatter_tensor(
+                torch.empty(n, dtype=torch.bfloat16, device=device),
+                torch.ones(ws * n, dtype=torch.bfloat16, device=device),
+            )
+        connected.append(f"{group.unique_name}(ws={ws})")
+    ws = dist.get_world_size()
+    for n in sizes:
+        dist.all_reduce(torch.ones(n, dtype=torch.bfloat16, device=device), group=dist.group.WORLD)
+        dist.all_gather_into_tensor(
+            torch.empty(ws * n, dtype=torch.bfloat16, device=device),
+            torch.ones(n, dtype=torch.bfloat16, device=device),
+            group=dist.group.WORLD,
+        )
+    torch.cuda.synchronize()
+    logger.info(
+        "[Foundry] SGLang collective connections bootstrapped in %.3fs: %s + WORLD(ws=%d)",
+        time.perf_counter() - t0,
+        ", ".join(connected) or "-",
+        ws,
+    )
+
+
+def bootstrap_logits_gatherer(cuda_graph_runner) -> bool:
+    """Create the logits all-gather's symmetric-memory state BEFORE capture, on
+    SAVE and LOAD alike.
+
+    sglang's ``LogitsProcessor`` gathers the TP-sharded logits through
+    ``MultimemAllGatherer``: a torch symmetric-memory buffer plus a multicast
+    mapping and signal pads, built lazily on the first *eager* call
+    (``create_state``, a collective) and skipped under capture, where the
+    gatherer falls back to an NCCL all-gather. Whether the multicast path is
+    available is a host property (IMEX / fabric), so on a host with multicast
+    any eager forward before capture activates the gatherer and every graph
+    then bakes in its pointers; those allocations bypass cudaMalloc, so the
+    hook never records them and LOAD cannot recreate them (illegal address at
+    the first decode). Creating the state here, at the same sequence point in
+    both modes, gives it the same addresses on both sides (its VA reservations
+    are carved from the region) and lets the graphs capture the multicast
+    gather exactly as native sglang does.
+
+    Returns True when a state was (or already is) built, False when the
+    gatherer is disabled, absent, or multicast is unavailable (NCCL fallback,
+    identical on both modes).
+    """
+    import torch
+
+    try:
+        from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+            MultimemAllGatherer,
+        )
+    except Exception:
+        return False
+    model = cuda_graph_runner.model_runner.model
+    built = False
+    for module in model.modules():
+        gatherer = getattr(module, "_logits_gatherer", None)
+        if not isinstance(gatherer, MultimemAllGatherer):
+            continue
+        if gatherer._state is None:
+            continue  # disabled by configuration
+        if gatherer._state is not MultimemAllGatherer._UNINIT:
+            # Built before this point by an eager forward: its addresses depend
+            # on that forward's allocations, which LOAD does not repeat.
+            logger.warning(
+                "[Foundry] logits all-gather state was already built before the bootstrap; "
+                "SAVE and LOAD may place it differently"
+            )
+            built = True
+            continue
+        lm_head = getattr(model, "lm_head", None)
+        weight = getattr(lm_head, "weight", None)
+        if weight is None or weight.dim() != 2:
+            logger.warning("[Foundry] logits gatherer found but no lm_head weight; leaving it lazy")
+            return False
+        # The gather input is the per-rank logits shard: (tokens, vocab / tp).
+        probe = torch.empty((1, weight.shape[0]), dtype=torch.bfloat16, device=weight.device)
+        t0 = time.perf_counter()
+        state = gatherer._build(probe)
+        if state is not MultimemAllGatherer._UNINIT:
+            gatherer._state = state
+        built = state is not None and state is not MultimemAllGatherer._UNINIT
+        logger.info(
+            "[Foundry] logits all-gather state %s pre-capture in %.3fs (shard width %d)",
+            "built" if built else "not built (NCCL fallback)",
+            time.perf_counter() - t0,
+            weight.shape[0],
+        )
+    return built
+
+
+def install_capture_autotune_guard() -> None:
+    """SAVE-only: turn inductor's Triton autotuning inside the capture window
+    into a clear error.
+
+    A freshly compiled inductor kernel with several candidate configs is
+    benchmarked on its first run (``CachingAutotuner.benchmark_all_configs``),
+    and the benchmark synchronizes the device, which the capturing stream
+    rejects ("operation not permitted when stream is capturing") and the whole
+    capture then fails with an unrelated-looking error. With a warm inductor
+    cache (``autotune_local_cache``) the best config is loaded and nothing is
+    benchmarked, so SAVE succeeds; this is why SAVE passes after a plain sglang
+    run of the same model on the same machine and fails cold. The guard does
+    not change behaviour, it names the cause and the remedy.
+    """
+    try:
+        import torch
+        from torch._inductor.runtime import triton_heuristics
+    except Exception as exc:  # pragma: no cover - inductor layout changed
+        logger.warning("[Foundry] capture-time autotune guard not installed: %s", exc)
+        return
+    cls = triton_heuristics.CachingAutotuner
+    orig = cls.benchmark_all_configs
+    if getattr(orig, "_foundry_capture_guard", False):
+        return
+
+    def benchmark_all_configs(self, *args, **kwargs):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "[Foundry] inductor wants to autotune a freshly compiled Triton kernel inside "
+                "the capture window; its benchmark synchronizes the device, which capture "
+                "forbids. Warm the JIT caches first: run plain sglang with the same decode-graph "
+                "set once for this model on this machine (same SGLANG_CACHE_DIR / "
+                "TORCHINDUCTOR_CACHE_DIR), then SAVE."
+            )
+        return orig(self, *args, **kwargs)
+
+    benchmark_all_configs._foundry_capture_guard = True  # type: ignore[attr-defined]
+    cls.benchmark_all_configs = benchmark_all_configs
+
+
+def bootstrap_lazy_runtimes() -> None:
+    """SAVE-only: perform, outside any stream capture, the one-time runtime
+    initializations that capture rejects, so that the model's own compiles and
+    JIT kernel loads can happen inside the captured forward and be recorded
+    like every other capture-time event (no eager warmup forward).
+
+    * torch.compile / inductor: its pattern-matcher lazy init traces example
+      graphs and copies unpinned host tensors to the device, which fails inside
+      capture ("Cannot copy between CPU and CUDA tensors during CUDA graph
+      capture"). The three lazy_init entry points run it once; the tensors are
+      transient. Dynamo tracing, inductor codegen and Triton compiles are host
+      work and module loads, legal during capture.
+    * DeepGEMM: the first JIT call builds its runtime, which calls
+      cudaFree(nullptr) and probes nvcc; get_num_sms() goes through the same
+      device object. Allocation-free.
+
+    LOAD needs neither: restore compiles nothing, and LOAD's first eager
+    request performs these inits outside capture, as native sglang does. The
+    caller runs this with the allocation region suspended, so the transient
+    tensors are plain driver allocations and the deterministic cursor is the
+    same on SAVE and LOAD afterwards.
+    """
+    import torch
+
+    t0 = time.perf_counter()
+    device = torch.device("cuda", torch.cuda.current_device())
+    # inductor guards its pattern-matcher initializers with a functools.cache
+    # keyed on the "input device" it derives from the compiled function's first
+    # tensor input (None when there is none). Warm every key a compile can
+    # produce: a trivial compile of a CUDA function runs the whole pipeline
+    # (dynamo, joint-graph and post-grad passes, one Triton kernel) for the
+    # CUDA key; the initializers are then run directly for the None and CPU
+    # keys.
+    torch.compile(lambda x: x * 2 + 1, dynamic=True)(torch.ones(8, device=device))
+    # Only the joint-graph initializers are device-keyed (pad_mm / sfdp / misc
+    # patterns trace example tensors on `input_device`, which is where the
+    # unpinned host-to-device copy happens). pre_grad and post_grad register
+    # global patterns once, and a second call raises "Duplicate pattern";
+    # the trivial compile above already ran them. Guard every call on its
+    # own: one failure must not skip the remaining keys (that skip let
+    # GLM-5.3-Flash's DSA indexer compile run _sfdp_init inside capture).
+    try:
+        from torch._inductor.fx_passes import joint_graph
+
+        keys = (None, torch.device("cpu"), torch.device("cuda"), device)
+        for key in keys:
+            try:
+                joint_graph.lazy_init(key)
+            except Exception as exc:
+                logger.warning("[Foundry] inductor joint_graph.lazy_init(%s) failed: %s", key, exc)
+    except Exception as exc:
+        logger.warning("[Foundry] inductor lazy_init warm-up unavailable: %s", exc)
+    install_capture_autotune_guard()
+    try:
+        import deep_gemm
+
+        deep_gemm.get_num_sms()
+    except Exception:
+        pass
+    logger.info("[Foundry] SGLang lazy runtimes bootstrapped in %.3fs", time.perf_counter() - t0)
 
 
 def bootstrap_deepep_buffer(cuda_graph_runner) -> bool:
@@ -410,6 +661,7 @@ def initialize_all_attention_metadata(cuda_graph_runner) -> None:
         initialize_attention_metadata_for_bs(cuda_graph_runner, bs)
 
 
+@nvtx_traced("foundry.graph_restore.load_all")
 def load_all_graphs(cuda_graph_runner) -> None:
     """LOAD-time replacement for the upstream capture loop.
 
@@ -431,15 +683,30 @@ def load_all_graphs(cuda_graph_runner) -> None:
     if not graph_files:
         raise RuntimeError(f"No Foundry SGLang graph files found in {cfg.workspace_dir}")
 
-    # NVSHMEM init runs once before any graph loads — graphs may reference
-    # NVSHMEM symbols. Single-GPU dense models have 0 NVSHMEM modules, so
-    # this is a no-op there but kept for EP parity.
+    # NVSHMEM init runs once before any graph is finished/replayed — graphs may
+    # reference NVSHMEM symbols. Single-GPU dense models have 0 NVSHMEM
+    # modules, so this is a no-op there but kept for EP parity.
     cge.init_nvshmem_for_loaded_modules()
 
-    paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
+    global _pending_graph_builds
     t0 = time.perf_counter()
-    pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
-    results = FoundryCUDAGraph.finish_graph_loads(pending)
+    if _pending_graph_builds is not None:
+        # Builds were started at setup (start_graph_builds, right after the
+        # binaries were loaded) and ran on the background thread during
+        # torch-distributed init, weight loading and the memory-pool setup;
+        # only the remainder is waited for here. finish_graph_loads replays
+        # the allocator events and reconstructs output tensors, so the
+        # cursor-dependent part still happens at this sequence point.
+        pending, early_files = _pending_graph_builds
+        _pending_graph_builds = None
+        if [f for _, f, _ in early_files] != [f for _, f, _ in graph_files]:
+            raise RuntimeError("Foundry: graph file list changed between setup and load")
+        logger.info("[Foundry] Using the %d graph builds started at setup", len(graph_files))
+    else:
+        paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
+        pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
+    with nvtx_range("foundry.graph_restore.finish"):
+        results = FoundryCUDAGraph.finish_graph_loads(pending)
     logger.info(
         "[Foundry] Loaded %d SGLang graphs in %.3fs",
         len(results),

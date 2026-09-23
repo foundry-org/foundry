@@ -123,6 +123,20 @@ def _patch_init_torch_distributed() -> None:
             dp_rank=_resolve_dp_rank(self),
         )
         rt.log_alloc_offset("after_setup_graph_ext")
+        if mode == CUDAGraphExtensionMode.LOAD and _early_graph_builds_enabled():
+            # Start rebuilding the CUDA graphs now, on foundry's background
+            # thread, so template builds and member instantiation overlap
+            # torch-distributed init, weight loading and the memory-pool
+            # setup instead of sitting on the critical path at the capture
+            # point. Only CUDA graph objects are created here (no torch
+            # allocations: allocator replay and output-tensor reconstruction
+            # happen in finish_graph_loads at the capture point, and NVSHMEM
+            # module init still precedes it), so the deterministic layout is
+            # unchanged. Opt-in (FOUNDRY_SGLANG_EARLY_GRAPH_BUILDS=1): see
+            # _early_graph_builds_enabled for why it is off by default.
+            from foundry.integration.sglang.graph_ops import start_graph_builds
+
+            start_graph_builds()
         result = orig(self, *args, **kwargs)
         rt.log_alloc_offset("after_init_torch_dist")
         rt.skip_to_scratch_boundary()
@@ -130,6 +144,19 @@ def _patch_init_torch_distributed() -> None:
         return result
 
     cls.init_torch_distributed = patched
+
+
+def _early_graph_builds_enabled() -> bool:
+    # Off by default: it does not work for graphs with memcpy/memset nodes.
+    # cuGraphAddMemcpyNode validates its addresses when the node is added, and
+    # at setup the buffers the decode graphs copy into (the graph runner's
+    # static inputs, the KV pool) do not exist yet: Qwen3.5-122B-FP8 EP8 fails
+    # with "cuGraphAddMemcpyNode FAILED for node 1604 with error 1". The
+    # graph build therefore has to follow the engine's allocations, i.e. the
+    # capture point, and instantiation (the bulk of the restore) cannot be
+    # overlapped with model initialization this way. Kept as an opt-in for
+    # graph sets without such nodes.
+    return os.environ.get("FOUNDRY_SGLANG_EARLY_GRAPH_BUILDS", "0") == "1"
 
 
 def _patch_alloc_memory_pool() -> None:
@@ -147,10 +174,33 @@ def _patch_alloc_memory_pool() -> None:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
     orig_resolve = kvc_mod.KVCacheConfigurator._resolve_memory_pool_config
+    # Context overrides the resolver issued on SAVE (get_context().override,
+    # e.g. max_mamba_cache_size for hybrid Mamba/GDN/KDA models); the pool
+    # factories read them from the bags, so LOAD must replay them when it skips
+    # the resolver. Filled by patched_resolve, persisted by patched_alloc.
+    resolve_overrides: list = []
+
+    def _json_safe(value):
+        if isinstance(value, (bool, int, float, str)) or value is None:
+            return True
+        if isinstance(value, (list, tuple)):
+            return all(_json_safe(v) for v in value)
+        return False
 
     @functools.wraps(orig_resolve)
     def patched_resolve(self, pre_model_load_memory):
-        if get_graph_extension_mode() != CUDAGraphExtensionMode.LOAD:
+        mode = get_graph_extension_mode()
+        if mode == CUDAGraphExtensionMode.SAVE:
+            from sglang.srt.runtime_context import get_context
+
+            before = len(get_context().overrides_log())
+            config = orig_resolve(self, pre_model_load_memory)
+            resolve_overrides[:] = [
+                [source, {k: v for k, v in fields.items() if _json_safe(v)}]
+                for source, fields in get_context().overrides_log()[before:]
+            ]
+            return config
+        if mode != CUDAGraphExtensionMode.LOAD:
             return orig_resolve(self, pre_model_load_memory)
         import torch
 
@@ -168,7 +218,15 @@ def _patch_alloc_memory_pool() -> None:
         config = MemoryPoolConfig(
             **{k: v for k, v in state.memory_pool_config.items() if k in valid}
         )
-        logger.info("[Foundry] SGLang reused saved memory pool config")
+        if state.context_overrides:
+            from sglang.srt.runtime_context import get_context
+
+            for source, fields in state.context_overrides:
+                get_context().override(f"foundry_replay:{source}", **fields)
+        logger.info(
+            "[Foundry] SGLang reused saved memory pool config (%d context overrides replayed)",
+            len(state.context_overrides),
+        )
         return config
 
     kvc_mod.KVCacheConfigurator._resolve_memory_pool_config = patched_resolve
@@ -190,7 +248,9 @@ def _patch_alloc_memory_pool() -> None:
         result = orig_alloc(self, *args, **kwargs)
         rt.log_alloc_offset("after_init_memory_pool")
         if mode == CUDAGraphExtensionMode.SAVE:
-            state = rt.create_warmup_state(asdict(self.memory_pool_config))
+            state = rt.create_warmup_state(
+                asdict(self.memory_pool_config), context_overrides=resolve_overrides
+            )
             rt.save_warmup_state(state)
         return result
 
@@ -223,25 +283,11 @@ def _patch_cuda_graph_capture() -> None:
     orig_capture_one = backend_cls.capture_one
     orig_capture = runner_cls.capture
 
-    # When set, the capture machinery is being reused as a foundry-driven WARMUP
-    # pass: run one real forward per shape (no warmup repeats, no graph capture,
-    # no store) to trigger all of sglang's pre-capture lazy init — DeepEP
-    # buffer, DeepGEMM per-shape JIT, etc. — that would otherwise fire inside
-    # the captured stream and abort with "operation not permitted when stream is
-    # capturing". See `_run_warmup_pass`.
-    warmup_active = [False]
-
     @functools.wraps(orig_capture_one)
     def patched_capture_one(
         self, shape_key, forward_fn, capture_inputs=None, post_warmup_hook=None
     ):
         mode = get_graph_extension_mode()
-        if warmup_active[0]:
-            # Warmup pass: one real eager forward; nothing captured or stored.
-            forward_fn()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
-            return
         if mode != CUDAGraphExtensionMode.SAVE:
             return orig_capture_one(
                 self,
@@ -270,86 +316,55 @@ def _patch_cuda_graph_capture() -> None:
         self._outputs[shape_key] = out
         save_graph(graph, out, shape_key)
 
-    def _warmup_pass_barrier():
-        """File-based barrier before the SAVE warmup pass (no device allocations, so the SAVE/LOAD
-        allocation sequences stay identical). The warmup forwards run the elastic-EP all-to-all;
-        nodes that reach them tens of seconds apart trip the a2a fault timeout, which forced SAVE
-        to use a long timeout. That timeout is a kernel argument baked into the captured graphs,
-        so LOAD-restored ranks then hang for the long timeout on the first step after a real fault
-        (~70 s to detect a fault with a 30 s SAVE timeout vs 2 s). With the barrier, SAVE can run
-        with the serving timeout. FOUNDRY_WARMUP_BARRIER_DIR: directory shared by the participating
-        processes; FOUNDRY_WARMUP_BARRIER_COUNT: number of ranks that run the warmup pass (default:
-        torch world size)."""
-        d = os.environ.get("FOUNDRY_WARMUP_BARRIER_DIR")
-        if not d:
-            return
-        import torch.distributed as dist
-
-        n = int(os.environ.get("FOUNDRY_WARMUP_BARRIER_COUNT", "0") or 0)
-        if n <= 0 and dist.is_initialized():
-            n = dist.get_world_size()
-        if n <= 1:
-            return
-        rank = dist.get_rank() if dist.is_initialized() else os.getpid()
-        os.makedirs(d, exist_ok=True)
-        open(os.path.join(d, f"warmup_ready_{rank}"), "w").close()
-        t0 = time.perf_counter()
-        while time.perf_counter() - t0 < 600:
-            if len([f for f in os.listdir(d) if f.startswith("warmup_ready_")]) >= n:
-                break
-            time.sleep(0.2)
-        logger.info(
-            "[Foundry] warmup-pass barrier: %d ranks ready after %.1f s",
-            n,
-            time.perf_counter() - t0,
-        )
-
-    def _run_warmup_pass(self):
-        """Foundry-driven pre-capture warmup for the DeepEP/EP path.
-
-        Reuses the upstream capture loop with graph capture neutered (see
-        ``warmup_active``) to run one real forward per ``capture_bs`` BEFORE the
-        real capture — triggering every pre-capture lazy init sglang normally
-        does in its (foundry-suppressed) warmup forwards: DeepEP dispatch
-        combine paths, DeepGEMM per-shape JIT compile, etc. SAVE-only: LOAD
-        replays recorded allocations at absolute offsets and must not re-enter
-        graph_capture() (it breaks the threaded finish_graph_loads with
-        "invalid device context")."""
-        _warmup_pass_barrier()
-        warmup_active[0] = True
-        t0 = time.perf_counter()
-        try:
-            orig_capture(self)
-        finally:
-            warmup_active[0] = False
-        logger.info(
-            "[Foundry] SGLang EP warmup pass (lazy-init) completed in %.3fs",
-            time.perf_counter() - t0,
-        )
-
     @functools.wraps(orig_capture)
     def patched(self):
         mode = get_graph_extension_mode()
         if mode == CUDAGraphExtensionMode.NONE:
             return orig_capture(self)
 
-        # DeepEP/EP only (gated so the dense / single-GPU / DP paths are
-        # untouched). bootstrap_deepep_buffer runs on both modes (cheap
-        # singleton) so the DeepEP buffer is created at the same
-        # allocation-sequence point on SAVE and LOAD — created lazily inside
-        # the warmup pass on SAVE but by bootstrap on LOAD, its VMM address
-        # differed between modes and one-sided NVSHMEM traffic + restored-graph
-        # references then corrupted whatever tensor later reused that VA
-        # (docs/sglang/known-issues.md).
-        if _ep_lazy_init_needed():
-            from foundry.integration.sglang.graph_ops import bootstrap_deepep_buffer
+        # Pre-capture bootstraps. Everything sglang initializes lazily on the
+        # first eager forward that a capturing stream rejects, or that must
+        # exist at the same addresses on both modes, is done here, at the same
+        # sequence point on SAVE and LOAD; no model forward runs.
+        from foundry.integration.sglang.graph_ops import (
+            bootstrap_collective_connections,
+            bootstrap_deepep_buffer,
+            bootstrap_lazy_runtimes,
+            bootstrap_logits_gatherer,
+        )
 
+        # 1. NCCL communicators (both modes): their first collective allocates
+        #    and connects, which capture rejects.
+        rt.log_alloc_offset("before_collective_bootstrap")
+        bootstrap_collective_connections()
+        rt.log_alloc_offset("after_collective_bootstrap")
+        # 2. The logits all-gather's symmetric-memory state (both modes): built
+        #    on a host with multicast by any eager forward before capture, and
+        #    invisible to the hook (torch symmetric memory is not cudaMalloc).
+        rt.log_alloc_offset("before_logits_gatherer")
+        bootstrap_logits_gatherer(self)
+        rt.log_alloc_offset("after_logits_gatherer")
+        # 3. The DeepEP buffer (both modes, DeepEP-family backends): NVSHMEM
+        #    runtime + symmetric heap, otherwise created inside the first
+        #    captured forward, where deep_ep_cpp.Buffer(...) aborts.
+        if _ep_lazy_init_needed():
             rt.log_alloc_offset("before_deepep_bootstrap")
             bootstrap_deepep_buffer(self)
             rt.log_alloc_offset("after_deepep_bootstrap")
-            if mode == CUDAGraphExtensionMode.SAVE:
-                _run_warmup_pass(self)
-                rt.log_alloc_offset("after_warmup_pass")
+        # 4. SAVE only, every model: the two one-time runtime initializations
+        #    capture rejects (inductor's lazy init, DeepGEMM's runtime init),
+        #    with the allocation region suspended so their transient tensors
+        #    never move the deterministic cursor. The model's own compiles and
+        #    JIT kernel loads then happen inside the captured forward.
+        if mode == CUDAGraphExtensionMode.SAVE:
+            with rt.allocation_region_suspended():
+                bootstrap_lazy_runtimes()
+            rt.log_alloc_offset("after_lazy_runtimes")
+
+        # The deterministic layout begins here on both modes: same sequence
+        # point, same (empty) caching-allocator state; LOAD's
+        # preallocate_for_load_mode below maps and replays from this point.
+        rt.mark_layout_start()
 
         if mode == CUDAGraphExtensionMode.LOAD:
             import torch
@@ -501,7 +516,7 @@ def _patch_cuda_graph_capture() -> None:
 
         save_graph_manifest()
         pack_fatbins()
-        rt.capture_final_alloc_offset()
+        rt.record_region_layout()
         return result
 
     # LOAD-mode WAR barrier: restored graphs carry no usable in-graph
