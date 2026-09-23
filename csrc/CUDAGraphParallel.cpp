@@ -168,6 +168,25 @@ ParsedGraphData CUDAGraph::prepare_graph_shell(boost::json::value&& root_val, Me
 // Does JSON traversal, function lookup, CUDA graph API calls, and instantiation.
 // ============================================================================
 
+// LOAD-time breakdown of the last template build (ms), printed with the [foundry BUILD] line.
+// Categories: json field extraction + kernel-param decode, function lookup, function attributes
+// (smem cap / carveout), cuGraphAdd*Node, per-node kernel attributes, dependencies, instantiate.
+struct BuildTiming {
+  double json_ms = 0, func_ms = 0, func_attr_ms = 0, add_ms = 0, node_attr_ms = 0, deps_ms = 0,
+         inst_ms = 0;
+  size_t func_attr_calls = 0, node_attr_calls = 0;
+};
+static thread_local BuildTiming g_last_build_timing;
+BuildTiming last_build_timing() {
+  return g_last_build_timing;
+}
+namespace {
+using bt_clock = std::chrono::steady_clock;
+inline double bt_ms(bt_clock::time_point a) {
+  return std::chrono::duration<double, std::milli>(bt_clock::now() - a).count();
+}
+}  // namespace
+
 GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUcontext ctx,
                                                    ReconstructTensorFn reconstruct_fn,
                                                    GraphTemplate* out_template) {
@@ -180,6 +199,8 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
   C10_CUDA_DRIVER_CHECK(cuGraphCreate(&cuGraph, 0));
   graph->graph_ = reinterpret_cast<cudaGraph_t>(cuGraph);
   graph->has_graph_ = true;
+  g_last_build_timing = BuildTiming{};
+  BuildTiming& bt = g_last_build_timing;
 
   if (out_template) {
     out_template->cuGraph = cuGraph;
@@ -273,6 +294,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
   std::vector<size_t> all_arg_buffer_sizes;
 
   for (const auto& node_val : nodes_array) {
+    auto t_nattr = bt_clock::now();
     const json::object& node_obj = node_val.as_object();
     int node_id = node_obj.at("id").to_number<int>();
     std::string node_type = node_obj.at("type").as_string().c_str();
@@ -281,6 +303,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
     CUgraphNode cuNode = nullptr;
 
     if (node_type == "KernelNode") {
+      auto t_json = bt_clock::now();
       CUDA_KERNEL_NODE_PARAMS node_params;
       memset(&node_params, 0, sizeof(node_params));
 
@@ -296,7 +319,11 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       std::string function_name = params.at("function_name").as_string().c_str();
       uint64_t binary_hash = params.at("kernel_source_binary_hash").to_number<uint64_t>();
 
+      bt.json_ms += bt_ms(t_json);
+      auto t_func = bt_clock::now();
       auto func_handle_variant = query_function_handle(binary_hash, function_name);
+      bt.func_ms += bt_ms(t_func);
+      t_json = bt_clock::now();
       if (std::holds_alternative<CUkernel>(func_handle_variant)) {
         node_params.kern = std::get<CUkernel>(func_handle_variant);
       } else {
@@ -411,37 +438,13 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
             cluster_depth = v;
         }
 
-        if (std::holds_alternative<CUkernel>(func_handle_variant)) {
-          CUkernel kern = std::get<CUkernel>(func_handle_variant);
-          if (max_shared > 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared,
-                                     kern, graph->capture_dev_));
-            // cuGraphAddKernelNode validates dynamic smem against the
-            // per-context CUfunction, which does not inherit the CUkernel
-            // attribute (>48KB kernels fail with CUDA_ERROR_INVALID_VALUE).
-            CUfunction ctx_func = nullptr;
-            if (cuKernelGetFunction(&ctx_func, kern) == CUDA_SUCCESS && ctx_func) {
-              C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                  ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
-            }
-          }
-          if (preferred_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
-                                     preferred_carveout, kern, graph->capture_dev_));
-          }
-        } else {
-          CUfunction func = std::get<CUfunction>(func_handle_variant);
-          if (max_shared > 0) {
-            C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
-          }
-          if (preferred_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                func, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, preferred_carveout));
-          }
-        }
+        bt.json_ms += bt_ms(t_json);
+        auto t_fa = bt_clock::now();
+        apply_saved_function_attributes(func_handle_variant, graph->capture_dev_, max_shared,
+                                        preferred_carveout, "LOAD");
+        bt.func_attr_ms += bt_ms(t_fa);
+        bt.func_attr_calls++;
+        t_json = bt_clock::now();
       }
 
       // Decode kernelParams
@@ -517,7 +520,12 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       }
 
       // Add kernel node
+      bt.json_ms += bt_ms(t_json);
+      auto t_add = bt_clock::now();
+      ensure_dynamic_smem_optin(node_params, graph->capture_dev_, "LOAD");
       CUresult kernel_result = cuGraphAddKernelNode(&cuNode, cuGraph, nullptr, 0, &node_params);
+      bt.add_ms += bt_ms(t_add);
+      t_nattr = bt_clock::now();
       if (kernel_result != CUDA_SUCCESS) {
         fprintf(stderr,
                 "[foundry LOAD ERROR] cuGraphAddKernelNode FAILED for node %d with error %d\n",
@@ -712,6 +720,9 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
     }
 
     if (cuNode) {
+      if (node_type == "KernelNode") {
+        bt.node_attr_ms += bt_ms(t_nattr);
+      }
       id_to_node[node_id] = cuNode;
       if (out_template) {
         out_template->ordered_nodes.push_back(cuNode);
@@ -721,6 +732,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
   }
 
   // Apply common kernel node attributes in batch (one set of attr values for all kernel nodes)
+  auto t_cattr = bt_clock::now();
   if (has_common_attrs && !kernel_nodes_for_common_attrs.empty()) {
     if (has_common_cluster_dim) {
       CUkernelNodeAttrValue clusterAttr;
@@ -814,6 +826,8 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
   }
 
   // Add dependencies
+  bt.node_attr_ms += bt_ms(t_cattr);
+  auto t_deps = bt_clock::now();
   const json::array& deps_array = root.at("dependencies").as_array();
   if (!deps_array.empty()) {
     std::vector<CUgraphNode> from_nodes;
@@ -850,9 +864,12 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
     }
   }
 
+  bt.deps_ms += bt_ms(t_deps);
   // Instantiate
+  auto t_inst = bt_clock::now();
   graph->capture_ended_ = true;
   graph->instantiate();
+  bt.inst_ms += bt_ms(t_inst);
   // NOTE(yongji): bypass destructor's release memory pool call
   graph->capture_ended_ = false;
 
@@ -887,14 +904,18 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
 // ============================================================================
 // prepare_on_demand_graph: parse node params without building a CUgraph.
 //
-// Instead of clone+instantiate, we store pre-decoded node params and
-// share the template's CUgraphExec. At replay time, the exec's nodes
-// are updated via cuGraphExecKernelNodeSetParams etc.
+// A member of a topology group never builds its own CUgraph. Its node params
+// are pre-decoded here (CPU only, runs in parallel with the template builds)
+// and later, in materialize_on_demand_exec(), written onto the group's shared
+// builder graph with cuGraph*NodeSetParams, from which the member instantiates
+// a DEDICATED exec (~5 ms per ~1000-node graph). Every member is instantiated
+// at load by default (Phase 2c); FOUNDRY_LAZY_GRAPH_EXEC=1 defers it to the
+// first replay. Nothing calls cuGraphExecUpdate: an exec updated in place
+// launches every node slower for the rest of its life.
 //
 // Savings vs full build_graph_from_parsed:
-//   - No cuGraphCreate, cuGraphAddKernelNode, cuGraphInstantiate, etc.
-//   - No CUDA driver API calls at all during load
-//   - Pure CPU-side JSON parsing + hex decoding
+//   - No cuGraphCreate / cuGraphAdd*Node / cuGraphAddDependencies per member
+//   - Parsing is pure CPU-side JSON/binary decoding
 // ============================================================================
 
 void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
@@ -1019,33 +1040,8 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
             cluster_depth = v;
         }
 
-        if (std::holds_alternative<CUkernel>(func_handle_variant)) {
-          CUkernel kern = std::get<CUkernel>(func_handle_variant);
-          CUdevice dev = parsed.graph->capture_dev_;
-          if (max_shared > 0) {
-            C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
-                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared, kern, dev));
-            CUfunction ctx_func = nullptr;  // see binary path: per-context function too
-            if (cuKernelGetFunction(&ctx_func, kern) == CUDA_SUCCESS && ctx_func) {
-              C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                  ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
-            }
-          }
-          if (preferred_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
-                CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, preferred_carveout, kern, dev));
-          }
-        } else {
-          CUfunction func = std::get<CUfunction>(func_handle_variant);
-          if (max_shared > 0) {
-            C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
-          }
-          if (preferred_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                func, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, preferred_carveout));
-          }
-        }
+        apply_saved_function_attributes(func_handle_variant, parsed.graph->capture_dev_, max_shared,
+                                        preferred_carveout, "LOAD");
       }
 
       // Resolve kernel node attributes: start from common, override with per-node
@@ -1370,42 +1366,9 @@ void CUDAGraph::prepare_on_demand_graph_binary(const BinaryGraphFile& bin_file,
           u.kernel_params.func = std::get<CUfunction>(func_handle_variant);
         }
 
-        // Set function attributes
-        if (std::holds_alternative<CUkernel>(func_handle_variant)) {
-          CUkernel kern = std::get<CUkernel>(func_handle_variant);
-          CUdevice dev = graph->capture_dev_;
-          if (k.max_dynamic_shared_size_bytes > 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                     k.max_dynamic_shared_size_bytes, kern, dev));
-            // cuGraphKernelNodeSetParams validates dynamic smem against the
-            // per-context CUfunction, which does not inherit the CUkernel
-            // attribute; a member kernel unseen by any template hits this.
-            CUfunction ctx_func = nullptr;
-            if (cuKernelGetFunction(&ctx_func, kern) == CUDA_SUCCESS && ctx_func) {
-              C10_CUDA_DRIVER_CHECK(
-                  cuFuncSetAttribute(ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                     k.max_dynamic_shared_size_bytes));
-            }
-          }
-          if (k.preferred_shared_memory_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
-                                     k.preferred_shared_memory_carveout, kern, dev));
-          }
-        } else {
-          CUfunction func = std::get<CUfunction>(func_handle_variant);
-          if (k.max_dynamic_shared_size_bytes > 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                   k.max_dynamic_shared_size_bytes));
-          }
-          if (k.preferred_shared_memory_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
-                                   k.preferred_shared_memory_carveout));
-          }
-        }
+        apply_saved_function_attributes(func_handle_variant, graph->capture_dev_,
+                                        k.max_dynamic_shared_size_bytes,
+                                        k.preferred_shared_memory_carveout, "LOAD");
 
         // Kernel node attrs: start from common, override with per-node
         u.kernel_attrs = common_attrs;
@@ -2017,6 +1980,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         // re-read full JSON for build_graph_from_parsed. Only ~22 templates.
         // Strip metadata keys already extracted in Phase 1b to match
         // what the original JSON flow produces at this point.
+        auto t_reread = std::chrono::steady_clock::now();
         if (bin_files[tmpl_idx].valid()) {
           all_parsed[tmpl_idx].root_val = read_and_parse_graph_json(json_path_list[tmpl_idx]);
           auto& re_root = all_parsed[tmpl_idx].root_val.as_object();
@@ -2026,10 +1990,17 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         }
 
         boost::json::value tmpl_json_copy = all_parsed[tmpl_idx].root_val;
+        double reread_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_reread)
+                .count();
 
         CUDAGraph::GraphTemplate tmpl;
+        auto t_build = std::chrono::steady_clock::now();
         auto result = CUDAGraph::build_graph_from_parsed(std::move(all_parsed[tmpl_idx]), main_ctx,
                                                          nullptr, &tmpl);
+        double build_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_build)
+                .count();
 
         auto shared = std::make_shared<CUDAGraph::SharedGraphExec>();
         shared->ctx = main_ctx;
@@ -2050,8 +2021,16 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         double tmpl_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_tmpl)
                 .count();
-        fprintf(stderr, "[foundry BUILD] Template %zu (%s): %zu nodes, done in %.1f ms\n", tmpl_idx,
-                graph_names[tmpl_idx].c_str(), shared->ordered_nodes.size(), tmpl_ms);
+        {
+          BuildTiming b = last_build_timing();
+          fprintf(stderr,
+                  "[foundry BUILD] Template %zu (%s): %zu nodes, done in %.1f ms (reread %.1f, "
+                  "build %.1f: json %.1f, func %.1f, func-attrs %.1f/%zu calls, add %.1f, "
+                  "node-attrs %.1f, deps %.1f, instantiate %.1f; on-demand prep %.1f)\n",
+                  tmpl_idx, graph_names[tmpl_idx].c_str(), shared->ordered_nodes.size(), tmpl_ms,
+                  reread_ms, build_ms, b.json_ms, b.func_ms, b.func_attr_ms, b.func_attr_calls,
+                  b.add_ms, b.node_attr_ms, b.deps_ms, b.inst_ms, tmpl_ms - reread_ms - build_ms);
+        }
 
         std::lock_guard<std::mutex> lock(shared_execs_mutex);
         shared_execs[tmpl_idx] = std::move(shared);
@@ -2082,8 +2061,12 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_phase2)
               .count();
       fprintf(stderr,
-              "[foundry] Phase 2: %zu templates + %zu on-demand = %zu graphs built in %.1f ms\n",
-              topology_groups.size(), num - topology_groups.size(), num, phase2_ms);
+              "[foundry] Phase 2: %zu templates + %zu on-demand = %zu graphs built in %.1f ms "
+              "(members: param/attr rewrite %.1f ms, instantiate %.1f ms, %llu attribute calls)\n",
+              topology_groups.size(), num - topology_groups.size(), num, phase2_ms,
+              CUDAGraph::g_member_update_us.load() / 1000.0,
+              CUDAGraph::g_member_inst_us.load() / 1000.0,
+              (unsigned long long)CUDAGraph::g_member_attr_calls.load());
 
       build_promise->set_value();
     } catch (...) {

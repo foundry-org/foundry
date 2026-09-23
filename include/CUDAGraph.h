@@ -67,6 +67,11 @@ struct CUDAGeneratorStateRegistry {
 };
 
 struct CUDAGraph {
+  // LOAD instrumentation: totals over all member materializations (microseconds / calls),
+  // printed with the "[foundry] Phase 2" line.
+  static std::atomic<uint64_t> g_member_update_us;
+  static std::atomic<uint64_t> g_member_inst_us;
+  static std::atomic<uint64_t> g_member_attr_calls;
   CUDAGraph(bool keep_graph = false);
   ~CUDAGraph();
 
