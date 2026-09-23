@@ -83,7 +83,7 @@ foundry_archive/
     graph_{0..N-1}_FULL_t{bs}_r{bs}_UX_pcN.json       # one per captured graph
     graph_{0..N-1}_FULL_t{bs}_r{bs}_UX_pcN.cugraph    # binary cuGraph blob
     graph_manifest.json                   # topology groups for template + on-demand linking
-    final_alloc_offset.json               # per-rank VMM watermark
+    region_layout.json                    # per-rank layout: start offset, watermark, live ranges
     fatbin_image_packed.img               # packed kernel fatbins
     fatbin_entrypoint_packed.txt          # fatbin entry-point index
 ```

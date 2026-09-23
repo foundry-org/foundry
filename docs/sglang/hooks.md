@@ -124,7 +124,7 @@ finally:
     attn_backend.init_forward_metadata_capture_cuda_graph = real_init
 save_graph_manifest()
 pack_fatbins()
-capture_final_alloc_offset()
+record_region_layout()
 ```
 
 `initialize_all_attention_metadata` walks `reversed(self.capture_bs)` and pre-allocates every per-bs FlashInfer wrapper. The wrappers are stored in `attn_backend.decode_cuda_graph_metadata[bs]`.
@@ -143,7 +143,7 @@ No allocation. The captured graph references the pre-pass wrapper's address; LOA
 if cgr.get_global_graph_memory_pool() is None:
     cgr.set_global_graph_memory_pool(self.device_module.graph_pool_handle())
 set_graph_pool_id(cgr.get_global_graph_memory_pool())
-preallocate_for_load_mode()                         # cuMemCreate+cuMemMap up to final_alloc_offset
+preallocate_for_load_mode()                         # cursor to start_offset; map live ranges up to final_alloc_offset
 initialize_all_attention_metadata(self)             # pre-pass (same as SAVE)
 load_all_graphs(self)                               # ONE start_graph_builds + finish_graph_loads
 self.graphs = {k: v[0] for k, v in state.loaded_graphs.items()}
@@ -183,11 +183,25 @@ TP attention is unsupported (its NCCL all-reduce is incompatible with the VMM re
   captured stream (`deep_ep_cpp.Buffer(...)` → "operation not permitted when stream is
   capturing"). The hook forces it before the capture loop, unwrapping the
   `MaybeTboDeepEPDispatcher._inners` to reach a `DeepEPDispatcher`. Runs on SAVE and LOAD.
-- **SAVE-only warmup pass** (`_run_warmup_pass`, `capture()` patch). Reuses the upstream
-  capture loop with graph capture neutered (run forwards only) to trigger every
-  pre-capture lazy init — DeepGEMM per-shape JIT (`stream.synchronize()` is illegal in
-  capture), buffer creation, etc. — outside the captured stream. LOAD doesn't need it
-  (preallocate + replay place allocations at recorded offsets; bootstrap covers NVSHMEM).
+- **Logits all-gather bootstrap** (`bootstrap_logits_gatherer`, `capture()` patch, SAVE and LOAD).
+  sglang's `LogitsProcessor` gathers TP-sharded logits through `MultimemAllGatherer`, whose torch
+  symmetric-memory buffer, multicast mapping and signal pads are built lazily on the first *eager*
+  call and skipped under capture (NCCL fallback). Multicast availability is a host property, so on
+  a host with multicast any eager forward before capture activates the gatherer and every graph
+  bakes in pointers to memory the hook never saw (torch symmetric memory is not `cudaMalloc`);
+  LOAD then faults at the first decode, while the same SAVE passes on a host without multicast.
+  The hook builds the state (`_build` with a probe of the per-rank logits shard width) before
+  capture at the same sequence point in both modes, so it lands at the same addresses and the
+  graphs capture the multicast gather like native sglang.
+- **SAVE-side runtime-init bootstrap** (`bootstrap_lazy_runtimes`, `capture()` patch). Two
+  one-time initializations are illegal while a stream is capturing and would otherwise fire
+  inside the first captured forward: inductor's pattern-matcher lazy init (an unpinned
+  host-to-device copy) and DeepGEMM's runtime init (`cudaFree(nullptr)`). SAVE runs them
+  directly, with the allocation region suspended so their transient tensors never move the
+  deterministic cursor. Everything else the model does lazily (torch.compile of its
+  functions, DeepGEMM per-shape JIT compile and `cuLibraryLoadFromFile`) happens inside the
+  captured forward and is recorded like any other capture-time event. No eager forward runs
+  on either mode, and SAVE and LOAD reach the layout start at the same cursor.
 - **`deepep_adapter` mode on LOAD.** LOAD replaces the capture loop, so the adapter's
   `_captured_deepep_mode` is never set; replay asserts on it. The hook calls
   `deepep_adapter.capture(is_extend_in_batch=False)` after load.

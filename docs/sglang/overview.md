@@ -26,8 +26,8 @@ config. DeepEP low-latency caps dispatch at
 `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` (default 128); raise it (+ chunk
 prefill) for larger batches and keep it identical across SAVE/LOAD. Foundry-specific
 EP handling is in [`hooks.md`](hooks.md): a DeepEP buffer pre-capture bootstrap, a
-SAVE-only warmup pass (triggers DeepGEMM JIT + buffer creation outside the capture
-stream), `deepep_adapter` mode init on LOAD, the FlashInfer pre-pass gated off for
+SAVE-side runtime-init bootstrap (the two one-time inits capture rejects run outside the
+capture stream; compiles and JIT loads happen inside it), `deepep_adapter` mode init on LOAD, the FlashInfer pre-pass gated off for
 fa3, and a C++ fix binding the CUDA context on the graph-build pool workers.
 
 **Per-rank device binding (DP/TP/EP).** Foundry's `set_allocation_region` binds the
