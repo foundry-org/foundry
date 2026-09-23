@@ -58,6 +58,6 @@ sglang serve \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --disable-radix-cache \
     --attention-backend flashinfer \
-    --cuda-graph-max-bs 128 \
+    --cuda-graph-max-bs-decode 128 \
     "${FOUNDRY_ARGS[@]}" \
     ${SGL_EXTRA_ARGS:-}

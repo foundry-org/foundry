@@ -3,10 +3,16 @@
 End-to-end serve scripts for SAVE / LOAD of CUDA graphs through the foundry SGLang
 integration.
 
-Current target: the fork's **`foundry`** branch — foundry v0.0.3 pairs with commit
-`f1d688e52`; the 0.0.2-era integration is kept on `foundry-0.0.2` (integration rebased onto
-upstream-synced `main`, post-0.5.18), which pins **torch 2.13.0+cu130** and ships the
-whole kernel stack as wheels. Foundry `dev >= ac6104f` builds against torch 2.11 and
+## Which commits
+
+| Component | Commit | Notes |
+|---|---|---|
+| SGLang fork `foundry-org/sglang`, branch **`foundry`** | `6272eb04c5` | = upstream `main` `03ea13a545` (2026-09-16) + one 8-file integration commit (`[foundry] SGLang integration: fast cold start by CUDA graph context materialization`). Check out this commit; `main` alone has no `--foundry-graph-extension-config-path`. |
+| Foundry, branch **`coldstart`** | `b4c2a84` (or later) | The sglang integration in `python/foundry/integration/sglang/` plus the hook/graph fixes the Qwen3.5 / DeepSeek rows needed. Archives written by earlier foundry commits (`final_alloc_offset.json` + `live_ranges.json` layout) do not load on this version: re-run `--save`. |
+
+The fork commit pins **torch 2.13.0+cu130**, sglang-kernel 0.4.7, sgl-deep-ep 0.1.2, sgl-deep-gemm 0.2.0 and
+ships the whole kernel stack as wheels. The previous pairing (foundry v0.0.3 with `f1d688e52`) is kept as branch `foundry-0.0.3`;
+the 0.0.2-era integration on `foundry-0.0.2`. Foundry `dev >= ac6104f` builds against torch 2.11 and
 2.13 alike (version-guarded csrc). Validated on this pairing (see **Validation**):
 single GPU, DP=2, TP=2, EP=2 with DeepEP low-latency and with DeepEP v2 —
 save/load, TPOT and greedy-output parity against plain SGLang. The 0.0.2-era
@@ -29,7 +35,12 @@ recipe/sglang/
 ├── serve_qwen3-1.7b_dp.sh          # Qwen3-1.7B           data parallel
 ├── serve_qwen3-30ba3b_ep.sh        # Qwen3-30B-A3B (MoE)  expert parallel (DeepEP + DP-attention)
 ├── serve_qwen3-30ba3b_ep_tpattn.sh # Qwen3-30B-A3B (MoE)  expert parallel, TP attention (symm-mem allreduce)
-└── serve_qwen3-30ba3bfp8_ep_v2.sh  # Qwen3-30B-A3B-FP8    expert parallel, DeepEP v2 (NCCL symmetric windows)
+├── serve_qwen3-30ba3bfp8_ep_v2.sh  # Qwen3-30B-A3B-FP8    expert parallel, DeepEP v2 (NCCL symmetric windows)
+├── serve_common.sh                 # shared driver of the scripts below: <cfg> = topology name (single|dpN|tpN|epN|tpepN|tpAepN)
+├── serve_qwen3.5-27b.sh            # Qwen3.5-27B          dense hybrid; single, dp2-8, tp2-8
+├── serve_qwen3.5-35ba3b.sh         # Qwen3.5-35B-A3B      MoE hybrid; tp2/tp4, ep2-8, tpep2/tpep4
+├── serve_qwen3.5-122ba10b.sh       # Qwen3.5-122B-A10B    MoE hybrid, FP8 (default) or bf16; ep4, tpep4, tp2ep4, ep8, tp4ep8
+└── serve_deepseek-v4-flash.sh      # DeepSeek-V4-Flash    sgl-project FP8 checkpoint; ep8 (DP attention + DeepEP)
 ```
 
 Every script accepts the same trailing `--save` / `--load` flag. Scripts that scale
@@ -42,6 +53,10 @@ bash serve_qwen3-1.7b_dp.sh        <dp_size>   [--save|--load]
 bash serve_qwen3-30ba3b_ep.sh          <ep_size>   [--save|--load]
 bash serve_qwen3-30ba3b_ep_tpattn.sh   <ep_size>   [--save|--load]
 bash serve_qwen3-30ba3bfp8_ep_v2.sh    <ep_size>   [--save|--load]
+bash serve_qwen3.5-27b.sh              <cfg>       [--save|--load]     # see "Qwen3.5 and DeepSeek" below
+bash serve_qwen3.5-35ba3b.sh           <cfg>       [--save|--load]
+bash serve_qwen3.5-122ba10b.sh         <cfg>       [--save|--load]
+bash serve_deepseek-v4-flash.sh        ep8         [--save|--load]
 ```
 
 Without `--save`/`--load` a script runs plain SGLang (the baseline). `SGL_EXTRA_ARGS`
@@ -49,12 +64,24 @@ appends extra `sglang serve` flags verbatim, e.g.
 `SGL_EXTRA_ARGS="--cuda-graph-backend-prefill disabled"` to give a baseline the same
 prefill-graph policy as a foundry LOAD (foundry restores decode graphs only).
 
-The scripts use `--cuda-graph-max-bs` (deprecated alias of
-`--cuda-graph-max-bs-decode` on the current fork) so the scripts also run on the
-0.0.2-era fork branch `foundry-0.0.2`.
+The scripts use `--cuda-graph-max-bs-decode`; the pre-0.5.18 alias `--cuda-graph-max-bs` was
+removed upstream, so they no longer run on the 0.0.2-era fork branch as-is.
 
 A single SAVE pass is enough — SGLang has no startup profile-forward, so there is no
 non-determinism that requires a two-pass save (unlike the vLLM recipe).
+
+**Warm the JIT caches once per machine and model before the first SAVE:** run the recipe
+once without `--save`/`--load` (or with `--warm`, the same thing), wait for `/health`, stop it.
+SAVE runs no eager forward and compiles inside the capture window on purpose; inductor's
+Triton autotuning of a freshly compiled kernel synchronizes the device, which capture
+forbids, so a SAVE on a cold cache fails (foundry replaces the cryptic capture error with a
+message naming this step). Plain SGLang's pre-capture warmup forwards compile and autotune
+every kernel with capture-mode inputs, so afterwards the inductor / Triton / DeepGEMM caches
+under `SGLANG_CACHE_DIR` hold exactly the artifacts SAVE loads. An eager run
+(`--disable-cuda-graph`) is not a substitute: the compiled functions then see plain tensors
+instead of views of the static batch buffers, dynamo guards differently, and the artifacts
+differ. Any earlier graph-mode run of the same model on the machine (a baseline, a previous
+SAVE) warms the caches too; a fresh container or a restored radix host does not.
 
 Because the two TOMLs are shared (single `workspace_root = "foundry_archive"`), one
 archive is written per host; run a fresh `rm -rf foundry_archive` whenever you change
@@ -185,16 +212,122 @@ every rank dispatches the full prefill chunk and prefill-graph capture trips
 DeepEP's `num_max_dispatch_tokens_per_rank` assert. `foundry` branch
 only (uses the per-phase cuda-graph flags).
 
-The EP script sets `--enable-dp-attention --moe-a2a-backend deepep --deepep-mode
-low_latency --moe-runner-backend deep_gemm --attention-backend fa3
---disable-custom-all-reduce` and `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256`.
-DeepEP low-latency caps dispatch at that per-rank token count (and asserts
-`(n+1)*2 <= NVSHMEM_QP_DEPTH`); keep it and `--chunked-prefill-size` identical between
-SAVE and LOAD so the captured graphs match.
+The EP script sets `--enable-dp-attention --enable-torch-symm-mem --moe-a2a-backend deepep --deepep-mode low_latency
+--moe-runner-backend deep_gemm --attention-backend fa3 --disable-custom-all-reduce` and
+`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256`. `--enable-torch-symm-mem` routes the DP-attention gather
+all-reduce through torch symmetric memory, the same path the TP recipes use; without it sglang uses pynccl for
+that all-reduce (NCCL LL kernels do replay from restored graphs; the flag keeps the collective path uniform).
+Communication state that sglang builds lazily on the first eager forward (the DeepEP buffer, the logits
+all-gather's symmetric-memory state) is created by foundry before capture at the same point on SAVE and LOAD, so
+it exists at the same addresses in both modes; see `docs/sglang/hooks.md`.
+
+## Qwen3.5 and DeepSeek
+
+`serve_qwen3.5-*.sh` and `serve_deepseek-v4-flash.sh` share one driver, `serve_common.sh`, whose first
+argument names the parallel topology with the vocabulary of the cold-start matrix that validated them
+(`experimental/matrix3`): `single`, `dpN`, `tpN` (torch symm-mem allreduce), `epN` (DP attention + DeepEP
+low-latency + DeepGEMM, capture bs per rank), `tpepN` (TP attention + EP; capture bs = N·k), and `tp2ep4` /
+`tp2ep8` / `tp4ep8` (attention TP inside DP-attention groups + EP over all ranks; capture bs = a·k). All of them
+capture every decode graph for bs 1..`MAXBS` (256) with `--disable-cuda-graph-padding` and prefill graphs
+disabled, so a baseline run of the same script restores nothing but captures the identical graph set.
+`--mem-fraction-static` defaults to the validated value per topology (`MEMFRAC` overrides it); the scripts set the
+Mamba/GDN state-pool cap and the DeepEP token/QP limits themselves.
+
+```bash
+rm -rf foundry_archive
+CUDA_VISIBLE_DEVICES=0,1,2,3 bash serve_qwen3.5-35ba3b.sh ep4 --save     # wait for /health, then SIGTERM
+CUDA_VISIBLE_DEVICES=0,1,2,3 bash serve_qwen3.5-35ba3b.sh ep4 --load
+
+rm -rf foundry_archive
+bash serve_qwen3.5-122ba10b.sh tp4ep8 --save                             # 8 GPUs, FP8 checkpoint
+bash serve_qwen3.5-122ba10b.sh tp4ep8 --load
+
+rm -rf foundry_archive
+bash serve_deepseek-v4-flash.sh ep8 --save                               # 8 GPUs, sgl-project/DeepSeek-V4-Flash-FP8
+bash serve_deepseek-v4-flash.sh ep8 --load
+```
+
+Measured on 8×H100 (2026-09-16/17, fork `6272eb04c5`, foundry `coldstart` `f0700cf`; time to `/health` from
+process start, log-based; TPOT at bs 1/8/32/128 within run-to-run noise and greedy output identical to the natively
+captured engine in every row):
+
+| Script, `<cfg>` | mem fraction | graphs/rank | Capture → restore | To `/health`: native graphs / LOAD |
+|---|---:|---:|---:|---:|
+| `serve_qwen3.5-27b.sh single` | 0.8 | 37 | 5.8 s → 0.31 s | 36.3 s / 33.7 s |
+| `serve_qwen3.5-27b.sh tp4` | 0.8 | 256 | 37.9 s → 1.8 s | 69.2 s / 35.3 s |
+| `serve_qwen3.5-27b.sh dp4` | 0.8 | 37 | 5.9 s → 0.27 s | 46.1 s / 43.2 s |
+| `serve_qwen3.5-35ba3b.sh tp4` | 0.8 | 256 | 43.0 s → 2.1 s | 74.5 s / 35.8 s |
+| `serve_qwen3.5-35ba3b.sh ep4` | 0.8 | 256 | 47.4 s → 4.1 s | 85.4 s / 49.7 s |
+| `serve_qwen3.5-35ba3b.sh ep8` | 0.6 | 256 | 52.3 s → 4.2 s | 92.2 s / 58.4 s |
+| `serve_qwen3.5-35ba3b.sh tpep4` | 0.8 | 256 (bs 4·k) | 54.4 s → 7.2 s | 85.1 s / 42.0 s |
+| `serve_qwen3.5-122ba10b.sh ep4` (FP8) | 0.6 | 64 | 21.3 s → 1.1 s | 65.1 s / 50.6 s |
+| `serve_qwen3.5-122ba10b.sh tpep4` (FP8) | 0.6 | 64 | 23.0 s → 1.3 s | 60.1 s / 43.2 s |
+| `serve_qwen3.5-122ba10b.sh tp4ep8` (FP8) | 0.65 | 16 | 10.1 s → 0.6 s | 54.6 s / 54.3 s |
+| `serve_qwen3.5-122ba10b.sh ep8` (bf16) | 0.6 | 32 | 11.7 s → 1.0 s | 56.0 s / 52.8 s |
+| `serve_deepseek-v4-flash.sh ep8` | 0.7 | 256 | 106.9 s → 5.7 s | 154.5 s / 60.8 s |
+
+The 122B rows restore fewer graphs than `MAXBS` because sglang caps the running requests per DP worker at the
+GDN state-cache size (`--max-mamba-cache-size` divided by the state slots per request and by `dp`) and keeps only
+the capture batch sizes below that cap: cache 256 on 4 DP workers gives 64 graphs, cache 64 on 8 gives 8, and the
+attention-TP rows keep the multiples of the attention TP below the cap. The cap is deliberate on this model (see
+the notes) and doubles as the graph-memory budget of the 8-rank rows.
+
+Model notes:
+
+- **Qwen3.5 hybrids (gated DeltaNet + attention).** The GDN state pool is a runtime-context override made inside
+  sglang's memory-pool resolver; SAVE records it and LOAD replays it, so the pool has the same size on both sides.
+  On the 122B model the pool must be capped (`--max-mamba-cache-size`, set by the script): sized from free memory
+  it crowds out the graphs on 8 ranks and fails to size at all on 4 ranks at 0.6. The cap also bounds the
+  concurrent requests per DP worker, and with them the decode graphs sglang captures (table above); raise it
+  together with `--mem-fraction-static` headroom if more concurrency is needed. Pure TP of the FP8 MoE
+  checkpoints (`tp4`, `tp8`) is rejected by sglang's block-quant sharding check; use the bf16 checkpoint or an EP
+  topology.
+- **TP attention rows (`tpepN`, `tpAepN`).** The capture list is multiples of the attention TP, so bs below it
+  runs eagerly on the native and the restored engine alike (bs 1 TPOT ~60-100 ms in the table's source data).
+  They also need less `--mem-fraction-static` than the DP-attention rows: TP attention adds symmetric-memory
+  buffers and the graphs carry a·256 tokens per rank.
+- **DeepSeek-V4-Flash.** On Hopper the stock checkpoint's FP4 experts are served TP-only by sglang; the all-FP8
+  conversion `sgl-project/DeepSeek-V4-Flash-FP8` is the one that runs DP attention + DeepEP, and it is what the
+  script uses. sglang's `dsv4` attention backend has a KV page of 256, and the DP-attention prefill chunk is divided
+  by `dp`, hence `--chunked-prefill-size 2048`. The attention-TP hybrids of this checkpoint fail in sglang's
+  weight loading (expert shard mismatch), so only `ep8` is offered. DeepSeek-V4.1-Flash is not in the fork's sglang
+  tree. The script exports `SGLANG_DSV4_FP4_EXPERTS=0`: sglang assumes FP4 experts for DeepSeek-V4 unless it can
+  probe a safetensors shard header, and without that probe (dummy weights) it builds FP4 experts that Hopper
+  DeepGEMM rejects (`kPackedFP4 and (arch_major == 10 or 12)`). Validated on 8xH200 with dummy weights: SAVE 222 s,
+  LOAD 72 s, 256 graphs restored in 7.0 s, identical output.
+- **8-rank memory headroom.** LOAD keeps the recorded kernel images resident and maps the graph range in one step,
+  so it needs a few GB more than SAVE; a LOAD that cannot map the range now fails at startup with the missing and
+  free MB instead of hanging at the first request. Lower the fraction for SAVE and LOAD alike.
+- **No eager warmup on SAVE.** SAVE runs only the two one-time initializations that stream capture rejects
+  (inductor's lazy init, DeepGEMM's runtime init), with the allocation region suspended; the model's compiles and
+  JIT loads happen inside the captured forward and are recorded. SAVE and LOAD therefore reach the graph range at
+  the same cursor. Validated on 8xH200 (Qwen3-30B-A3B EP2: identical output).
 
 ## Validation
 
-Every recipe in this directory was run as shipped on 2026-09-05 (8×H100 host, 2 GPUs
+**8xH200, 2026-09-23** (foundry `coldstart`, sglang fork `foundry` at `03ea13a545`, driver 595, dummy weights,
+every decode batch size captured without padding, `experimental/matrix3/coldstart.sh`): the 100B+ recipes serve
+and restore with greedy output identical across eager / native graph / LOAD. Time to `/health` eager / native
+graph / LOAD and LOAD TPOT vs native at bs 1 / 8 / 32 / 128:
+
+| Model, topology | graphs/rank | eager / graph / LOAD to `/health` | restore | TPOT LOAD vs native |
+|---|---:|---|---:|---|
+| Qwen3.5-122B-A10B-FP8, EP8 | 256 | 63 / 189 / 67 s | 4.9 s | +3.6 / +3.9 / -0.7 / -0.9 % |
+| Qwen3.5-397B-A17B-FP8, EP8 | 128 | 58 / 136 / 66 s | 2.9 s | +0.8 / +3.5 / +0.2 / +0.1 % |
+| GLM-5.3-Flash, EP8 | 256 | 120 / 324 / 128 s | 10.1 s | +1.6 / -1.1 / +10.2 / +9.7 % (single run) |
+| Qwen3.5-122B-A10B-FP8, attn-TP4 + EP8 | 64 | 67 / 90 / 75 s | 2.0 s | eager bs1 / -0.6 / +4.7 / +2.6 % |
+| Qwen3.5-122B-A10B bf16, EP8 | 256 | 65 / 141 / 71 s | 5.8 s | +2.5 / -0.1 / +20 (single run) / +4.0 % |
+| DeepSeek-V4-Flash-FP8, EP8 | 256 | 99 (cold caches: 360 graph) / - / 72 s | 7.0 s | +0.6 / +1.0 / -10 / -6 % (single run) |
+
+Also validated there (SAVE + LOAD, identical parity): Qwen3.5-122B attn-TP2+EP4 (FP8 and bf16), Qwen3.5-397B-FP8
+attn-TP4+EP8, gpt-oss-120b EP4 / attn-TP4+EP4 / EP8, Qwen3.5-35B-A3B EP8 and attn-TP2+EP4, GLM-4.7-Flash EP8,
+Qwen3-Next-80B EP8, Qwen3-30B-A3B (bf16, FP8) EP2 / TP2 / attn-TP2+EP2, Qwen3-1.7B single / DP2 / TP2. Not
+servable in plain sglang on that host: DeepSeek-V4-Flash-FP8 (DeepGEMM has no ue8m0 layout on SM90),
+Inkling-Small before the fork's idle-rank fixes (see the report). DeepSeek-V4-Flash-FP8 needs
+`SGLANG_DSV4_FP4_EXPERTS=0` without a probe-able checkpoint (the script sets it). Hybrid (GDN/KDA) models: size
+`--max-mamba-cache-size` to at least `dp_size * cuda-graph-max-bs-decode`, or sglang silently caps the graph set.
+
+**8xH100, 2026-09-05.** Every recipe in this directory was run as shipped (8×H100 host, 2 GPUs
 per multi-GPU run, foundry v0.0.3, sglang fork branch `foundry` at `f1d688e52`, CUDA 13.3
 compat library, NCCL 2.30.7)
 through `experimental/recipe_validate.sh`: SAVE, then plain SGLang twice (the noise
@@ -220,7 +353,7 @@ restored graphs sit inside SGLang's own run-to-run noise.
 
 With the recipes' default graph sets (20–52 decode graphs) capture is only a few
 seconds, so time-to-health is dominated by weight loading and the differences above
-are small; with all 256 decode graphs (`--cuda-graph-max-bs 256 --disable-cuda-graph-padding`)
+are small; with all 256 decode graphs (`--cuda-graph-max-bs-decode 256 --disable-cuda-graph-padding`)
 restore saves 25–50 s per engine start (see the top-level README's Performance table).
 
 ## DeepEP v2 (NCCL)
@@ -259,7 +392,7 @@ foundry_archive/
     ├── graph_*.json + .cugraph    # one pair per captured graph
     ├── graph_manifest.json        # topology groups + template assignments
     ├── fatbin_image_packed.img    # packed CUDA modules
-    └── final_alloc_offset.json    # per-rank VMM watermark
+    └── region_layout.json         # per-rank layout: start offset, watermark, live ranges
 ```
 
 For DP / EP each rank gets its own `rank_<N>/`.
@@ -273,3 +406,4 @@ For DP / EP each rank gets its own `rank_<N>/`.
 | `NVSHMEM device library version does not match with NVSHMEM host library version`, then segfault | A custom `nvshmem_host_path` in the TOMLs points at a different NVSHMEM build than the one inside the `sgl-deep-ep` wheel. Remove the override; foundry's auto-detected `nvidia-nvshmem` wheel matches. |
 | `nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2` | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` too high for `NVSHMEM_QP_DEPTH`; lower it or raise the QP depth. |
 | TP/EP LOAD aborts `[HOOK] ERROR: cuLinkAddData failed for segment 0 with error 209` (SAVE may log the same during pre-link); DP unaffected | Driver too old for the CUDA version NCCL was built with. Foundry device-links NCCL's kernel library on reload, and the driver's linker rejects fatbins from a newer toolkit even though `cuLibraryLoadData` (plain sglang) accepts them. Compare `nvidia-smi` (driver CUDA version) against the `+cudaX.Y` in `NCCL version 2.29.7+cuda13.2` in the worker log — the torch 2.13 cu130 wheel pins a 13.2-built NCCL, so a 13.0 driver (580.x) fails while 595.x works. After installing NCCL 2.30.7 (a cuda13.3 build) for DeepEP v2, *every* recipe, TP and EP included, needs the CUDA 13.3 compat library (or a 13.3-capable driver): with the 13.2 compat lib, the TP SAVE logs `cuLinkAddData failed ... 209 during pre-link` for NCCL's 128-segment device library and the LOAD then aborts. Fix: upgrade the driver, or install NVIDIA's forward-compat package (`apt-get install cuda-compat-13-2`, then `LD_LIBRARY_PATH=/usr/local/cuda-13.2/compat:$LD_LIBRARY_PATH`). Downgrading NCCL to a 13.0 build is not an option: torch 2.13 needs `ncclCommResume` (>= 2.29). |
+| 8-rank engine (EP8 / TP4xEP8) inside a container: one scheduler dies at init with `RuntimeError: Resource temporarily unavailable` (first all_reduce) or `Fatal Python error: Aborted` on thread creation, the remaining ranks then spin at 100 % CPU with 0 % GPU utilization | Container pid limit. Rootless podman / docker default `--pids-limit 2048`; an 8-rank sglang engine needs roughly 2800 tasks (NCCL, DeepEP, tokenizer and compile worker threads). Raise it: `podman update --pids-limit 65536 <container>` (or `--pids-limit` at create time). Check the demand with the cgroup's `pids.current`. |
