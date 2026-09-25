@@ -537,26 +537,17 @@ static BinaryFormat detect_binary_format(const void* data_ptr) {
   return BinaryFormat::PTX;
 }
 
+// Size of the fatbin container that starts at `fatbin_data`: its header plus `size` bytes of
+// payload, which already covers every arch entry of the image (fatbinary_section.h: fatSize is the
+// size of the whole fat binary after the header). Do not walk on to the next header: the containers
+// that follow in memory are other translation units of the same library's .nv_fatbin section, not
+// part of this image (a FATBINC_LINK_VERSION wrapper lists each of its segments separately). The
+// previous walk sized every image as "from here to the end of the section", so SAVE copied and
+// CRC-hashed 50-1000x the real bytes (NCCL: 5.95 GB for a 127 MB linked library, cuBLASLt: 140 MB
+// for a 6200-byte image).
 static size_t compute_fatbin_size(const uint8_t* fatbin_data) {
-  size_t size = 0;
-  size_t offset = 0;
-
-  while (true) {
-    const auto* header = reinterpret_cast<const fat_elf_header*>(fatbin_data + offset);
-
-    if (offset > 0 && header->magic != FATBIN_MAGIC) {
-      break;
-    }
-
-    const size_t fatbin_size = header->header_size + header->size;
-    size = offset + fatbin_size;
-    offset += fatbin_size;
-
-    if (header->magic != FATBIN_MAGIC) {
-      break;
-    }
-  }
-
+  const auto* header = reinterpret_cast<const fat_elf_header*>(fatbin_data);
+  const size_t size = header->header_size + header->size;
   return size == 0 ? sizeof(fat_elf_header) : size;
 }
 
@@ -4681,7 +4672,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
       // For device-linked binaries
       std::vector<std::vector<uint8_t>> linked_segments;
       const uint8_t* view =
-          nullptr;  // zero-copy view into the mmapped packed image (FOUNDRY_MMAP_ARCHIVE=1)
+          nullptr;  // zero-copy view into the mmapped packed image (default; see below)
       size_t view_size = 0;
     };
     std::vector<BinaryEntry> binaries;
@@ -4691,7 +4682,10 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
     auto bin_size = [](const BinaryEntry& b) -> size_t {
       return b.view ? b.view_size : b.data.size();
     };
-    // FOUNDRY_MMAP_ARCHIVE=1: map fatbin_image_packed.img instead of reading it into memory.
+    // Map fatbin_image_packed.img instead of reading it into memory (default; set
+    // FOUNDRY_MMAP_ARCHIVE=0/false to read it eagerly with ifstream). Measured on an H200 EP8
+    // archive: the eager read of 4.7-5.5 GB costs 1.6-1.8 s per rank; mmap takes binary restore
+    // from 1.67 s to 0.10 s with identical output.
     // The recorded images are loaded with CU_LIBRARY_BINARY_IS_PRESERVED, so the driver keeps
     // referring to the mapping (never unmapped); it only faults in the pages it actually parses,
     // so a 5 GB EP archive (four ~1 GB FlashAttention-3 fatbins with three architectures each)
@@ -4700,7 +4694,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
     size_t map_len = 0;
     {
       const char* e = std::getenv("FOUNDRY_MMAP_ARCHIVE");
-      if (e && (std::string(e) == "1" || std::string(e) == "true")) {
+      if (!e || (std::string(e) != "0" && std::string(e) != "false")) {
         int fd = open(packed_img_path.string().c_str(), O_RDONLY);
         struct stat st;
         if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0) {

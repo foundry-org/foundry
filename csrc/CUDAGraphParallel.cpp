@@ -1968,28 +1968,58 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       // CUDA driver API calls serialize on per-device mutex anyway.
       // Templates need full JSON (with nodes + dependencies) for build_graph_from_parsed.
       // If binary was loaded, the minimal JSON has empty nodes — re-read the
-      // JSON file for templates only (~12 graphs, acceptable cost).
-      for (const auto& [key, indices] : topology_groups) {
-        size_t tmpl_idx = indices[0];
+      // JSON file for templates only (one per topology group).
+      //
+      // The re-read + parse is pure CPU (26-30 ms per 1600-1900-node template),
+      // so for binary archives it is prefetched: while template k builds
+      // (driver-bound), template k+1's JSON is parsed on an async thread. One
+      // tree in flight at a time. JSON-only archives already hold the full tree.
+      std::vector<size_t> tmpl_order;
+      tmpl_order.reserve(topology_groups.size());
+      for (const auto& [key, indices] : topology_groups)
+        tmpl_order.push_back(indices[0]);
+
+      // Read + parse + strip the metadata keys already extracted in Phase 1b,
+      // to match what the original JSON flow produces at this point.
+      auto reread_template_json = [&json_path_list](size_t idx) {
+        boost::json::value v = read_and_parse_graph_json(json_path_list[idx]);
+        auto& re_root = v.as_object();
+        re_root.erase("generators");
+        re_root.erase("allocator_events");
+        re_root.erase("output_tensors");
+        return v;
+      };
+      auto start_prefetch = [&](size_t pos) {
+        std::future<boost::json::value> f;
+        if (pos < tmpl_order.size() && bin_files[tmpl_order[pos]].valid())
+          f = std::async(std::launch::async, reread_template_json, tmpl_order[pos]);
+        return f;
+      };
+      std::future<boost::json::value> next_json = start_prefetch(0);
+
+      for (size_t pos = 0; pos < tmpl_order.size(); ++pos) {
+        size_t tmpl_idx = tmpl_order[pos];
 
         fprintf(stderr, "[foundry BUILD] Template %zu (%s): building...\n", tmpl_idx,
                 graph_names[tmpl_idx].c_str());
         auto t_tmpl = std::chrono::steady_clock::now();
 
-        // If template came from binary (minimal JSON, empty nodes),
-        // re-read full JSON for build_graph_from_parsed. Only ~22 templates.
-        // Strip metadata keys already extracted in Phase 1b to match
-        // what the original JSON flow produces at this point.
+        // If template came from binary (minimal JSON, empty nodes), take the
+        // prefetched full JSON for build_graph_from_parsed ("reread" now only
+        // measures the wait on the prefetch) and start the next one.
+        const bool from_binary = bin_files[tmpl_idx].valid();
         auto t_reread = std::chrono::steady_clock::now();
-        if (bin_files[tmpl_idx].valid()) {
-          all_parsed[tmpl_idx].root_val = read_and_parse_graph_json(json_path_list[tmpl_idx]);
-          auto& re_root = all_parsed[tmpl_idx].root_val.as_object();
-          re_root.erase("generators");
-          re_root.erase("allocator_events");
-          re_root.erase("output_tensors");
-        }
+        if (from_binary)
+          all_parsed[tmpl_idx].root_val = next_json.get();
+        // (JSON-only template: the full tree is already in all_parsed.)
+        next_json = start_prefetch(pos + 1);
 
-        boost::json::value tmpl_json_copy = all_parsed[tmpl_idx].root_val;
+        // The template's on-demand data comes from the binary when available;
+        // the JSON copy is only needed for the JSON-only fallback
+        // (build_graph_from_parsed consumes the original tree).
+        boost::json::value tmpl_json_copy;
+        if (!from_binary)
+          tmpl_json_copy = all_parsed[tmpl_idx].root_val;
         double reread_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_reread)
                 .count();
@@ -2007,12 +2037,18 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         shared->current_params_id = static_cast<int>(tmpl_idx);
         result.graph->transfer_to_shared_exec(shared, std::move(tmpl));
 
-        // Prepare template's own on-demand data (needs shared_exec directly)
-        ParsedGraphData tmpl_parsed;
-        tmpl_parsed.graph = result.graph;
-        tmpl_parsed.root_val = std::move(tmpl_json_copy);
-        CUDAGraph::prepare_on_demand_graph(tmpl_parsed, main_ctx, shared,
-                                           static_cast<int>(tmpl_idx));
+        // Prepare template's own on-demand data (needs shared_exec directly).
+        // Binary path: direct struct reads (the JSON walk took 13-19 ms per template).
+        if (from_binary) {
+          CUDAGraph::prepare_on_demand_graph_binary(bin_files[tmpl_idx], result.graph, main_ctx,
+                                                    shared, static_cast<int>(tmpl_idx));
+        } else {
+          ParsedGraphData tmpl_parsed;
+          tmpl_parsed.graph = result.graph;
+          tmpl_parsed.root_val = std::move(tmpl_json_copy);
+          CUDAGraph::prepare_on_demand_graph(tmpl_parsed, main_ctx, shared,
+                                             static_cast<int>(tmpl_idx));
+        }
         result.graph->on_demand_data_->graph_name = graph_names[tmpl_idx];
         // Bind the template to the shared exec before any member rewrites the
         // shared graph's params.

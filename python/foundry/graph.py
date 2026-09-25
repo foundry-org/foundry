@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -167,12 +168,22 @@ class graph:
         self.stream_ctx.__exit__(*args)
 
 
-def save_graph_manifest(archive_dir: str, enable_templates: bool = True) -> None:
+def save_graph_manifest(
+    archive_dir: str,
+    enable_templates: bool = True,
+    partition: Callable[[str], str] | None = None,
+) -> None:
     """Write graph_manifest.json with topology groups and template assignments.
 
     With ``enable_templates=False`` every graph is its own topology group
     (template of itself, no on-demand members), so LOAD rebuilds each graph
     from its full node list instead of re-parameterizing a shared template.
+
+    ``partition`` maps a graph filename to a partition name; graphs in
+    different partitions never share a topology group. Use it when LOAD
+    restores the partitions with separate ``start_graph_builds`` calls: a
+    member's template must be in the same call (members are stored without
+    their dependencies).
 
     Reads topology_key from each saved graph JSON, groups graphs by topology,
     picks the first graph in each group as the template, strips the
@@ -189,7 +200,7 @@ def save_graph_manifest(archive_dir: str, enable_templates: bool = True) -> None
         return
 
     # Read topology_key from each graph JSON
-    topology_keys: dict[str, list[str]] = {}
+    topology_keys: dict[tuple[str, str], list[str]] = {}
     for filename in graph_files:
         json_path = os.path.join(archive_dir, filename)
         with open(json_path) as f:
@@ -199,19 +210,21 @@ def save_graph_manifest(archive_dir: str, enable_templates: bool = True) -> None
             return
         if not enable_templates:
             topo_key = f"{topo_key}#{filename}"
-        topology_keys.setdefault(topo_key, []).append(filename)
+        part = partition(filename) if partition is not None else ""
+        topology_keys.setdefault((part, topo_key), []).append(filename)
 
     # Build manifest
     groups = []
     templates = set()
-    for topo_key, filenames in topology_keys.items():
-        groups.append(
-            {
-                "topology_key": topo_key,
-                "template": filenames[0],
-                "members": filenames,
-            }
-        )
+    for (part, topo_key), filenames in topology_keys.items():
+        group = {
+            "topology_key": topo_key,
+            "template": filenames[0],
+            "members": filenames,
+        }
+        if part:
+            group["partition"] = part
+        groups.append(group)
         templates.add(filenames[0])
 
     manifest = {"topology_groups": groups}

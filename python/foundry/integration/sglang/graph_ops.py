@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -29,6 +31,20 @@ logger = logging.getLogger(__name__)
 
 _pending_graph_builds: tuple[Any, list[tuple[int, str, dict[str, Any]]]] | None = None
 _GRAPH_FILENAME_RE = re.compile(r"^graph_(?P<index>\d+)_FULL_t(?P<bs>\d+)_r\d+_UX_pcN\.json$")
+# Full-backend prefill graphs: one per token bucket t and cached-prefix variant
+# pc (prefix chunks, 0 = suffix-only), captured with r request slots. Their own
+# phase tag keeps them out of the decode scan above, so decode-only archives
+# and their consumers are unchanged.
+_PREFILL_GRAPH_FILENAME_RE = re.compile(
+    r"^graph_(?P<index>\d+)_PREFILL_t(?P<tokens>\d+)_r(?P<slots>\d+)_UX_pc(?P<chunks>\d+)\.json$"
+)
+# Per-rank SAVE record of what LOAD needs besides the graphs: the DP-gather
+# flag the captured forwards latch and the prefill output structures.
+_PREFILL_STATE_FILE = "prefill_graphs.json"
+# PrefillCudaGraphRunner's only ShapeKey variants (_chunked_prefix_variant).
+_CHUNKED_PREFIX_LABEL = "chunked_prefix:"
+# SAVE: output structure of each prefill graph whose output is not one tensor.
+_prefill_output_specs: dict[str, Any] = {}
 
 
 def _batch_size_from_key(key: Any) -> int:
@@ -52,6 +68,85 @@ def _batch_size_from_key(key: Any) -> int:
 def _graph_filename(index: int, key: Any) -> str:
     batch_size = _batch_size_from_key(key)
     return f"graph_{index}_FULL_t{batch_size}_r{batch_size}_UX_pcN.json"
+
+
+def _prefill_shape(key: Any) -> tuple[int, int]:
+    """(num_tokens, prefix chunks) of a prefill ShapeKey."""
+    variant = getattr(key, "attention_variant", None) or getattr(key, "dsa_variant", None)
+    if key.stream_idx is not None or variant is not None:
+        raise ValueError(f"Foundry SGLang save/load does not support graph variants: {key!r}")
+    label = key.variant_label
+    if label is None:
+        return key.size, 0
+    if label.startswith(_CHUNKED_PREFIX_LABEL):
+        return key.size, int(label[len(_CHUNKED_PREFIX_LABEL) :])
+    raise ValueError(f"Foundry SGLang save/load does not support prefill variant {label!r}")
+
+
+def _prefill_graph_filename(index: int, key: Any, req_slots: int) -> str:
+    tokens, chunks = _prefill_shape(key)
+    return f"graph_{index}_PREFILL_t{tokens}_r{req_slots}_UX_pc{chunks}.json"
+
+
+def graph_partition(filename: str) -> str:
+    """Manifest partition: prefill and decode graphs are restored by separate
+    start_graph_builds calls (at their own runner's capture point), so they
+    must not share a template."""
+    return "prefill" if _PREFILL_GRAPH_FILENAME_RE.match(filename) else "decode"
+
+
+def _flatten_prefill_output(output: Any) -> tuple[Any, list[torch.Tensor]]:
+    """Prefill graphs capture the transformer body, whose output is the hidden
+    states: one tensor for most models, a nested tuple / list (auxiliary hidden
+    states) or PPProxyTensors (non-last PP rank) otherwise. Returns a JSON spec
+    of the structure and its tensors in depth-first order."""
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+    tensors: list[torch.Tensor] = []
+
+    def walk(x: Any) -> Any:
+        if x is None:
+            return "N"
+        if isinstance(x, torch.Tensor):
+            tensors.append(x)
+            return "T"
+        if isinstance(x, PPProxyTensors):
+            names = list(x.tensors)
+            tensors.extend(x.tensors[n] for n in names)
+            return {"pp": names}
+        if isinstance(x, tuple):
+            return {"tuple": [walk(v) for v in x]}
+        if isinstance(x, list):
+            return {"list": [walk(v) for v in x]}
+        raise TypeError(f"Unsupported SGLang prefill CUDA graph output type: {type(x)!r}")
+
+    return walk(output), tensors
+
+
+def _unflatten_prefill_output(spec: Any, tensors: Any) -> Any:
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+    if tensors is None:
+        tensors = []
+    elif isinstance(tensors, torch.Tensor):
+        tensors = [tensors]
+    it = iter(tensors)
+
+    def build(s: Any) -> Any:
+        if s == "N":
+            return None
+        if s == "T":
+            return next(it)
+        if "pp" in s:
+            return PPProxyTensors({n: next(it) for n in s["pp"]})
+        if "tuple" in s:
+            return tuple(build(v) for v in s["tuple"])
+        return [build(v) for v in s["list"]]
+
+    out = build(spec)
+    if next(it, None) is not None:
+        raise RuntimeError("SGLang prefill CUDA graph restored more output tensors than recorded")
+    return out
 
 
 def _pack_output(output: Any) -> torch.Tensor:
@@ -109,14 +204,26 @@ def capture_graph(graph, pool, stream, run_once_fn):
     return None
 
 
-def save_graph(graph, output: Any, key: Any) -> None:
+def save_graph(graph, output: Any, key: Any, prefill_req_slots: int | None = None) -> None:
+    """Persist one captured graph. ``prefill_req_slots`` is set for the
+    prefill runner's graphs (its fixed request-slot count) and selects the
+    prefill filename and output packing; decode graphs are unchanged."""
     cfg = get_config()
     state = get_state()
     if cfg is None or state is None or cfg.workspace_dir is None:
         raise RuntimeError("Foundry SGLang graph extension is not initialized")
 
-    packed_output = _pack_output(output)
-    filename = _graph_filename(state.capture_index, key)
+    if prefill_req_slots is None:
+        packed_output = _pack_output(output)
+        filename = _graph_filename(state.capture_index, key)
+    else:
+        filename = _prefill_graph_filename(state.capture_index, key, prefill_req_slots)
+        spec, tensors = _flatten_prefill_output(output)
+        if spec == "T":
+            packed_output = tensors[0]
+        else:
+            packed_output = tensors or None
+            _prefill_output_specs[filename] = spec
     graph_path = os.path.join(cfg.workspace_dir, filename)
     with nvtx_range("foundry.save.graph_save"):
         graph.save(graph_path, packed_output)
@@ -130,7 +237,143 @@ def save_graph_manifest() -> None:
     cfg = get_config()
     if cfg is None or cfg.workspace_dir is None:
         return
-    foundry_pkg.save_graph_manifest(cfg.workspace_dir, enable_templates=cfg.graph_templates)
+    foundry_pkg.save_graph_manifest(
+        cfg.workspace_dir, enable_templates=cfg.graph_templates, partition=graph_partition
+    )
+
+
+def save_prefill_graph_state(*, req_slots: int, has_dp_gather: bool) -> None:
+    """SAVE: write the rank's prefill record (see _PREFILL_STATE_FILE)."""
+    cfg = get_config()
+    if cfg is None or cfg.workspace_dir is None:
+        return
+    record = {
+        "req_slots": req_slots,
+        "prefill_graph_has_dp_gather": has_dp_gather,
+        "output_specs": _prefill_output_specs,
+    }
+    with open(os.path.join(cfg.workspace_dir, _PREFILL_STATE_FILE), "w") as f:
+        json.dump(record, f, indent=2)
+
+
+def _scan_prefill_graph_files(workspace_dir: str) -> list[tuple[int, str, dict[str, Any]]]:
+    graph_files = []
+    for filename in os.listdir(workspace_dir):
+        match = _PREFILL_GRAPH_FILENAME_RE.match(filename)
+        if not match:
+            continue
+        meta = {k: int(match.group(k)) for k in ("index", "tokens", "slots", "chunks")}
+        graph_files.append((meta["index"], filename, meta))
+    graph_files.sort(key=lambda x: x[0])
+    return graph_files
+
+
+def has_prefill_graphs() -> bool:
+    cfg = get_config()
+    if cfg is None or cfg.workspace_dir is None:
+        return False
+    return bool(_scan_prefill_graph_files(cfg.workspace_dir))
+
+
+@dataclass
+class _PrefillRestore:
+    pending: Any
+    graph_files: list[tuple[int, str, dict[str, Any]]]
+    output_specs: dict[str, Any]
+    t0: float
+    next: int = 0
+
+
+_prefill_restore: _PrefillRestore | None = None
+
+
+@nvtx_traced("foundry.graph_restore.prefill_start")
+def start_prefill_graph_restore() -> dict[str, Any]:
+    """LOAD, at the prefill runner's capture: start building the prefill
+    graphs and return the rank's SAVE record. The graphs are then finished one
+    at a time by restore_next_prefill_graph, from inside the upstream capture
+    loop, so their allocator events replay at the points SAVE captured them."""
+    global _prefill_restore
+    cfg = get_config()
+    if cfg is None or cfg.workspace_dir is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
+        raise RuntimeError("Foundry SGLang graph extension is not initialized for LOAD")
+    graph_files = _scan_prefill_graph_files(cfg.workspace_dir)
+    record_path = os.path.join(cfg.workspace_dir, _PREFILL_STATE_FILE)
+    if not graph_files or not os.path.exists(record_path):
+        raise RuntimeError(
+            f"Foundry archive {cfg.workspace_dir} has no prefill graphs: it was saved with "
+            "prefill graphs disabled. Re-save with the same --cuda-graph-backend-prefill as LOAD."
+        )
+    with open(record_path) as f:
+        record = json.load(f)
+
+    # Graphs may reference NVSHMEM symbols; the DeepEP bootstrap ran before.
+    cge.init_nvshmem_for_loaded_modules()
+    paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
+    t0 = time.perf_counter()
+    pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
+    _prefill_restore = _PrefillRestore(
+        pending=pending,
+        graph_files=graph_files,
+        output_specs=record.get("output_specs", {}),
+        t0=t0,
+    )
+    logger.info(
+        "[Foundry] Started SGLang prefill graph builds for %d graphs in %.3fs",
+        len(paths),
+        time.perf_counter() - t0,
+    )
+    return record
+
+
+def restore_next_prefill_graph(key: Any, req_slots: int) -> tuple[Any, Any]:
+    """LOAD: stands in for capturing prefill graph ``key``. The archive holds
+    the graphs in capture order; the upstream loop asks for them in the same
+    order, which is checked here."""
+    r = _prefill_restore
+    state = get_state()
+    if r is None or state is None:
+        raise RuntimeError("Foundry prefill graph restore was not started")
+    tokens, chunks = _prefill_shape(key)
+    if r.next >= len(r.graph_files):
+        raise RuntimeError(
+            f"Foundry archive holds {len(r.graph_files)} prefill graphs, but the capture loop "
+            f"asks for more (t={tokens} pc={chunks}): the prefill capture shapes differ from SAVE"
+        )
+    _index, filename, meta = r.graph_files[r.next]
+    if (meta["tokens"], meta["chunks"], meta["slots"]) != (tokens, chunks, req_slots):
+        raise RuntimeError(
+            f"Foundry prefill graph order mismatch: the capture loop asks for t={tokens} "
+            f"pc={chunks} r={req_slots}, the next archived graph is {filename}. The prefill "
+            "capture shapes (--cuda-graph-bs-prefill, full_prefill_max_req, chunked-prefix "
+            "settings) differ between SAVE and LOAD."
+        )
+    graph, tensors = FoundryCUDAGraph.finish_one_graph_load(r.pending, r.next)
+    r.next += 1
+    output = _unflatten_prefill_output(r.output_specs.get(filename, "T"), tensors)
+    # Strong reference, like the decode graphs.
+    state.loaded_graphs[("prefill", tokens, chunks)] = (graph, output)
+    return graph, output
+
+
+def finish_prefill_graph_restore() -> None:
+    global _prefill_restore
+    r = _prefill_restore
+    _prefill_restore = None
+    state = get_state()
+    if r is None or state is None:
+        raise RuntimeError("Foundry prefill graph restore was not started")
+    if r.next != len(r.graph_files):
+        raise RuntimeError(
+            f"Foundry archive holds {len(r.graph_files)} prefill graphs, the capture loop "
+            f"restored {r.next}: the prefill capture shapes differ from SAVE"
+        )
+    state.prefill_graphs_restored = True
+    logger.info(
+        "[Foundry] Loaded %d SGLang prefill graphs in %.3fs",
+        r.next,
+        time.perf_counter() - r.t0,
+    )
 
 
 @nvtx_traced("foundry.save.pack_fatbins")

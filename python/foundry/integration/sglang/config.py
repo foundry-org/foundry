@@ -23,6 +23,12 @@ class CUDAGraphExtensionConfig:
     mode: CUDAGraphExtensionMode = CUDAGraphExtensionMode.NONE
     hook_library_path: str | None = None
     nvshmem_host_path: str | None = None
+    # Bare hosts whose verbs devices exist but cannot be opened make rdma-core
+    # wait 5 s per HCA for udev in DeepEP's first NVSHMEM init (~40 s per
+    # engine). Path to the preload shim that removes the wait
+    # (tools/host/no_cdev_wait.c, docs/bare-host-verbs-udev-wait.md); None
+    # leaves LD_PRELOAD as the launcher exported it.
+    verbs_udev_wait_shim_path: str | None = None
     base_addr: int = 0x600000000000
     region_size: str = "64GB"
     workspace_root: str = "foundry_archive"
@@ -49,10 +55,19 @@ class CUDAGraphExtensionConfig:
         if nvshmem_host_path is None:
             nvshmem_host_path = cls._detect_nvshmem_host_path()
 
+        verbs_udev_wait_shim_path = data.get("verbs_udev_wait_shim_path")
+        if verbs_udev_wait_shim_path is not None and not Path(verbs_udev_wait_shim_path).is_file():
+            raise FileNotFoundError(
+                f"verbs_udev_wait_shim_path={verbs_udev_wait_shim_path!r} in {path} "
+                "does not exist; "
+                "build it with `make -C tools/host` (docs/bare-host-verbs-udev-wait.md)"
+            )
+
         return cls(
             mode=CUDAGraphExtensionMode(data.get("mode", cls.mode.value)),
             hook_library_path=hook_library_path,
             nvshmem_host_path=nvshmem_host_path,
+            verbs_udev_wait_shim_path=verbs_udev_wait_shim_path,
             base_addr=base_addr,
             region_size=data.get("region_size", cls.region_size),
             workspace_root=data.get("workspace_root", cls.workspace_root),
@@ -134,6 +149,12 @@ def get_nvshmem_host_path() -> str | None:
     if _config is None:
         return None
     return _config.nvshmem_host_path
+
+
+def get_verbs_udev_wait_shim_path() -> str | None:
+    if _config is None:
+        return None
+    return _config.verbs_udev_wait_shim_path
 
 
 def compute_workspace_rank(server_args, tp_rank: int, pp_rank: int, dp_rank: int | None) -> int:

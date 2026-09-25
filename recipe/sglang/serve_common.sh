@@ -71,7 +71,11 @@ serve_main() {
   local foundry_args=()
   case "$mode" in
     --save) foundry_args=( --foundry-graph-extension-config-path "${SCRIPT_DIR}/foundry_save.toml" ); echo "Using foundry SAVE" ;;
-    --load) foundry_args=( --foundry-graph-extension-config-path "${SCRIPT_DIR}/foundry_load.toml" ); echo "Using foundry LOAD" ;;
+    --load) foundry_args=( --foundry-graph-extension-config-path "${SCRIPT_DIR}/foundry_load.toml" ); echo "Using foundry LOAD"
+            # Map the packed kernel image instead of reading it: the eager read of the 4.7-5.5 GB image was 1.6-1.8 s
+            # of every rank's LOAD (Qwen3.5-122B-FP8 EP8: 1.67 s -> 0.10 s with mmap, identical output). Measured with
+            # the archive in the page cache; set FOUNDRY_MMAP_ARCHIVE=0 to read eagerly.
+            export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
     --warm)
       # Cache warm-up, once per machine and model: plain SGLang with the SAME decode-graph set (identical to
       # running without a mode). SAVE compiles inside the capture window on purpose (no eager forward); a
