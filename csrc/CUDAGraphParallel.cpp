@@ -24,7 +24,9 @@
 #include <sstream>
 #include <vector>
 #include <thread>
+#include <algorithm>
 #include <queue>
+#include <stdexcept>
 #include <mutex>
 #include <condition_variable>
 #include <functional>
@@ -87,6 +89,80 @@ class SimpleThreadPool {
   std::mutex mutex_;
   std::condition_variable cv_;
   bool stop_;
+};
+
+// One thread that runs jobs in submission order with a CUDA context bound (LOAD
+// Phase 2's instantiate thread). The first exception is kept, later jobs are
+// dropped, and on_error runs so that a producer waiting on a job's side effect
+// can stop waiting. busy_ms / idle_ms: time running jobs / waiting for one.
+class SerialWorker {
+ public:
+  SerialWorker(CUcontext ctx, std::function<void()> on_error)
+      : on_error_(std::move(on_error)), thread_([this, ctx] { run(ctx); }) {}
+  ~SerialWorker() { finish(); }
+  void push(std::function<void()> job) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      jobs_.push(std::move(job));
+    }
+    cv_.notify_one();
+  }
+  // Runs the queued jobs to the end and joins (rethrow() then reports a job failure).
+  void finish() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      closed_ = true;
+    }
+    cv_.notify_one();
+    if (thread_.joinable())
+      thread_.join();
+  }
+  void rethrow() {
+    if (error_)
+      std::rethrow_exception(error_);
+  }
+  double busy_ms = 0, idle_ms = 0;
+
+ private:
+  void run(CUcontext ctx) {
+    using clk = std::chrono::steady_clock;
+    bool failed = cuCtxSetCurrent(ctx) != CUDA_SUCCESS;
+    if (failed) {
+      error_ = std::make_exception_ptr(std::runtime_error("SerialWorker: cuCtxSetCurrent failed"));
+      on_error_();
+    }
+    while (true) {
+      std::function<void()> job;
+      {
+        auto t_wait = clk::now();
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return closed_ || !jobs_.empty(); });
+        idle_ms += std::chrono::duration<double, std::milli>(clk::now() - t_wait).count();
+        if (jobs_.empty())
+          return;
+        job = std::move(jobs_.front());
+        jobs_.pop();
+      }
+      if (failed)
+        continue;
+      auto t_job = clk::now();
+      try {
+        job();
+      } catch (...) {
+        error_ = std::current_exception();
+        failed = true;
+        on_error_();
+      }
+      busy_ms += std::chrono::duration<double, std::milli>(clk::now() - t_job).count();
+    }
+  }
+  std::function<void()> on_error_;
+  std::queue<std::function<void()>> jobs_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool closed_ = false;
+  std::exception_ptr error_;
+  std::thread thread_;  // last: starts after the members above are constructed
 };
 
 // File I/O + JSON parse - no shared state, safe to run on worker threads.
@@ -1507,6 +1583,274 @@ void CUDAGraph::prepare_on_demand_graph_binary(const BinaryGraphFile& bin_file,
   graph->on_demand_data_ = std::move(data);
 }
 
+// ============================================================================
+// build_template_graph_binary: the template's CUgraph from the .cugraph data.
+//
+// Params, function handles, function attributes and events come from the
+// template's prepared on-demand data (prepare_on_demand_graph_binary, run on a
+// pool worker). Node attributes are read from the node table and applied with
+// the same precedence as build_graph_from_parsed: per-node attributes (with
+// the function's required cluster overriding the node's cluster dims) right
+// after each node add, then the common attributes on every kernel node.
+// Requires FLAG_COMPLETE_KERNEL_ATTRS (every attribute the JSON records is in
+// the binary). Does not instantiate.
+// ============================================================================
+
+namespace {
+// Kernel-node attributes of a .cugraph node (kna flags + extension flags) on a graph node, with
+// build_graph_from_parsed's semantics. per_node: the node's own attributes, where the function's
+// required cluster dims override the node's cluster dims and the extension attributes apply;
+// otherwise the graph's common attributes (flags/values in `k`).
+void apply_binary_kernel_attrs(CUgraphNode n, uint32_t flags, const binary_format::BinKernelNode& k,
+                               bool per_node) {
+  namespace bf = binary_format;
+  auto set_attr = [](CUgraphNode n, CUkernelNodeAttrID id, const CUkernelNodeAttrValue& v) {
+    C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(n, id, &v));
+  };
+  CUkernelNodeAttrValue v;
+  unsigned cx = 0, cy = 0, cz = 0;
+  if (flags & bf::KNA_CLUSTER_DIM) {
+    cx = k.kna_clusterDimX;
+    cy = k.kna_clusterDimY;
+    cz = k.kna_clusterDimZ;
+  }
+  if (per_node) {
+    if (k.required_cluster_width > 0)
+      cx = k.required_cluster_width;
+    if (k.required_cluster_height > 0)
+      cy = k.required_cluster_height;
+    if (k.required_cluster_depth > 0)
+      cz = k.required_cluster_depth;
+  }
+  if ((flags & bf::KNA_CLUSTER_DIM) || cx > 0 || cy > 0 || cz > 0) {
+    memset(&v, 0, sizeof(v));
+    v.clusterDim.x = cx > 0 ? cx : 1;
+    v.clusterDim.y = cy > 0 ? cy : 1;
+    v.clusterDim.z = cz > 0 ? cz : 1;
+    if (per_node ? (cx > 0 || cy > 0 || cz > 0) : true)
+      set_attr(n, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, v);
+  }
+  if (flags & bf::KNA_PREFERRED_CLUSTER_DIM) {
+    memset(&v, 0, sizeof(v));
+    v.preferredClusterDim.x = k.kna_preferredClusterDimX;
+    v.preferredClusterDim.y = k.kna_preferredClusterDimY;
+    v.preferredClusterDim.z = k.kna_preferredClusterDimZ;
+    set_attr(n, CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION, v);
+  }
+  if (flags & bf::KNA_CLUSTER_SCHEDULING) {
+    memset(&v, 0, sizeof(v));
+    v.clusterSchedulingPolicyPreference =
+        static_cast<CUclusterSchedulingPolicy>(k.kna_clusterSchedulingPolicy);
+    set_attr(n, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, v);
+  }
+  if (flags & bf::KNA_COOPERATIVE) {
+    memset(&v, 0, sizeof(v));
+    v.cooperative = k.kna_cooperative;
+    set_attr(n, CU_KERNEL_NODE_ATTRIBUTE_COOPERATIVE, v);
+  }
+  if (flags & bf::KNA_PRIORITY) {
+    memset(&v, 0, sizeof(v));
+    v.priority = k.kna_priority;
+    set_attr(n, CU_KERNEL_NODE_ATTRIBUTE_PRIORITY, v);
+  }
+  if (flags & bf::KNA_MEM_SYNC_DOMAIN) {
+    memset(&v, 0, sizeof(v));
+    v.memSyncDomain = static_cast<CUlaunchMemSyncDomain>(k.kna_memSyncDomain);
+    set_attr(n, CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN, v);
+  }
+  if (flags & bf::KNA_MEM_SYNC_DOMAIN_MAP) {
+    memset(&v, 0, sizeof(v));
+    v.memSyncDomainMap.default_ = k.kna_memSyncDomainMapDefault;
+    v.memSyncDomainMap.remote = k.kna_memSyncDomainMapRemote;
+    set_attr(n, CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN_MAP, v);
+  }
+  if (flags & bf::KNA_SHARED_MEM_CARVEOUT) {
+    memset(&v, 0, sizeof(v));
+    v.sharedMemCarveout = k.kna_preferredSharedMemCarveout;
+    set_attr(n, CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, v);
+  }
+  if (per_node && (k.ext_flags & bf::KNX_DEVICE_UPDATABLE)) {
+    memset(&v, 0, sizeof(v));
+    v.deviceUpdatableKernelNode.deviceUpdatable = k.ext_device_updatable;
+    set_attr(n, CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE, v);
+  }
+  if (per_node && (k.ext_flags & bf::KNX_PROGRAMMATIC_STREAM_SERIALIZATION)) {
+    memset(&v, 0, sizeof(v));
+    v.programmaticStreamSerializationAllowed = k.ext_programmatic_stream_serialization;
+    set_attr(n,
+             static_cast<CUkernelNodeAttrID>(CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION),
+             v);
+  }
+}
+
+// The graph's common attributes in a node record, for apply_binary_kernel_attrs(per_node=false).
+binary_format::BinKernelNode common_attrs_as_node(const binary_format::BinCommonKernelAttrs& ca) {
+  binary_format::BinKernelNode k{};
+  k.kna_clusterDimX = ca.clusterDimX;
+  k.kna_clusterDimY = ca.clusterDimY;
+  k.kna_clusterDimZ = ca.clusterDimZ;
+  k.kna_preferredClusterDimX = ca.preferredClusterDimX;
+  k.kna_preferredClusterDimY = ca.preferredClusterDimY;
+  k.kna_preferredClusterDimZ = ca.preferredClusterDimZ;
+  k.kna_clusterSchedulingPolicy = ca.clusterSchedulingPolicy;
+  k.kna_cooperative = ca.cooperative;
+  k.kna_priority = ca.priority;
+  k.kna_memSyncDomain = ca.memSyncDomain;
+  k.kna_memSyncDomainMapDefault = ca.memSyncDomainMapDefault;
+  k.kna_memSyncDomainMapRemote = ca.memSyncDomainMapRemote;
+  k.kna_preferredSharedMemCarveout = ca.preferredSharedMemCarveout;
+  return k;
+}
+}  // namespace
+
+void CUDAGraph::build_template_graph_binary(const BinaryGraphFile& bin_file, CUDAGraph& graph,
+                                            CUcontext ctx, GraphTemplate* out_template,
+                                            BuildTiming* timing) {
+  namespace bf = binary_format;
+  TORCH_CHECK(graph.on_demand_data_ != nullptr,
+              "build_template_graph_binary: the template's on-demand data is not prepared");
+  TORCH_CHECK(bin_file.header.flags & bf::FLAG_COMPLETE_KERNEL_ATTRS,
+              "build_template_graph_binary: binary does not hold every kernel attribute");
+  BuildTiming& bt = *timing;
+  const bf::BinNodeEntry* nodes = bin_file.node_table();
+  const uint32_t num_nodes = bin_file.header.num_nodes;
+  auto& updates = graph.on_demand_data_->updates;
+  TORCH_CHECK(updates.size() == num_nodes, "build_template_graph_binary: ", updates.size(),
+              " prepared nodes vs ", num_nodes, " in the binary");
+
+  CUgraph cuGraph;
+  C10_CUDA_DRIVER_CHECK(cuGraphCreate(&cuGraph, 0));
+  out_template->cuGraph = cuGraph;
+  out_template->ordered_nodes.reserve(num_nodes);
+
+  std::vector<CUgraphNode> kernel_nodes;
+  std::unordered_map<uint32_t, CUgraphNode> id_to_node;
+  id_to_node.reserve(num_nodes);
+  for (uint32_t idx = 0; idx < num_nodes; ++idx) {
+    const bf::BinNodeEntry& entry = nodes[idx];
+    auto& u = updates[idx];
+    CUgraphNode cuNode = nullptr;
+    auto t_add = bt_clock::now();
+    switch (entry.type) {
+      case bf::NODE_KERNEL: {
+        ensure_dynamic_smem_optin(u.kernel_params, graph.capture_dev_, "LOAD");
+        CUresult r = cuGraphAddKernelNode(&cuNode, cuGraph, nullptr, 0, &u.kernel_params);
+        if (r != CUDA_SUCCESS) {
+          fprintf(stderr,
+                  "[foundry LOAD ERROR] cuGraphAddKernelNode FAILED for node %u with error %d\n",
+                  entry.node_id, r);
+          fprintf(
+              stderr, "[foundry LOAD ERROR]   function: %s\n",
+              bin_file
+                  .get_string(entry.kernel.function_name_offset, entry.kernel.function_name_length)
+                  .c_str());
+          fprintf(stderr, "[foundry LOAD ERROR]   grid=(%u,%u,%u) block=(%u,%u,%u) sharedMem=%u\n",
+                  u.kernel_params.gridDimX, u.kernel_params.gridDimY, u.kernel_params.gridDimZ,
+                  u.kernel_params.blockDimX, u.kernel_params.blockDimY, u.kernel_params.blockDimZ,
+                  u.kernel_params.sharedMemBytes);
+          C10_CUDA_DRIVER_CHECK(r);
+        }
+        bt.add_ms += bt_ms(t_add);
+        auto t_attr = bt_clock::now();
+        apply_binary_kernel_attrs(cuNode, entry.kernel.kna_flags, entry.kernel, /*per_node=*/true);
+        kernel_nodes.push_back(cuNode);
+        bt.node_attr_ms += bt_ms(t_attr);
+        break;
+      }
+      case bf::NODE_MEMCPY: {
+        CUresult r = cuGraphAddMemcpyNode(&cuNode, cuGraph, nullptr, 0, &u.memcpy_params, ctx);
+        if (r != CUDA_SUCCESS) {
+          fprintf(stderr,
+                  "[foundry LOAD ERROR] cuGraphAddMemcpyNode FAILED for node %u with error %d\n",
+                  entry.node_id, r);
+          C10_CUDA_DRIVER_CHECK(r);
+        }
+        bt.add_ms += bt_ms(t_add);
+        break;
+      }
+      case bf::NODE_MEMSET: {
+        CUresult r = cuGraphAddMemsetNode(&cuNode, cuGraph, nullptr, 0, &u.memset_params, ctx);
+        if (r != CUDA_SUCCESS) {
+          fprintf(stderr,
+                  "[foundry LOAD ERROR] cuGraphAddMemsetNode FAILED for node %u with error %d\n",
+                  entry.node_id, r);
+          C10_CUDA_DRIVER_CHECK(r);
+        }
+        bt.add_ms += bt_ms(t_add);
+        break;
+      }
+      case bf::NODE_EVENT_RECORD:
+        C10_CUDA_DRIVER_CHECK(cuGraphAddEventRecordNode(&cuNode, cuGraph, nullptr, 0, u.event));
+        bt.add_ms += bt_ms(t_add);
+        break;
+      case bf::NODE_EVENT_WAIT:
+        C10_CUDA_DRIVER_CHECK(cuGraphAddEventWaitNode(&cuNode, cuGraph, nullptr, 0, u.event));
+        bt.add_ms += bt_ms(t_add);
+        break;
+      case bf::NODE_EMPTY:
+        C10_CUDA_DRIVER_CHECK(cuGraphAddEmptyNode(&cuNode, cuGraph, nullptr, 0));
+        bt.add_ms += bt_ms(t_add);
+        break;
+    }
+    TORCH_CHECK(cuNode != nullptr, "build_template_graph_binary: unknown node type ",
+                (int)entry.type, " at node ", idx);
+    id_to_node[entry.node_id] = cuNode;
+    out_template->ordered_nodes.push_back(cuNode);
+  }
+
+  // Common attributes last, on every kernel node (build_graph_from_parsed's order).
+  auto t_cattr = bt_clock::now();
+  if ((bin_file.header.flags & bf::FLAG_HAS_COMMON_KERNEL_ATTRS) && !kernel_nodes.empty()) {
+    const bf::BinCommonKernelAttrs* ca =
+        bin_file.section_ptr<bf::BinCommonKernelAttrs>(bf::SECTION_COMMON_KERNEL_ATTRS);
+    const bf::BinKernelNode k = common_attrs_as_node(*ca);
+    for (auto n : kernel_nodes)
+      apply_binary_kernel_attrs(n, ca->flags, k, /*per_node=*/false);
+  }
+  bt.node_attr_ms += bt_ms(t_cattr);
+
+  // Dependencies (v1 records carry default edges only).
+  auto t_deps = bt_clock::now();
+  const uint32_t num_deps = bin_file.header.num_dependencies;
+  if ((bin_file.header.flags & bf::FLAG_HAS_DEPENDENCIES) && num_deps > 0) {
+    std::vector<CUgraphNode> from_nodes(num_deps), to_nodes(num_deps);
+    std::vector<CUgraphEdgeData> edge_data(num_deps);
+    memset(edge_data.data(), 0, edge_data.size() * sizeof(CUgraphEdgeData));
+    auto lookup = [&](uint32_t id) {
+      auto it = id_to_node.find(id);
+      TORCH_CHECK(it != id_to_node.end(),
+                  "build_template_graph_binary: dependency on unknown node ", id);
+      return it->second;
+    };
+    if (bin_file.header.version >= 2) {
+      const bf::BinDependency* deps =
+          bin_file.section_ptr<bf::BinDependency>(bf::SECTION_DEPENDENCY_TABLE);
+      for (uint32_t i = 0; i < num_deps; ++i) {
+        from_nodes[i] = lookup(deps[i].from_id);
+        to_nodes[i] = lookup(deps[i].to_id);
+        edge_data[i].from_port = deps[i].from_port;
+        edge_data[i].to_port = deps[i].to_port;
+        edge_data[i].type = deps[i].edge_type;
+      }
+    } else {
+      const bf::BinDependencyV1* deps =
+          bin_file.section_ptr<bf::BinDependencyV1>(bf::SECTION_DEPENDENCY_TABLE);
+      for (uint32_t i = 0; i < num_deps; ++i) {
+        from_nodes[i] = lookup(deps[i].from_id);
+        to_nodes[i] = lookup(deps[i].to_id);
+      }
+    }
+    CUresult dep_result = add_graph_dependencies(cuGraph, from_nodes.data(), to_nodes.data(),
+                                                 edge_data.data(), num_deps);
+    if (dep_result != CUDA_SUCCESS) {
+      fprintf(stderr, "[foundry LOAD ERROR] cuGraphAddDependencies FAILED with error %d\n",
+              dep_result);
+      C10_CUDA_DRIVER_CHECK(dep_result);
+    }
+  }
+  bt.deps_ms += bt_ms(t_deps);
+}
+
 void CUDAGraph::link_on_demand_shared_exec(CUDAGraph& graph,
                                            std::shared_ptr<SharedGraphExec> shared_exec) {
   TORCH_CHECK(graph.on_demand_data_ != nullptr,
@@ -1549,6 +1893,242 @@ static GraphLoadResult make_load_result_from_extracted(
   }
 
   return result;
+}
+
+// ============================================================================
+// Exec-pool prewarm (contract in CUDAGraph.h, start_exec_pool_prewarm).
+// ============================================================================
+
+namespace {
+std::mutex g_prewarm_mutex;
+std::shared_future<void> g_prewarm_done;
+// Set by Phase 2 when it starts before the prewarm finished: the prewarm stops after its
+// current graph (Phase 2 never waits for it).
+std::atomic<bool> g_prewarm_abandon{false};
+
+double epoch_s() {
+  return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+// Resident set of this process in MB (/proc/self/statm), 0 if unavailable.
+double rss_mb() {
+  std::ifstream f("/proc/self/statm");
+  size_t pages_total = 0, pages_rss = 0;
+  if (!(f >> pages_total >> pages_rss))
+    return 0.0;
+  return pages_rss * 4096.0 / (1024.0 * 1024.0);
+}
+
+std::string cugraph_path_for(const std::string& json_path) {
+  if (json_path.size() >= 5 && json_path.substr(json_path.size() - 5) == ".json")
+    return json_path.substr(0, json_path.size() - 5) + ".cugraph";
+  return json_path;
+}
+
+// Kernel-only copy of one archive graph (non-kernel nodes -> empty nodes, same edges),
+// built from its .cugraph. Returns nullptr (after a warning) if a node cannot be added.
+// Node attributes are not copied: with them the Phase 2 instantiates were no faster and the
+// prewarm build took ~0.5 s longer (Qwen3-30B ep4, 128 graphs).
+CUgraph build_prewarm_graph(const BinaryGraphFile& b, CUcontext ctx, CUdevice dev,
+                            size_t* num_nodes) {
+  namespace bf = binary_format;
+  const bf::BinNodeEntry* nodes = b.node_table();
+  const bf::BinParamEntry* param_idx = b.param_index();
+  const uint8_t* pd = b.param_data();
+  const uint8_t* abd = b.arg_buffer_data();
+  CUgraph g;
+  C10_CUDA_DRIVER_CHECK(cuGraphCreate(&g, 0));
+  std::unordered_map<uint32_t, CUgraphNode> id_to_node;
+  std::vector<void*> ptrs;
+  for (uint32_t idx = 0; idx < b.header.num_nodes; ++idx) {
+    const bf::BinNodeEntry& e = nodes[idx];
+    CUgraphNode n = nullptr;
+    CUresult r = CUDA_SUCCESS;
+    if (e.type == bf::NODE_KERNEL) {
+      const auto& k = e.kernel;
+      CUDA_KERNEL_NODE_PARAMS p;
+      memset(&p, 0, sizeof(p));
+      p.gridDimX = k.gridDimX;
+      p.gridDimY = k.gridDimY;
+      p.gridDimZ = k.gridDimZ;
+      p.blockDimX = k.blockDimX;
+      p.blockDimY = k.blockDimY;
+      p.blockDimZ = k.blockDimZ;
+      p.sharedMemBytes = k.sharedMemBytes;
+      p.ctx = ctx;
+      auto h = query_function_handle(k.binary_hash,
+                                     b.get_string(k.function_name_offset, k.function_name_length));
+      if (std::holds_alternative<CUkernel>(h))
+        p.kern = std::get<CUkernel>(h);
+      else
+        p.func = std::get<CUfunction>(h);
+      size_t arg_size = k.arg_buffer_size;
+      void* extra[5];
+      if (k.arg_buffer_offset != 0xFFFFFFFF) {
+        extra[0] = CU_LAUNCH_PARAM_BUFFER_POINTER;
+        extra[1] = const_cast<uint8_t*>(abd + k.arg_buffer_offset);
+        extra[2] = CU_LAUNCH_PARAM_BUFFER_SIZE;
+        extra[3] = &arg_size;
+        extra[4] = CU_LAUNCH_PARAM_END;
+        p.extra = extra;
+      } else {
+        const bf::BinParamEntry* pe = reinterpret_cast<const bf::BinParamEntry*>(
+            reinterpret_cast<const uint8_t*>(param_idx) + k.param_index_offset);
+        ptrs.resize(k.num_params);
+        for (uint32_t j = 0; j < k.num_params; ++j)
+          ptrs[j] = const_cast<uint8_t*>(pd + pe[j].data_offset);
+        p.kernelParams = ptrs.data();
+      }
+      ensure_dynamic_smem_optin(p, dev, "PREWARM");
+      r = cuGraphAddKernelNode(&n, g, nullptr, 0, &p);
+    } else {
+      r = cuGraphAddEmptyNode(&n, g, nullptr, 0);
+    }
+    if (r != CUDA_SUCCESS) {
+      fprintf(stderr, "[foundry] exec pool prewarm: node %u not added (%d); graph skipped\n",
+              e.node_id, (int)r);
+      cuGraphDestroy(g);
+      return nullptr;
+    }
+    id_to_node[e.node_id] = n;
+  }
+  const uint32_t nd = b.header.num_dependencies;
+  if ((b.header.flags & bf::FLAG_HAS_DEPENDENCIES) && nd > 0) {
+    std::vector<CUgraphNode> from(nd), to(nd);
+    std::vector<CUgraphEdgeData> ed(nd);
+    memset(ed.data(), 0, ed.size() * sizeof(CUgraphEdgeData));
+    for (uint32_t i = 0; i < nd; ++i) {
+      uint32_t f, t;
+      if (b.header.version >= 2) {
+        const auto* d = b.section_ptr<bf::BinDependency>(bf::SECTION_DEPENDENCY_TABLE) + i;
+        f = d->from_id;
+        t = d->to_id;
+        ed[i].from_port = d->from_port;
+        ed[i].to_port = d->to_port;
+        ed[i].type = d->edge_type;
+      } else {
+        const auto* d = b.section_ptr<bf::BinDependencyV1>(bf::SECTION_DEPENDENCY_TABLE) + i;
+        f = d->from_id;
+        t = d->to_id;
+      }
+      from[i] = id_to_node.at(f);
+      to[i] = id_to_node.at(t);
+    }
+    CUresult r = add_graph_dependencies(g, from.data(), to.data(), ed.data(), nd);
+    if (r != CUDA_SUCCESS) {
+      fprintf(stderr, "[foundry] exec pool prewarm: dependencies not added (%d); graph skipped\n",
+              (int)r);
+      cuGraphDestroy(g);
+      return nullptr;
+    }
+  }
+  *num_nodes = b.header.num_nodes;
+  return g;
+}
+
+void run_exec_pool_prewarm(const std::vector<std::string>& json_paths, CUcontext ctx,
+                           CUdevice dev) {
+  using clk = std::chrono::steady_clock;
+  auto ms_since = [](clk::time_point a) {
+    return std::chrono::duration<double, std::milli>(clk::now() - a).count();
+  };
+  C10_CUDA_DRIVER_CHECK(cuCtxSetCurrent(ctx));
+  auto t0 = clk::now();
+  const double start_epoch = epoch_s();
+  size_t free0 = 0, free_peak = 0, free_end = 0, total = 0;
+  C10_CUDA_DRIVER_CHECK(cuMemGetInfo(&free0, &total));
+  const double rss0 = rss_mb();
+  std::vector<cudaGraphExec_t> execs;
+  size_t nodes = 0;
+  double read_ms = 0, build_ms = 0, inst_ms = 0;
+  bool abandoned = false;
+  for (const auto& path : json_paths) {
+    if (g_prewarm_abandon.load()) {
+      abandoned = true;
+      break;
+    }
+    auto t_r = clk::now();
+    BinaryGraphFile b = read_binary_graph_file(cugraph_path_for(path));
+    read_ms += ms_since(t_r);
+    if (!b.valid())
+      continue;
+    auto t_b = clk::now();
+    size_t n = 0;
+    CUgraph g = build_prewarm_graph(b, ctx, dev, &n);
+    build_ms += ms_since(t_b);
+    if (!g)
+      continue;
+    auto t_i = clk::now();
+    execs.push_back(CUDAGraph::instantiate_graph_exec(reinterpret_cast<cudaGraph_t>(g)));
+    inst_ms += ms_since(t_i);
+    C10_CUDA_DRIVER_CHECK(cuGraphDestroy(g));
+    nodes += n;
+  }
+  C10_CUDA_DRIVER_CHECK(cuMemGetInfo(&free_peak, &total));
+  const double rss_peak = rss_mb();
+  for (auto e : execs)
+    C10_CUDA_CHECK(cudaGraphExecDestroy(e));
+  C10_CUDA_DRIVER_CHECK(cuMemGetInfo(&free_end, &total));
+  const double rss_end = rss_mb();
+  // Device-memory and RSS deltas include whatever the engine allocated concurrently.
+  fprintf(stderr,
+          "[foundry] exec pool prewarm: %zu graphs, %zu nodes, %.1f ms (read %.1f, build %.1f, "
+          "instantiate %.1f)%s; start %.3f end %.3f (epoch s); device free %.0f -> %.0f at peak "
+          "-> %.0f MB after destroy; RSS %.0f -> %.0f -> %.0f MB\n",
+          execs.size(), nodes, ms_since(t0), read_ms, build_ms, inst_ms,
+          abandoned ? ", abandoned: Phase 2 started first" : "", start_epoch, epoch_s(),
+          free0 / 1048576.0, free_peak / 1048576.0, free_end / 1048576.0, rss0, rss_peak, rss_end);
+}
+
+// Phase 2 (instantiate thread, before its first instantiate): never waits for the prewarm.
+// Finished: collect it (a failure only costs speed). Still running: tell it to stop after its
+// current graph and go on without it. Returns whether it had finished.
+bool join_exec_pool_prewarm() {
+  std::shared_future<void> f;
+  {
+    std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+    f = g_prewarm_done;
+  }
+  if (!f.valid())
+    return false;
+  if (f.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+    g_prewarm_abandon = true;
+    fprintf(stderr,
+            "[foundry] exec pool prewarm still running at Phase 2 start (%.3f epoch s): "
+            "abandoned, not waited for\n",
+            epoch_s());
+    return false;
+  }
+  try {
+    f.get();
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[foundry] exec pool prewarm failed (%s); instantiating without it\n",
+            e.what());
+    return false;
+  }
+  return true;
+}
+}  // namespace
+
+void CUDAGraph::start_exec_pool_prewarm(const std::vector<std::string>& json_paths) {
+  CUcontext ctx = nullptr;
+  C10_CUDA_DRIVER_CHECK(cuCtxGetCurrent(&ctx));
+  TORCH_CHECK(ctx != nullptr, "start_exec_pool_prewarm: no CUDA context on this thread");
+  CUdevice dev;
+  C10_CUDA_DRIVER_CHECK(cuCtxGetDevice(&dev));
+  auto promise = std::make_shared<std::promise<void>>();
+  {
+    std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+    g_prewarm_abandon = false;
+    g_prewarm_done = promise->get_future().share();
+  }
+  std::thread([json_paths, ctx, dev, promise]() {
+    try {
+      run_exec_pool_prewarm(json_paths, ctx, dev);
+      promise->set_value();
+    } catch (...) {
+      promise->set_exception(std::current_exception());
+    }
+  }).detach();
 }
 
 // ============================================================================
@@ -1886,19 +2466,9 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
           num_binary, num_json);
 
   // ---- Phase 2: background graph build with on-demand optimization ----
-  // Runs on a detached thread to overlap with subsequent initialization
-  // (KV cache init, metadata builder setup, etc.).
-  //
-  // On-demand metadata parsing runs in PARALLEL with template builds:
-  //   - Template builds (sequential, CUDA driver calls)
-  //   - On-demand prep (parallel, CPU-only: JSON parse + hex decode + func lookup)
-  // After both complete, a quick linking step associates each on-demand graph
-  // with its template's SharedGraphExec.
-  //
-  // This works because template identification is done at save time
-  // (graph_manifest.json), so on-demand graphs don't need to wait for
-  // template builds to know their params.
-  //
+  // Runs on a detached thread (the pipeline is described at its start below).
+  // Template identification is done at save time (graph_manifest.json), so the
+  // members' on-demand data is decoded in parallel with the template builds.
   // finish_graph_loads_impl waits on build_complete_ before allocator replay.
   std::vector<std::string> graph_names;
   graph_names.reserve(num_graphs);
@@ -1910,7 +2480,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
   auto build_promise = std::make_shared<std::promise<void>>();
   pending->build_complete_ = build_promise->get_future().share();
 
-  // Copy json_paths for template re-reads in Phase 2a
+  // Copy json_paths for the JSON template builds in Phase 2
   std::vector<std::string> json_path_list(json_paths.begin(), json_paths.end());
 
   std::thread bg_thread([all_parsed = std::move(all_parsed), bin_files = std::move(bin_files),
@@ -1924,152 +2494,210 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
     try {
       C10_CUDA_DRIVER_CHECK(cuCtxSetCurrent(main_ctx));
 
-      // Shared execs: indexed by template graph index.
-      // Protected by mutex since template build thread writes, then
-      // the main bg thread reads after on-demand prep completes.
+      // Shared execs, indexed by template graph index (written by this thread only).
       std::unordered_map<size_t, std::shared_ptr<CUDAGraph::SharedGraphExec>> shared_execs;
-      std::mutex shared_execs_mutex;
 
-      // Launch on-demand prep on worker threads (CPU-only, no driver calls).
-      // These run in parallel with the template builds below.
-      // shared_exec is nullptr — linking happens after both phases complete.
-      // Uses binary-native path when .cugraph available (direct struct reads,
-      // no JSON parsing, no hex decode — ~10x faster than JSON path).
-      SimpleThreadPool pool(actual_threads);
-      std::vector<std::future<void>> on_demand_futures;
-      for (size_t i = 0; i < num; ++i) {
-        if (template_for[i] == SIZE_MAX)
-          continue;
+      // Phase 2 pipeline. Three kinds of work:
+      //   prep (pool workers): decode each graph's .cugraph into its on-demand data
+      //     (params, function handles + attributes, events); templates are queued first.
+      //   build (this thread): each template's CUgraph from its binary node table (node adds,
+      //     attributes, dependencies), then each member's rewrite of its group's builder graph.
+      //   instantiate (one SerialWorker): every cuGraphInstantiate, in the order the builds
+      //     finish. The driver serializes instantiation (it does not scale across threads or
+      //     contexts), so one instantiate thread is the whole budget; graph-side param rewrites
+      //     of one group overlap the instantiation of another group's graph.
+      // Member order within a group is unchanged (index order on the group's single builder
+      // graph: a member inherits the attributes it does not record from the previous
+      // rewrite, as before); members of different groups are interleaved round-robin so a
+      // rewrite always has another group's instantiate to overlap. Templates without a
+      // complete binary (JSON-only archives, or attributes the node table cannot hold) are
+      // built from the JSON inside their instantiate job, as before.
+      using clk = std::chrono::steady_clock;
+      auto ms_since = [](clk::time_point a) {
+        return std::chrono::duration<double, std::milli>(clk::now() - a).count();
+      };
+      const char* lazy_env = std::getenv("FOUNDRY_LAZY_GRAPH_EXEC");
+      const bool lazy_graph_exec = lazy_env && lazy_env[0] == '1';
+      auto binary_template = [&](size_t idx) {
+        return bin_files[idx].valid() &&
+               (bin_files[idx].header.flags & binary_format::FLAG_COMPLETE_KERNEL_ATTRS);
+      };
 
-        on_demand_futures.push_back(
-            pool.submit([&all_parsed, &graph_names, &bin_files, main_ctx, i]() {
-              // Bind the captured context on this pool worker thread. CUDA
-              // current-context is per-thread; without this the worker has no
-              // context and any driver call below fails with
-              // CUDA_ERROR_INVALID_CONTEXT. Dense decode graphs hit only
-              // CPU-only paths here, but multi-stream graphs (e.g. DeepEP EP,
-              // which uses cross-stream events) reach cuEventCreate /
-              // cuKernelSetAttribute in prepare_on_demand_graph* and need it.
-              C10_CUDA_DRIVER_CHECK(cuCtxSetCurrent(main_ctx));
-              if (bin_files[i].valid()) {
-                // Binary-native path: direct struct reads, no JSON
-                CUDAGraph::prepare_on_demand_graph_binary(bin_files[i], all_parsed[i].graph,
-                                                          main_ctx, nullptr, static_cast<int>(i));
-              } else {
-                // JSON fallback
-                CUDAGraph::prepare_on_demand_graph(all_parsed[i], main_ctx, nullptr,
-                                                   static_cast<int>(i));
-              }
-              all_parsed[i].graph->on_demand_data_->graph_name = graph_names[i];
-            }));
-      }
-
-      // Phase 2a: Build template graphs sequentially (on this thread).
-      // CUDA driver API calls serialize on per-device mutex anyway.
-      // Templates need full JSON (with nodes + dependencies) for build_graph_from_parsed.
-      // If binary was loaded, the minimal JSON has empty nodes — re-read the
-      // JSON file for templates only (one per topology group).
-      //
-      // The re-read + parse is pure CPU (26-30 ms per 1600-1900-node template),
-      // so for binary archives it is prefetched: while template k builds
-      // (driver-bound), template k+1's JSON is parsed on an async thread. One
-      // tree in flight at a time. JSON-only archives already hold the full tree.
       std::vector<size_t> tmpl_order;
       tmpl_order.reserve(topology_groups.size());
       for (const auto& [key, indices] : topology_groups)
         tmpl_order.push_back(indices[0]);
 
-      // Read + parse + strip the metadata keys already extracted in Phase 1b,
-      // to match what the original JSON flow produces at this point.
-      auto reread_template_json = [&json_path_list](size_t idx) {
-        boost::json::value v = read_and_parse_graph_json(json_path_list[idx]);
-        auto& re_root = v.as_object();
-        re_root.erase("generators");
-        re_root.erase("allocator_events");
-        re_root.erase("output_tensors");
-        return v;
+      std::vector<double> prep_ms(num, 0.0);
+      auto prep_task = [&all_parsed, &graph_names, &bin_files, &prep_ms, main_ctx](size_t i) {
+        return [&all_parsed, &graph_names, &bin_files, &prep_ms, main_ctx, i]() {
+          // Bind the captured context on this pool worker thread: prep creates events
+          // (cross-stream graphs) and sets function attributes.
+          C10_CUDA_DRIVER_CHECK(cuCtxSetCurrent(main_ctx));
+          auto t0 = std::chrono::steady_clock::now();
+          if (bin_files[i].valid()) {
+            CUDAGraph::prepare_on_demand_graph_binary(bin_files[i], all_parsed[i].graph, main_ctx,
+                                                      nullptr, static_cast<int>(i));
+          } else {
+            CUDAGraph::prepare_on_demand_graph(all_parsed[i], main_ctx, nullptr,
+                                               static_cast<int>(i));
+          }
+          all_parsed[i].graph->on_demand_data_->graph_name = graph_names[i];
+          prep_ms[i] =
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                  .count();
+        };
       };
-      auto start_prefetch = [&](size_t pos) {
-        std::future<boost::json::value> f;
-        if (pos < tmpl_order.size() && bin_files[tmpl_order[pos]].valid())
-          f = std::async(std::launch::async, reread_template_json, tmpl_order[pos]);
-        return f;
+      SimpleThreadPool pool(actual_threads);
+      std::unordered_map<size_t, std::future<void>> tmpl_prep;
+      for (size_t idx : tmpl_order)
+        if (binary_template(idx))
+          tmpl_prep[idx] = pool.submit(prep_task(idx));
+      std::vector<std::future<void>> on_demand_futures;
+      for (size_t i = 0; i < num; ++i)
+        if (template_for[i] != SIZE_MAX)
+          on_demand_futures.push_back(pool.submit(prep_task(i)));
+
+      // A group's builder graph is busy from the enqueue of an instantiate of it until that
+      // instantiate returns; the build thread rewrites it only when it is free.
+      std::mutex group_mu;
+      std::condition_variable group_cv;
+      std::unordered_map<size_t, bool> group_busy;
+      bool inst_failed = false;
+      auto set_free = [&](size_t g) {
+        {
+          std::lock_guard<std::mutex> lock(group_mu);
+          group_busy[g] = false;
+        }
+        group_cv.notify_all();
       };
-      std::future<boost::json::value> next_json = start_prefetch(0);
+      auto wait_free = [&](size_t g) {
+        std::unique_lock<std::mutex> lock(group_mu);
+        group_cv.wait(lock, [&] { return inst_failed || !group_busy[g]; });
+        return !inst_failed;
+      };
+      // Declared before the instantiate worker: its jobs use them until it is joined.
+      double tmpl_build_ms = 0, tmpl_inst_ms = 0, member_wait_ms = 0;
+      bool prewarm_done = false;
+      const double phase2_start_epoch = epoch_s();
+      std::mutex stats_mu;  // tmpl_inst_ms is written by the instantiate thread
+      SerialWorker inst(main_ctx, [&] {
+        {
+          std::lock_guard<std::mutex> lock(group_mu);
+          inst_failed = true;
+        }
+        group_cv.notify_all();
+      });
 
-      for (size_t pos = 0; pos < tmpl_order.size(); ++pos) {
-        size_t tmpl_idx = tmpl_order[pos];
-
-        fprintf(stderr, "[foundry BUILD] Template %zu (%s): building...\n", tmpl_idx,
-                graph_names[tmpl_idx].c_str());
-        auto t_tmpl = std::chrono::steady_clock::now();
-
-        // If template came from binary (minimal JSON, empty nodes), take the
-        // prefetched full JSON for build_graph_from_parsed ("reread" now only
-        // measures the wait on the prefetch) and start the next one.
-        const bool from_binary = bin_files[tmpl_idx].valid();
-        auto t_reread = std::chrono::steady_clock::now();
-        if (from_binary)
-          all_parsed[tmpl_idx].root_val = next_json.get();
-        // (JSON-only template: the full tree is already in all_parsed.)
-        next_json = start_prefetch(pos + 1);
-
-        // The template's on-demand data comes from the binary when available;
-        // the JSON copy is only needed for the JSON-only fallback
-        // (build_graph_from_parsed consumes the original tree).
-        boost::json::value tmpl_json_copy;
-        if (!from_binary)
-          tmpl_json_copy = all_parsed[tmpl_idx].root_val;
-        double reread_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_reread)
-                .count();
-
-        CUDAGraph::GraphTemplate tmpl;
-        auto t_build = std::chrono::steady_clock::now();
-        auto result = CUDAGraph::build_graph_from_parsed(std::move(all_parsed[tmpl_idx]), main_ctx,
-                                                         nullptr, &tmpl);
-        double build_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_build)
-                .count();
-
+      // Free device memory around Phase 2's instantiates: what the execs took beyond the driver's
+      // pool (the exec pool prewarm is meant to make this ~0).
+      size_t free_before = 0, free_after = 0, mem_total = 0;
+      inst.push([&prewarm_done, &free_before, &mem_total] {
+        prewarm_done = join_exec_pool_prewarm();
+        C10_CUDA_DRIVER_CHECK(cuMemGetInfo(&free_before, &mem_total));
+      });
+      for (size_t tmpl_idx : tmpl_order) {
         auto shared = std::make_shared<CUDAGraph::SharedGraphExec>();
         shared->ctx = main_ctx;
         shared->current_params_id = static_cast<int>(tmpl_idx);
-        result.graph->transfer_to_shared_exec(shared, std::move(tmpl));
-
-        // Prepare template's own on-demand data (needs shared_exec directly).
-        // Binary path: direct struct reads (the JSON walk took 13-19 ms per template).
-        if (from_binary) {
-          CUDAGraph::prepare_on_demand_graph_binary(bin_files[tmpl_idx], result.graph, main_ctx,
-                                                    shared, static_cast<int>(tmpl_idx));
-        } else {
-          ParsedGraphData tmpl_parsed;
-          tmpl_parsed.graph = result.graph;
-          tmpl_parsed.root_val = std::move(tmpl_json_copy);
-          CUDAGraph::prepare_on_demand_graph(tmpl_parsed, main_ctx, shared,
-                                             static_cast<int>(tmpl_idx));
-        }
-        result.graph->on_demand_data_->graph_name = graph_names[tmpl_idx];
-        // Bind the template to the shared exec before any member rewrites the
-        // shared graph's params.
-        result.graph->materialize_on_demand_exec();
-
-        double tmpl_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_tmpl)
-                .count();
+        shared_execs[tmpl_idx] = shared;
         {
-          BuildTiming b = last_build_timing();
-          fprintf(stderr,
-                  "[foundry BUILD] Template %zu (%s): %zu nodes, done in %.1f ms (reread %.1f, "
-                  "build %.1f: json %.1f, func %.1f, func-attrs %.1f/%zu calls, add %.1f, "
-                  "node-attrs %.1f, deps %.1f, instantiate %.1f; on-demand prep %.1f)\n",
-                  tmpl_idx, graph_names[tmpl_idx].c_str(), shared->ordered_nodes.size(), tmpl_ms,
-                  reread_ms, build_ms, b.json_ms, b.func_ms, b.func_attr_ms, b.func_attr_calls,
-                  b.add_ms, b.node_attr_ms, b.deps_ms, b.inst_ms, tmpl_ms - reread_ms - build_ms);
+          std::lock_guard<std::mutex> lock(group_mu);
+          group_busy[tmpl_idx] = true;
         }
+        auto graph = all_parsed[tmpl_idx].graph;
+        const std::string& name = graph_names[tmpl_idx];
 
-        std::lock_guard<std::mutex> lock(shared_execs_mutex);
-        shared_execs[tmpl_idx] = std::move(shared);
+        if (binary_template(tmpl_idx)) {
+          auto t_tmpl = clk::now();
+          tmpl_prep[tmpl_idx].get();
+          double prep_wait = ms_since(t_tmpl);
+          CUDAGraph::GraphTemplate tmpl;
+          BuildTiming bt;
+          CUDAGraph::build_template_graph_binary(bin_files[tmpl_idx], *graph, main_ctx, &tmpl, &bt);
+          shared->graph = tmpl.cuGraph;
+          shared->ordered_nodes = std::move(tmpl.ordered_nodes);
+          graph->on_demand_data_->shared_exec = shared;
+          double build_ms = ms_since(t_tmpl);
+          tmpl_build_ms += build_ms;
+          double prep = prep_ms[tmpl_idx];
+          auto t_enq = clk::now();
+          inst.push([=, &set_free, &stats_mu, &tmpl_inst_ms, &ms_since]() {
+            double queued = ms_since(t_enq);
+            auto t_i = clk::now();
+            shared->exec = reinterpret_cast<CUgraphExec>(
+                CUDAGraph::instantiate_graph_exec(reinterpret_cast<cudaGraph_t>(shared->graph)));
+            double inst_ms = ms_since(t_i);
+            // Bind the template to the shared exec before any member rewrites the graph.
+            graph->materialize_on_demand_exec();
+            {
+              std::lock_guard<std::mutex> lock(stats_mu);
+              tmpl_inst_ms += inst_ms;
+            }
+            fprintf(stderr,
+                    "[foundry BUILD] Template %zu (%s): %zu nodes, done in %.1f ms (binary: prep "
+                    "%.1f on a worker, prep wait %.1f, add %.1f, node-attrs %.1f, deps %.1f, "
+                    "queued %.1f, instantiate %.1f)\n",
+                    tmpl_idx, name.c_str(), shared->ordered_nodes.size(), ms_since(t_tmpl), prep,
+                    prep_wait, bt.add_ms, bt.node_attr_ms, bt.deps_ms, queued, inst_ms);
+            set_free(tmpl_idx);
+          });
+        } else {
+          // JSON template (archive without a complete binary): the whole build runs in its
+          // instantiate job, as it did before the pipeline.
+          inst.push([=, &all_parsed, &json_path_list, &bin_files, &set_free, &stats_mu,
+                     &tmpl_inst_ms, &ms_since]() {
+            fprintf(stderr, "[foundry BUILD] Template %zu (%s): building...\n", tmpl_idx,
+                    name.c_str());
+            auto t_tmpl = clk::now();
+            const bool from_binary = bin_files[tmpl_idx].valid();
+            if (from_binary) {
+              // Binary without every attribute: the full tree comes from the JSON copy.
+              boost::json::value v = read_and_parse_graph_json(json_path_list[tmpl_idx]);
+              auto& re_root = v.as_object();
+              re_root.erase("generators");
+              re_root.erase("allocator_events");
+              re_root.erase("output_tensors");
+              all_parsed[tmpl_idx].root_val = std::move(v);
+            }
+            boost::json::value tmpl_json_copy;
+            if (!from_binary)
+              tmpl_json_copy = all_parsed[tmpl_idx].root_val;
+            double reread_ms = ms_since(t_tmpl);
+            CUDAGraph::GraphTemplate tmpl;
+            auto t_build = clk::now();
+            auto result = CUDAGraph::build_graph_from_parsed(std::move(all_parsed[tmpl_idx]),
+                                                             main_ctx, nullptr, &tmpl);
+            double build_ms = ms_since(t_build);
+            result.graph->transfer_to_shared_exec(shared, std::move(tmpl));
+            if (from_binary) {
+              CUDAGraph::prepare_on_demand_graph_binary(bin_files[tmpl_idx], result.graph, main_ctx,
+                                                        shared, static_cast<int>(tmpl_idx));
+            } else {
+              ParsedGraphData tmpl_parsed;
+              tmpl_parsed.graph = result.graph;
+              tmpl_parsed.root_val = std::move(tmpl_json_copy);
+              CUDAGraph::prepare_on_demand_graph(tmpl_parsed, main_ctx, shared,
+                                                 static_cast<int>(tmpl_idx));
+            }
+            result.graph->on_demand_data_->graph_name = name;
+            result.graph->materialize_on_demand_exec();
+            double tmpl_ms = ms_since(t_tmpl);
+            BuildTiming b = last_build_timing();
+            {
+              std::lock_guard<std::mutex> lock(stats_mu);
+              tmpl_inst_ms += b.inst_ms;
+            }
+            fprintf(stderr,
+                    "[foundry BUILD] Template %zu (%s): %zu nodes, done in %.1f ms (reread %.1f, "
+                    "build %.1f: json %.1f, func %.1f, func-attrs %.1f/%zu calls, add %.1f, "
+                    "node-attrs %.1f, deps %.1f, instantiate %.1f; on-demand prep %.1f)\n",
+                    tmpl_idx, name.c_str(), shared->ordered_nodes.size(), tmpl_ms, reread_ms,
+                    build_ms, b.json_ms, b.func_ms, b.func_attr_ms, b.func_attr_calls, b.add_ms,
+                    b.node_attr_ms, b.deps_ms, b.inst_ms, tmpl_ms - reread_ms - build_ms);
+            set_free(tmpl_idx);
+          });
+        }
       }
 
       // Wait for all on-demand prep to finish
@@ -2077,32 +2705,72 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         f.get();
       }
 
-      // Phase 2c: Quick linking — associate on-demand graphs with shared execs.
-      const char* lazy_env = std::getenv("FOUNDRY_LAZY_GRAPH_EXEC");
-      const bool lazy_graph_exec = lazy_env && lazy_env[0] == '1';
-      for (size_t i = 0; i < num; ++i) {
-        if (template_for[i] == SIZE_MAX)
-          continue;
-        size_t tmpl_idx = template_for[i];
-        CUDAGraph::link_on_demand_shared_exec(*all_parsed[i].graph, shared_execs.at(tmpl_idx));
-        // Default: instantiate every member's exec now (~5 ms per ~1000-node
-        // graph) so no replay ever stalls. FOUNDRY_LAZY_GRAPH_EXEC=1 defers
-        // it to each graph's first replay and shortens load instead.
-        if (!lazy_graph_exec) {
-          all_parsed[i].graph->materialize_on_demand_exec();
-        }
+      // Phase 2c: members, round-robin across groups (index order within a group). Each is
+      // linked to its group's shared exec, rewrites the builder graph once the previous
+      // instantiate of it has returned, and is instantiated on the instantiate thread
+      // (~5-10 ms per ~1000-1600-node graph) so no replay ever stalls.
+      // FOUNDRY_LAZY_GRAPH_EXEC=1 defers the rewrite + instantiate to the first replay.
+      std::vector<std::vector<size_t>> group_members;
+      std::unordered_map<size_t, size_t> group_pos;
+      for (size_t idx : tmpl_order) {
+        group_pos[idx] = group_members.size();
+        group_members.emplace_back();
       }
+      for (size_t i = 0; i < num; ++i)
+        if (template_for[i] != SIZE_MAX)
+          group_members[group_pos.at(template_for[i])].push_back(i);
+      size_t max_members = 0;
+      for (auto& gm : group_members)
+        max_members = std::max(max_members, gm.size());
+      std::vector<size_t> member_order;
+      for (size_t round = 0; round < max_members; ++round)
+        for (auto& gm : group_members)
+          if (round < gm.size())
+            member_order.push_back(gm[round]);
+
+      for (size_t i : member_order) {
+        size_t g = template_for[i];
+        auto t_w = clk::now();
+        if (!wait_free(g))
+          break;  // the instantiate thread failed; finish() rethrows below
+        member_wait_ms += ms_since(t_w);
+        CUDAGraph* member = all_parsed[i].graph.get();
+        CUDAGraph::link_on_demand_shared_exec(*member, shared_execs.at(g));
+        if (lazy_graph_exec)
+          continue;
+        member->rewrite_shared_graph_for_member();
+        {
+          std::lock_guard<std::mutex> lock(group_mu);
+          group_busy[g] = true;
+        }
+        inst.push([member, g, &set_free]() {
+          member->instantiate_member_exec();
+          set_free(g);
+        });
+      }
+      inst.push([&free_after, &mem_total] {
+        C10_CUDA_DRIVER_CHECK(cuMemGetInfo(&free_after, &mem_total));
+      });
+      inst.finish();
+      inst.rethrow();
 
       double phase2_ms =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_phase2)
               .count();
       fprintf(stderr,
               "[foundry] Phase 2: %zu templates + %zu on-demand = %zu graphs built in %.1f ms "
-              "(members: param/attr rewrite %.1f ms, instantiate %.1f ms, %llu attribute calls)\n",
+              "(members: param/attr rewrite %.1f ms, instantiate %.1f ms, %llu attribute calls), "
+              "pipeline: template builds %.1f ms, template instantiates %.1f ms, build thread "
+              "waited %.1f ms for a free builder graph, instantiate thread busy %.1f ms / idle "
+              "%.1f ms, exec pool prewarm %s, device memory taken during the instantiates %.0f "
+              "MB; Phase 2 start %.3f (epoch s)\n",
               topology_groups.size(), num - topology_groups.size(), num, phase2_ms,
               CUDAGraph::g_member_update_us.load() / 1000.0,
               CUDAGraph::g_member_inst_us.load() / 1000.0,
-              (unsigned long long)CUDAGraph::g_member_attr_calls.load());
+              (unsigned long long)CUDAGraph::g_member_attr_calls.load(), tmpl_build_ms,
+              tmpl_inst_ms, member_wait_ms, inst.busy_ms, inst.idle_ms,
+              prewarm_done ? "finished before Phase 2" : "not used",
+              ((double)free_before - (double)free_after) / (1024.0 * 1024.0), phase2_start_epoch);
 
       build_promise->set_value();
     } catch (...) {

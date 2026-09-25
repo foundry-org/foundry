@@ -123,6 +123,13 @@ def _patch_init_torch_distributed() -> None:
             dp_rank=_resolve_dp_rank(self),
         )
         rt.log_alloc_offset("after_setup_graph_ext")
+        if mode == CUDAGraphExtensionMode.LOAD:
+            # Grow the driver's graph-exec memory now, on a background thread,
+            # so Phase 2's instantiates at the capture point reuse it (see
+            # graph_ops.start_exec_pool_prewarm).
+            from foundry.integration.sglang.graph_ops import start_exec_pool_prewarm
+
+            start_exec_pool_prewarm()
         if mode == CUDAGraphExtensionMode.LOAD and _early_graph_builds_enabled():
             # Start rebuilding the CUDA graphs now, on foundry's background
             # thread, so template builds and member instantiation overlap

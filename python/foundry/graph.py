@@ -75,6 +75,14 @@ class CUDAGraph(ops.CUDAGraph):
         return cuda_graph, output_tensors
 
     @staticmethod
+    def start_exec_pool_prewarm(json_paths: list[str]) -> None:
+        """LOAD: grow the driver's graph-exec memory for these graphs on a
+        background thread (kernel-only copies, instantiated then destroyed, never
+        launched), so the later start_graph_builds instantiates reuse it instead of
+        growing it one exec at a time. Needs the recorded binaries loaded."""
+        ops.CUDAGraph.start_exec_pool_prewarm(json_paths)
+
+    @staticmethod
     def start_graph_builds(
         json_paths: list[str],
         pool: tuple[int, int] | None = None,

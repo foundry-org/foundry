@@ -96,6 +96,14 @@ graph_{state.capture_index}_FULL_t{bs}_r{bs}_UX_pcN.json
 
 `state.capture_index` increments per `save_graph` call so files sort in SAVE-time order. `_GRAPH_FILENAME_RE` in `graph_ops.py` parses them on LOAD.
 
+**Archive format note (LOAD template build).** A `.cugraph` written by the current SAVE carries the header flag
+`FLAG_COMPLETE_KERNEL_ATTRS` when it holds every kernel-node attribute the JSON records (per-node programmatic stream
+serialization and device-updatable live in spare node-table space; an access-policy window, or those attributes in the
+common set, leave the flag unset). LOAD then builds each template's graph from the binary node table only. Archives
+saved before this (or without the flag) still load unchanged, but their templates are built from the JSON copy, as
+before, so they do not get that speedup: re-SAVE to get it. The format stays v2, so older foundry builds read new
+archives too.
+
 ## Expected logs
 
 SAVE (success):

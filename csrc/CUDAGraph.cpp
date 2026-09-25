@@ -472,20 +472,26 @@ void CUDAGraph::instantiate() {
                 "instantiate() is intended to be called by the user only when keep_graph=true");
     AT_CUDA_CHECK(cudaGraphExecDestroy(graph_exec_));
   }
+  graph_exec_ = instantiate_graph_exec(graph_);
+  has_graph_exec_ = true;
+}
+
+cudaGraphExec_t CUDAGraph::instantiate_graph_exec(cudaGraph_t graph) {
+  cudaGraphExec_t exec = nullptr;
 #if !defined(USE_ROCM) || ROCM_VERSION >= 60200
   int version = 0;
   AT_CUDA_CHECK(cudaDriverGetVersion(&version));
   if (version < 11040) {
 #endif
 #if (defined(CUDA_VERSION) && CUDA_VERSION >= 12000)
-    cudaError_t inst_err = cudaGraphInstantiate(&graph_exec_, graph_, 0);
+    cudaError_t inst_err = cudaGraphInstantiate(&exec, graph, 0);
     if (inst_err != cudaSuccess) {
       fprintf(stderr, "[foundry INSTANTIATE ERROR] cudaGraphInstantiate FAILED with error %d: %s\n",
               inst_err, cudaGetErrorString(inst_err));
       AT_CUDA_CHECK(inst_err);
     }
 #else
-  cudaError_t inst_err = cudaGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0);
+  cudaError_t inst_err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
   if (inst_err != cudaSuccess) {
     fprintf(stderr, "[foundry INSTANTIATE ERROR] cudaGraphInstantiate FAILED with error %d: %s\n",
             inst_err, cudaGetErrorString(inst_err));
@@ -494,8 +500,8 @@ void CUDAGraph::instantiate() {
 #endif
 #if !defined(USE_ROCM) || ROCM_VERSION >= 60200
   } else {
-    cudaError_t inst_err = cudaGraphInstantiateWithFlags(&graph_exec_, graph_,
-                                                         cudaGraphInstantiateFlagAutoFreeOnLaunch);
+    cudaError_t inst_err =
+        cudaGraphInstantiateWithFlags(&exec, graph, cudaGraphInstantiateFlagAutoFreeOnLaunch);
     if (inst_err != cudaSuccess) {
       fprintf(
           stderr,
@@ -505,7 +511,7 @@ void CUDAGraph::instantiate() {
     }
   }
 #endif
-  has_graph_exec_ = true;
+  return exec;
 }
 
 std::atomic<uint64_t> CUDAGraph::g_member_update_us{0};
@@ -692,16 +698,26 @@ void CUDAGraph::materialize_on_demand_exec() {
   // instantiate a dedicated exec. Execs are snapshots, so the template's exec
   // and earlier members' execs are untouched; the shared graph is a builder.
   // ~5 ms for a ~1000-node graph; totals are printed with the Phase 2 line.
+  rewrite_shared_graph_for_member();
+  instantiate_member_exec();
+}
+
+void CUDAGraph::rewrite_shared_graph_for_member() {
   auto t_upd = std::chrono::steady_clock::now();
   apply_on_demand_updates();
+  on_demand_data_->shared_exec->current_params_id = on_demand_data_->graph_id;
+  g_member_update_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t_upd)
+                            .count();
+}
+
+void CUDAGraph::instantiate_member_exec() {
+  auto& shared = on_demand_data_->shared_exec;
   auto t_inst = std::chrono::steady_clock::now();
-  shared->current_params_id = on_demand_data_->graph_id;
   cudaGraphExec_t exec = nullptr;
   cudaError_t inst_err =
       cudaGraphInstantiate(&exec, reinterpret_cast<cudaGraph_t>(shared->graph), 0);
   auto t_end = std::chrono::steady_clock::now();
-  g_member_update_us +=
-      std::chrono::duration_cast<std::chrono::microseconds>(t_inst - t_upd).count();
   g_member_inst_us += std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_inst).count();
   if (inst_err != cudaSuccess) {
     fprintf(stderr,

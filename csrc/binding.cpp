@@ -258,6 +258,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           },
           py::arg("json_path"), py::arg("pool") = py::none())
       .def_static(
+          "start_exec_pool_prewarm",
+          [](const std::vector<std::string>& json_paths) {
+            py::gil_scoped_release release;
+            ::foundry::CUDAGraph::start_exec_pool_prewarm(json_paths);
+          },
+          py::arg("json_paths"))
+      .def_static(
           "start_graph_builds",
           [](const std::vector<std::string>& json_paths, std::optional<c10::MempoolId_t> pool_opt,
              int num_threads) {

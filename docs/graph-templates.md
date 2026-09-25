@@ -29,20 +29,48 @@ key (node types + cluster dims, `save_graph_manifest`) and records one
 LOAD (`CUDAGraph::start_graph_builds` / `finish_graph_loads`, parallel path in
 `csrc/CUDAGraphParallel.cpp`):
 
-1. **Phase 1** — parse all `.cugraph` binaries on a thread pool (~30 ms for 256).
-2. **Phase 2a** — build each template's `CUgraph` node by node
-   (`build_graph_from_parsed`) and instantiate it. This is the only place the
-   37 ms/graph cost is paid. The template's full JSON (the `.cugraph` has no
-   node list for `build_graph_from_parsed`) is parsed on an async thread one
-   template ahead, and its own on-demand data is read from the `.cugraph`.
-3. **Phase 2b/2c** — for each member: apply its parameter set to the template's
-   `CUgraph` with `cuGraphKernelNodeSetParams` (`apply_on_demand_updates`) and
-   `cudaGraphInstantiate` a **dedicated** exec (`materialize_on_demand_exec`).
-   Execs are snapshots, so the template's exec and earlier members' execs are
-   untouched; the shared `CUgraph` is only a builder. About 6 ms per member.
+0. **Exec-pool prewarm** (sglang: at setup, right after the recorded binaries
+   are loaded; `start_exec_pool_prewarm`) — on a background thread, instantiate a
+   kernel-only copy of every archived graph (non-kernel nodes become empty nodes,
+   nothing is launched), keep the execs until all exist, then destroy them. A
+   `CUgraphExec` holds ~3 KB of device memory per node; while earlier execs stay
+   alive every instantiate otherwise grows the driver's pool for its own exec,
+   which is most of its cost. After the prewarm the Phase 2 instantiates reuse
+   that memory (the execs take ~12-18 MB beyond it instead of ~600 MB). Phase 2
+   never waits for it: a prewarm still running when Phase 2 starts is told to
+   stop after its current graph (log: "abandoned, not waited for").
+1. **Phase 1** — parse all `.cugraph` binaries on a thread pool (~20 ms for 128).
+2. **Phase 2** — a pipeline of three kinds of threads:
+   - *prep* (pool): decode each graph's `.cugraph` into its on-demand data
+     (params, function handles and attributes, events), templates first;
+   - *build* (one thread): each template's `CUgraph` from its binary node table
+     (`build_template_graph_binary`: node adds, attributes with
+     `build_graph_from_parsed`'s precedence, dependencies), then each member's
+     rewrite of its group's builder graph (`rewrite_shared_graph_for_member`);
+   - *instantiate* (one thread): every `cuGraphInstantiate`, in the order the
+     builds finish. Instantiation does not scale across threads, contexts or
+     devices of one process, so one thread is the whole budget; a member's
+     rewrite overlaps another group's instantiate.
 
-Measured on Qwen3-30B-A3B EP=4, 256 graphs per rank (37 templates + 219
-members):
+   Members still get a **dedicated** exec each (`instantiate_member_exec`):
+   execs are snapshots, so the template's exec and earlier members' execs are
+   untouched; the shared `CUgraph` is only a builder, rewritten in member index
+   order per group. Archives without a complete binary (JSON only, or kernel
+   attributes the node table cannot hold: `FLAG_COMPLETE_KERNEL_ATTRS` unset)
+   build their templates from the JSON inside the instantiate job, as before.
+   The Phase 2 log line reports the pipeline (instantiate thread busy / idle,
+   build thread waits, device memory the execs took beyond the pool).
+
+Qwen3.5-122B-A10B-FP8 EP4, 128 graphs per rank (12 templates + 116 members),
+4xH200, same archive: Phase 2 1.81-1.87 s (before) -> 1.34-1.43 s (binary
+templates + pipeline) -> 0.79-0.82 s (+ prewarm); Qwen3-30B-A3B EP4 (14 + 114):
+1.48-1.59 -> 1.05-1.14 -> 0.61-0.67 s. The instantiate thread is busy for 90%
+(122B) and 96% (30B) of Phase 2. The prewarm's cost is host memory: each
+scheduler keeps ~0.4 GB more RSS (the driver's host-side allocations for the
+copies); device memory at `/health` is unchanged.
+
+Earlier measurement (before the pipeline and the prewarm), Qwen3-30B-A3B EP=4,
+256 graphs per rank (37 templates + 219 members):
 
 | LOAD mode | Phase 2 build | sglang decode-graph phase | vs native capture (81 s) |
 |---|---:|---:|---:|

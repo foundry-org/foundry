@@ -504,6 +504,14 @@ foundry_archive/
 
 For DP / EP each rank gets its own `rank_<N>/`.
 
+**Archive format note (LOAD template build).** A `.cugraph` written by the current SAVE carries the header flag
+`FLAG_COMPLETE_KERNEL_ATTRS` when it holds every kernel-node attribute the JSON records (per-node programmatic stream
+serialization and device-updatable live in spare node-table space; an access-policy window, or those attributes in the
+common set, leave the flag unset). LOAD then builds each template's graph from the binary node table only. Archives
+saved before this (or without the flag) still load unchanged, but their templates are built from the JSON copy, as
+before, so they do not get that speedup: re-SAVE to get it. The format stays v2, so older foundry builds read new
+archives too.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |

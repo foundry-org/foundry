@@ -389,6 +389,27 @@ def pack_fatbins() -> None:
     )
 
 
+@nvtx_traced("foundry.graph_restore.prewarm")
+def start_exec_pool_prewarm() -> None:
+    """LOAD, at setup (right after the recorded binaries are loaded): start
+    growing the driver's graph-exec memory for every archived graph (decode and
+    prefill) on a background thread, while torch-distributed init, weight
+    loading and the memory pools run. Phase 2's instantiates then reuse that
+    memory instead of growing it per exec (~3/4 of an instantiate's cost with
+    earlier execs alive). Nothing is launched and no torch/VMM allocation is
+    made. Phase 2 never waits for it: one still running at the capture point
+    is told to stop and Phase 2 instantiates without it."""
+    cfg = get_config()
+    if cfg is None or cfg.workspace_dir is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
+        return
+    files = _scan_graph_files(cfg.workspace_dir) + _scan_prefill_graph_files(cfg.workspace_dir)
+    if not files:
+        return
+    FoundryCUDAGraph.start_exec_pool_prewarm(
+        [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in files]
+    )
+
+
 @nvtx_traced("foundry.graph_restore.start")
 def start_graph_builds() -> None:
     global _pending_graph_builds
