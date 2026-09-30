@@ -877,7 +877,25 @@ def _bootstrap_deepep_v2_buffer(cuda_graph_runner) -> bool:
     return False
 
 
-def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int) -> None:
+def flashinfer_decode_backend(attn_backend):
+    """The FlashInfer backend whose per-bs decode wrappers the captured graphs
+    read, or None.
+
+    The runner's backend itself for plain FlashInfer; the full-attention child
+    for the hybrid linear-attention wrapper (``HybridLinearAttnBackend``: GDN /
+    Mamba + full attention), which exposes neither ``indices_updater_decode``
+    nor ``decode_cuda_graph_metadata`` itself. Missing the child sends the
+    hybrid down the non-FlashInfer path: SAVE allocates the wrappers (each with
+    its own ``_int_workspace_buffer``) between captures, LOAD re-creates them
+    after ``load_all_graphs`` at other addresses, and the restored graphs read
+    SAVE's never-refreshed plan buffers."""
+    for backend in (attn_backend, getattr(attn_backend, "full_attn_backend", None)):
+        if backend is not None and hasattr(backend, "indices_updater_decode"):
+            return backend
+    return None
+
+
+def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int, attn_backend=None) -> None:
     """Populate the backend's per-bs cuda-graph metadata for runtime replay.
 
     Drives the public capture-time entry point with a duck-typed batch
@@ -892,7 +910,8 @@ def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int) -> None:
     and does not move the VMM cursor.
     """
     buffers = cuda_graph_runner.buffers
-    attn_backend = cuda_graph_runner.attn_backend
+    if attn_backend is None:
+        attn_backend = cuda_graph_runner.attn_backend
     num_tokens = bs * cuda_graph_runner.captured_req_width
     encoder_lens = buffers.encoder_lens[:bs] if cuda_graph_runner.is_encoder_decoder else None
     spec_info = cuda_graph_runner.get_spec_info(num_tokens)
@@ -913,16 +932,19 @@ def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int) -> None:
     attn_backend.init_forward_metadata_out_graph(fb, in_capture=True)
 
 
-def initialize_all_attention_metadata(cuda_graph_runner) -> None:
+def initialize_all_attention_metadata(cuda_graph_runner, attn_backend=None) -> None:
     """Pre-pass: populate ``decode_cuda_graph_metadata`` for all bs at once.
 
-    Called on both SAVE and LOAD before the capture/load loop. Walking
+    Called on both SAVE and LOAD before the capture/load loop (FlashInfer,
+    with ``attn_backend`` = ``flashinfer_decode_backend(...)``, which is the
+    full-attention child of a hybrid backend), and on LOAD after it for the
+    other backends (``attn_backend`` None: the runner's backend). Walking
     ``reversed(self.capture_bs)`` (largest first) matches SAVE's natural
     capture order; same order on both sides keeps the VMM cursor
     trajectory identical.
     """
     for bs in reversed(cuda_graph_runner.capture_bs):
-        initialize_attention_metadata_for_bs(cuda_graph_runner, bs)
+        initialize_attention_metadata_for_bs(cuda_graph_runner, bs, attn_backend)
 
 
 @nvtx_traced("foundry.graph_restore.load_all")

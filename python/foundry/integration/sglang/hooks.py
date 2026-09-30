@@ -578,6 +578,7 @@ def _patch_cuda_graph_capture() -> None:
             import torch
 
             from foundry.integration.sglang.graph_ops import (
+                flashinfer_decode_backend,
                 has_prefill_graphs,
                 initialize_all_attention_metadata,
                 load_all_graphs,
@@ -618,10 +619,13 @@ def _patch_cuda_graph_capture() -> None:
             # SAVE's reuse shim makes the in-capture allocation half reuse
             # these, so the cursor sits at SAVE's ``start_base_addr_0`` when
             # graph load begins. fa3 etc. allocate their cuda-graph metadata
-            # once in init_cuda_graph_state and need no pre-pass.
-            use_fi_prepass = hasattr(self.attn_backend, "indices_updater_decode")
-            if use_fi_prepass:
-                initialize_all_attention_metadata(self)
+            # once in init_cuda_graph_state and need no pre-pass. For the
+            # hybrid linear-attention backend the pre-pass runs on its
+            # FlashInfer child only; the linear child's metadata live in
+            # init_cuda_graph_state buffers that every replay refreshes.
+            fi_backend = flashinfer_decode_backend(self.attn_backend)
+            if fi_backend is not None:
+                initialize_all_attention_metadata(self, fi_backend)
             rt.log_alloc_offset("after_pre_init")
 
             load_all_graphs(self)
@@ -655,7 +659,7 @@ def _patch_cuda_graph_capture() -> None:
             # LOAD replaces. Run AFTER load_all_graphs: fa3's metadata are
             # lightweight views over the fixed init_cuda_graph_state
             # workspace, not graph memory, so the cursor is unaffected.
-            if not use_fi_prepass:
+            if fi_backend is None:
                 initialize_all_attention_metadata(self)
 
             # Upstream sets the DeepEP adapter's captured mode in
@@ -665,7 +669,11 @@ def _patch_cuda_graph_capture() -> None:
             return None
 
         # SAVE
-        attn_backend = self.attn_backend
+        from foundry.integration.sglang.graph_ops import flashinfer_decode_backend
+
+        # The FlashInfer backend itself, or the FlashInfer child of a hybrid
+        # linear-attention backend (same pre-pass as on LOAD).
+        attn_backend = flashinfer_decode_backend(self.attn_backend) or self.attn_backend
         use_fi_prepass = hasattr(attn_backend, "indices_updater_decode")
         real_prepare = getattr(attn_backend, "_prepare_cuda_graph_metadata", None)
 
@@ -710,7 +718,7 @@ def _patch_cuda_graph_capture() -> None:
             self.buffers.seq_lens.fill_(self.seq_len_fill_value)
             self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
             rt.log_alloc_offset("save_before_pre_init")
-            initialize_all_attention_metadata(self)
+            initialize_all_attention_metadata(self, attn_backend)
             rt.log_alloc_offset("save_after_pre_init")
             # Drop the pre-pass's last forward_metadata ref so popping the
             # dict entry doesn't keep the wrapper alive at refcount 1.
