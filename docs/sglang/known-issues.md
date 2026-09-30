@@ -9,6 +9,29 @@ order, and LOAD cannot replay that layout. `region_layout.json` (per rank) recor
 or with another value: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the
 current code`. Rule: re-SAVE every archive saved by the old code.
 
+## DeepEP v2 (NCCL windows + GIN) not validated on the plugin route (TODO, 2026-09-30)
+
+`--moe-a2a-backend deepep_v2` was validated on the earlier fork route only (H100 EP2 / EP4, all 256 decode graphs,
+foundry e24186b). On the plugin route (upstream main) it has not run: the plugin leaves `NCCL_CUMEM_ENABLE` to
+sglang for v2 (its NCCL windows need cuMem), and that exception is the one pin without a measurement behind it.
+
+Two attempts on the bare 4xH200 radix hosts failed before any Foundry code ran:
+
+- `sgl-deep-ep` 0.1.2 is built against NCCL 2.30.7 while torch pins 2.29.7 (`NCCL library version is too old`);
+  fixed for the run with `uv pip install --no-deps nvidia-nccl-cu13==2.30.7` plus the CUDA 13.3 compat libcuda.
+- With NCCL 2.30.7, plain sglang asserts at the first MoE dispatch: `NCCL GIN is unavailable` (`ElasticBuffer.__init__`,
+  `csrc/kernels/backend/nccl.cu:87`). v2 requires NCCL GIN even for a single-node EP4, i.e. an RDMA NIC visible to
+  the process. These hosts are 4-GPU slices of 8xH200 nodes with IB disabled, so v2 cannot start there at all.
+
+What to check once an RDMA-capable host is available (Qwen3-30B-A3B-FP8 EP4, decode graphs; sglang forces prefill
+graphs off for v2): the `[Foundry] pin:` line saying `NCCL_CUMEM_ENABLE` was left to sglang; the ElasticBuffer
+bootstrap time on SAVE and LOAD; `Loaded 128 SGLang graphs in`; SAVE `final_alloc_offset` == LOAD
+`after_load_all_graphs`; no `[HOOK] WARNING: cuMemAddressReserve returned address ... != hint` (NCCL cuMem
+allocations made outside the hook's thread-local region would show up there); greedy parity and TPOT vs native.
+Why it is expected to work: v2's windows are library-owned physical memory at a hook-carved VA, registered at the
+pre-capture bootstrap on both SAVE and LOAD, the same model as DeepEP v1's NVSHMEM heap; the
+`NCCL_GRAPH_REGISTER=0` / `NCCL_LOCAL_REGISTER=0` / `NCCL_NVLS_ENABLE=0` pins stay in force.
+
 ## SAVE spends ~30 s in `Init torch distributed` (and ~20 s more elsewhere) copying over-read fatbins (FIXED, 2026-09-25)
 
 SAVE only (LOAD skips fatbin processing). The hook sized each registered fatbin by walking every following
