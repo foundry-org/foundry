@@ -23,8 +23,8 @@ Code labels:
 | GLM-5.3-Flash (FP8) | EP4, DP attention (4) | dummy | 4xH200 / main / `64b23ac` | 0 + 128 (native limitation) | 138.3 -> **79.3** | 1.02 | dummy text, native == LOAD | dist init 23-29 s on every engine, eager included |
 | gpt-oss-120b | EP4, plain EP (4) | dummy | 4xH200 / main / `64b23ac` | 4 + 128 | 76.8 -> **50.5** | 0.72 + 0.51 | **not testable**: mxfp4 dummy experts are uninitialized memory, so the text differs after token 1; TPOT native = LOAD (9.59 / 9.51 ms at bs 128) | the only non-Qwen3 row with prefill graphs |
 | DeepSeek-V4-Flash-FP8 | EP4, DP attention (4) | dummy | 4xH200 / main / `6d5bec5` (cluster fix) | 0 + 128 (native limitation) | 105.2 -> **46.4** | 1.16 | dummy text, native == LOAD | before the fix, LOAD failed with error 912 on the cluster-16 top-k kernel |
-| Qwen3-235B-A22B-FP8 | attn TP4 + EP4, DeepEP LL (4) | dummy | 4xH200 / **fork, flag route** / `64b23ac` | 0 + 128 (decode-only run; the model can capture prefill) | 101.9 -> **35.3** | 1.42 | dummy text, native == LOAD | not rerun on main; bs 1 runs eagerly in both |
-| Qwen3-30B-A3B-FP8 | EP4, DP attention, DeepEP LL (4) | **real** | 4xH200 / main / `c5e43c4` (loop LOAD) | 4 + 128 | 81.7 -> **47.4** | 0.76 + 0.67 | greedy 20/20 x 2 reps, native vs LOAD | rechecked on `056b154` (decode only): SAVE vs LOAD 20/20, restore 0.68-0.76 s |
+| Qwen3-235B-A22B-FP8 | attn TP4 + EP4, DeepEP LL (4) | dummy | 4xH200 / main / `10a2681` | 4 + 128 | 111.8 -> **36.2** | 0.06 + 1.51-1.54 | dummy text, native == LOAD | TTFT / TPOT equal to native (C8 1030 / 1023 ms; bs128 75.9 / 75.8 ms) |
+| Qwen3-30B-A3B-FP8 | EP4, DP attention, DeepEP LL (4) | **real** | 4xH200 / main / `10a2681` | 4 + 128 | 80.7 -> **47.8** | 0.025 + 0.70-0.72 | greedy 20/20 x 2 reps, native vs LOAD; eager vs LOAD 20/20 | TTFT C8 439 / 434 ms; TPOT bs128 10.2 / 9.2 ms (native / LOAD) |
 | Qwen3-30B-A3B-FP8 | TP2 (2) | **real** | 4xH200 / main / `c5e43c4` | 5 + 128 | 71.5 -> **37.9** | 1.22 + 0.52 | greedy 20/20 per rep, native vs LOAD | native is not run-to-run deterministic at TP2 (19/20); native bar from part-2; rechecked on `056b154`: SAVE vs LOAD 20/20 |
 | Qwen3-1.7B | 1 GPU, flashinfer | real | H200 / sglang `foundry-plugin` (main + PR) / `056b154` | 4 + 8 | 23.0 -> **20.0** | 0.012 + 0.024 | e2e test: 8 prompts sequential + batched equal to native; 8/8 prefill replays | e2e test 6/6 OK |
 | Qwen3.5-2B | 1 GPU, fa3 | real | H200 / sglang `foundry-plugin` / `056b154` | 0 + 8 (native limitation) | 28.0 -> **27.0** | 0.015 | e2e test greedy equal (3 runs) | 2 of 3 runs 6/6 OK; one run tripped the TPOT check on a slow native bench (greedy output still matched) |
@@ -52,6 +52,6 @@ Code labels:
 | Inkling-Small-21L (**reduced model**, 21 of 42 layers) | EP4, DP attention (4) | dummy | 4xH200 `H200-C4` | 0 + 128 (native limitation) | 96.1 -> **56.3** | 2.09 | dummy text | a2a `deepep` |
 | Inkling-Small-21L (**reduced model**) | TP4 + EP4 (4) | dummy | `H200-C4` | 0 + 128 (native limitation) | 61.2 -> **46.2** | 1.61 | dummy text | |
 
-33 rows. The `P1-real` TP2 and EP4 rows are superseded by the two `main` Qwen3-30B-A3B-FP8 rows above. Not included: an older 8xH100 real-weight matrix on much older code.
+33 rows. The `P1-real` TP2 and EP4 rows are superseded by the two `main` Qwen3-30B-A3B-FP8 rows above. The `10a2681` rows are the final validation of the plugin route (2026-09-30, 4xH200); the same lease also passed the 1-GPU e2e test (4 runs), the Qwen3.5-35B-A3B tp2 / ep2 large tests (real weights) and the xlarge Qwen3.5-122B-FP8 / DeepSeek-V4-Flash-FP8 EP4 tests. Not included: an older 8xH100 real-weight matrix on much older code.
 
 The stage breakdown of the `main` rows is in [figs/stages_pr.png](figs/stages_pr.png).
