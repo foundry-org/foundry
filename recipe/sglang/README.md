@@ -7,7 +7,7 @@ integration.
 
 | Component | Commit | Notes |
 |---|---|---|
-| SGLang, upstream `main` **`fa090f7755`** (2026-09-29) | fork branch **`foundry-plugin`** | = upstream `main` with **no changes**; the branch only pins the commit the plugin route was validated on. Foundry runs as an SGLang plugin (entry point `foundry` in group `sglang.srt.plugins`), switched on by `FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>`; there is no CLI flag. Optional: `symm-mem-no-multicast-fallback` (`50b4f5302d`, one commit on `fa090f7755`) for TP LOAD on hosts without multicast (see TP notes). |
+| SGLang, upstream `main` **`fa090f7755`** (2026-09-29) | fork branch **`foundry-plugin`** | = upstream `main` `fa090f7755` plus the CUDA graph extension hooks, the `FOUNDRY_GRAPH_EXTENSION_CONFIG` declaration and its loader check (4 commits, head `7d0fafc1fa`); the plugin route itself was validated on plain `fa090f7755`. Foundry runs as an SGLang plugin (entry point `foundry` in group `sglang.srt.plugins`), switched on by `FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>`; there is no CLI flag. Optional: `symm-mem-no-multicast-fallback` (`50b4f5302d`, one commit on `fa090f7755`) for TP LOAD on hosts without multicast (see TP notes). |
 | Foundry, branch **`sglang-registry`** | this commit or later | The SGLang integration in `python/foundry/integration/sglang/` plus the plugin entry module `python/foundry_sglang_plugin.py`; `pip install -e .` registers the entry point. Archives written by foundry before `coldstart` `b4c2a84` (`final_alloc_offset.json` + `live_ranges.json` layout) do not load: re-run `--save`. |
 
 The older in-tree route (fork branches `foundry` `6272eb04c5`, `foundry-prefill` `4f018fd052`, flag
@@ -117,8 +117,9 @@ scripts, the equivalent is
 FOUNDRY_GRAPH_EXTENSION_CONFIG=recipe/sglang/foundry_save.toml sglang serve <flags>    # then foundry_load.toml
 ```
 
-**SGLang falls back to a native run without any error in two cases**, because the plugin's code never runs and
-cannot report its own absence:
+**On plain upstream `fa090f7755` SGLang falls back to a native run without any error in two cases**, because the
+plugin's code never runs and cannot report its own absence (with the `foundry-plugin` branch's loader check, both
+cases raise a `ValueError` naming the variable before any process starts):
 
 1. `FOUNDRY_GRAPH_EXTENSION_CONFIG` is set but the `foundry` entry point is not registered in the venv that runs
    `sglang serve` (Foundry not installed there, or an install from before the plugin commit);
