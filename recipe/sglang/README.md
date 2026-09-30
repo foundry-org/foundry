@@ -7,11 +7,17 @@ integration.
 
 | Component | Commit | Notes |
 |---|---|---|
-| SGLang fork `foundry-org/sglang`, branch **`foundry`** | `6272eb04c5` | = upstream `main` `03ea13a545` (2026-09-16) + one 8-file integration commit (`[foundry] SGLang integration: fast cold start by CUDA graph context materialization`). Check out this commit; `main` alone has no `--foundry-graph-extension-config-path`. Inkling-Small needs the branch head instead (`a911f6b66b`: five DP-attention fixes plus the `_run_mlp` fix that every TP-attention topology needs, report findings 14 and 18); every other validated model runs on `6272eb04c5`. |
-| Foundry, branch **`coldstart`** | `b4c2a84` (or later) | The sglang integration in `python/foundry/integration/sglang/` plus the hook/graph fixes the Qwen3.5 / DeepSeek rows needed. Archives written by earlier foundry commits (`final_alloc_offset.json` + `live_ranges.json` layout) do not load on this version: re-run `--save`. |
+| SGLang, upstream `main` **`fa090f7755`** (2026-09-29) | fork branch **`foundry-plugin`** | = upstream `main` with **no changes**; the branch only pins the commit the plugin route was validated on. Foundry runs as an SGLang plugin (entry point `foundry` in group `sglang.srt.plugins`), switched on by `FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>`; there is no CLI flag. Optional: `symm-mem-no-multicast-fallback` (`50b4f5302d`, one commit on `fa090f7755`) for TP LOAD on hosts without multicast (see TP notes). |
+| Foundry, branch **`sglang-registry`** | this commit or later | The SGLang integration in `python/foundry/integration/sglang/` plus the plugin entry module `python/foundry_sglang_plugin.py`; `pip install -e .` registers the entry point. Archives written by foundry before `coldstart` `b4c2a84` (`final_alloc_offset.json` + `live_ranges.json` layout) do not load: re-run `--save`. |
 
-The fork commit pins **torch 2.13.0+cu130**, sglang-kernel 0.4.7, sgl-deep-ep 0.1.2, sgl-deep-gemm 0.2.0 and
-ships the whole kernel stack as wheels. The previous pairing (foundry v0.0.3 with `f1d688e52`) is kept as branch `foundry-0.0.3`;
+The older in-tree route (fork branches `foundry` `6272eb04c5`, `foundry-prefill` `4f018fd052`, flag
+`--foundry-graph-extension-config-path`) is superseded; most rows under **Validation** were measured on it. The
+plugin also activates on those fork commits (Qwen3-30B-A3B EP4 SAVE/LOAD passed on `4f018fd052`, 2026-09-29), so
+the scripts here work there too once Foundry is installed in that venv. Inkling-Small needs the fork's DP-attention
+and `_run_mlp` fixes (`a911f6b66b`, report findings 14 and 18), which are not upstream.
+
+`fa090f7755` (like the fork commits) pins **torch 2.13.0+cu130**, sglang-kernel 0.4.7, sgl-deep-ep 0.1.2,
+sgl-deep-gemm 0.2.0 and ships the whole kernel stack as wheels. The previous pairing (foundry v0.0.3 with `f1d688e52`) is kept as branch `foundry-0.0.3`;
 the 0.0.2-era integration on `foundry-0.0.2`. Foundry `dev >= ac6104f` builds against torch 2.11 and
 2.13 alike (version-guarded csrc). Validated on this pairing (see **Validation**):
 single GPU, DP=2, TP=2, EP=2 with DeepEP low-latency and with DeepEP v2 —
@@ -97,13 +103,70 @@ model or topology before SAVE.
 | Tensor parallel | `serve_qwen3-1.7b_tp.sh` | Qwen3-1.7B | torch symm-mem allreduce (`--enable-torch-symm-mem --disable-custom-all-reduce`); mirrors the vLLM TP recipe |
 | Data parallel | `serve_qwen3-1.7b_dp.sh` | Qwen3-1.7B | one full replica/rank; `NCCL_CUMEM_ENABLE=0`/`NCCL_NVLS_ENABLE=0` |
 | Expert parallel | `serve_qwen3-30ba3b_ep.sh` | Qwen3-30B-A3B | DP-attention + DeepEP; fa3 backend; `SGL_MODEL=Qwen/Qwen3-30B-A3B-FP8` for FP8 |
-| Expert parallel, TP attention | `serve_qwen3-30ba3b_ep_tpattn.sh` | Qwen3-30B-A3B | symm-mem allreduce + DeepEP (vLLM-shaped EP); needs the `foundry` branch's per-phase cuda-graph flags |
+| Expert parallel, TP attention | `serve_qwen3-30ba3b_ep_tpattn.sh` | Qwen3-30B-A3B | symm-mem allreduce + DeepEP (vLLM-shaped EP); uses the per-phase cuda-graph flags |
 | Expert parallel, DeepEP v2 | `serve_qwen3-30ba3bfp8_ep_v2.sh` | Qwen3-30B-A3B-FP8 | NCCL symmetric windows + GIN instead of NVSHMEM; needs NCCL >= 2.30.7 (see below) |
+
+## Foundry plugin: activation and checks
+
+The scripts turn Foundry on through the environment, not a flag: `--save` / `--load` export
+`FOUNDRY_GRAPH_EXTENSION_CONFIG` to `foundry_save.toml` / `foundry_load.toml` next to the script, and every other
+mode (baseline, `--warm`) unsets it, so a stray export in your shell cannot turn a baseline into a SAVE. Without the
+scripts, the equivalent is
+
+```bash
+FOUNDRY_GRAPH_EXTENSION_CONFIG=recipe/sglang/foundry_save.toml sglang serve <flags>    # then foundry_load.toml
+```
+
+**SGLang falls back to a native run without any error in two cases**, because the plugin's code never runs and
+cannot report its own absence:
+
+1. `FOUNDRY_GRAPH_EXTENSION_CONFIG` is set but the `foundry` entry point is not registered in the venv that runs
+   `sglang serve` (Foundry not installed there, or an install from before the plugin commit);
+2. SGLang's plugin allowlist `SGLANG_PLUGINS` is set and does not name `foundry`.
+
+Every other failure (missing TOML, a renamed SGLang step, a patch that cannot be installed) stops the process with
+the reason.
+
+**Preflight.** Before launching a `--save` / `--load`, the scripts run
+`python -m foundry.integration.sglang.preflight --toml <toml> --save|--load` with the interpreter of the `sglang`
+launcher on `PATH` (`SGL_PYTHON` overrides it) and stop with a one-line `[Foundry preflight] FAILED: <reason>` if
+any check fails:
+
+- `sglang.srt.plugins` imports and `sglang.srt.arg_groups.resolution_hooks` still lists the three steps the plugin
+  wraps; the sglang version and commit are printed, with whether the tree contains `fa090f7755` (an older tree with
+  that surface, such as the fork base, only gets a warning);
+- the `foundry` entry point is registered in `sglang.srt.plugins`, points at `foundry_sglang_plugin:load`, and
+  imports;
+- `SGLANG_PLUGINS`, if set, includes `foundry`;
+- the TOML exists, parses, has the expected `mode`, `libcuda_hook.so` is found, and for `--load` the archive
+  (`workspace_root`, relative to the current directory) exists and has `rank_*` directories.
+
+The end-to-end test (`tests/integration/sglang/test_sglang_save_load_e2e.py`) runs the same checks.
+
+**After launch**, the output of a `--save` / `--load` engine is also written to `logs/sglang_<mode>_<time>.log`
+(`FOUNDRY_SERVE_LOG` overrides it). Once `/health` answers, the script reads that log and prints the number of
+processes that logged the plugin's activation line and, on `--load`, the `[Foundry] Loaded N SGLang graphs` lines. If
+the activation line is missing it prints a warning that SGLang ran natively. It also counts `[HOOK] ERROR` lines.
+
+### Verify the plugin is active
+
+- Each Foundry process (the launcher and every scheduler) prints to stderr:
+  `[Foundry] sglang plugin active: pid=<pid> config=<toml>`. A LOAD also logs
+  `[Foundry] Loaded <N> SGLang graphs in <t>s` once per rank. No activation line means SGLang ran natively.
+- Check the entry point in the serving venv:
+
+  ```bash
+  python -c "from importlib.metadata import entry_points; eps=[e for e in entry_points(group='sglang.srt.plugins') if e.name=='foundry']; assert eps, 'foundry plugin entry point not registered: pip install -e foundry'; print(eps)"
+  ```
+
+- Or run the whole preflight by hand, from the directory you serve in:
+  `python -m foundry.integration.sglang.preflight --toml recipe/sglang/foundry_load.toml --load`.
 
 ## Installation
 
-The recipes assume `foundry` and the SGLang fork are **pip-installed** (editable is
-fine) so both import without any `PYTHONPATH`, and foundry's spawn-site patch
+The recipes assume `foundry` and SGLang are **pip-installed** in the same venv (editable
+is fine): installing foundry registers the plugin entry point (a `PYTHONPATH` checkout
+does not), and foundry's spawn-site patch
 auto-detects `libcuda_hook.so` from its install — the scripts set no `LD_PRELOAD`
 themselves. The standard workspace layout has `foundry/` (this repo) and `sglang/`
 (the foundry-org SGLang fork) as siblings:
@@ -114,7 +177,7 @@ themselves. The standard workspace layout has `foundry/` (this repo) and `sglang
 │   ├── python/foundry/     # `pip install -e .` builds libcuda_hook.so here
 │   ├── recipe/sglang/      # <-- you are here
 │   └── ...
-└── sglang/                 # foundry-org/sglang fork (with direct edits applied)
+└── sglang/                 # SGLang upstream main fa090f7755 (foundry-org/sglang branch foundry-plugin, unmodified)
 ```
 
 Use a dedicated env, kept separate from the vLLM env so kernel pins don't clash
@@ -125,7 +188,7 @@ Use a dedicated env, kept separate from the vLLM env so kernel pins don't clash
 python3.12 -m venv venv && source venv/bin/activate
 pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
 
-# in-tree sglang fork (branch foundry), editable — this pulls the FULL
+# sglang at fa090f7755 (branch foundry-plugin), editable — this pulls the FULL
 # kernel stack as wheels: flashinfer 0.6.18, sglang-kernel 0.4.6.post1,
 # sgl-deep-ep, sgl-deep-gemm, flash-attn-4. No hand-built kernels remain
 # (fa3 now lives inside sglang-kernel as sgl_kernel.flash_attn).
@@ -138,7 +201,7 @@ pip install "flashinfer-jit-cache==0.6.18" --index-url https://flashinfer.ai/whl
 
 # foundry build deps (boost from conda/system; cmake+ninja can come from pip)
 pip install "cmake>=4.0" ninja wheel pytest
-pushd foundry && pip install -e . --no-build-isolation && popd
+pushd foundry && pip install -e . --no-build-isolation && popd   # also registers the sglang plugin entry point
 ```
 
 `libcuda_hook.so` finds boost via a baked rpath; if it can't, add the conda lib dir to
@@ -172,15 +235,16 @@ pynccl are both replay paths foundry does not support; the TP script disables
 them and enables `--enable-torch-symm-mem`, so every decode-graph allreduce is a
 `symm_mem.two_shot_all_reduce_` (TP=2 on Hopper) on the persistent symmetric
 buffer foundry places deterministically. On hosts without usable multicast (no
-IMEX channels), the `foundry` fork keeps the communicator enabled on the
-two-shot path — upstream sglang would silently fall back to in-graph NCCL,
-which breaks LOAD. If a load aborts with `TorchSymmMemCommunicator ...
+IMEX channels), upstream sglang disables the communicator and silently falls
+back to in-graph NCCL, which breaks LOAD; the optional fork branch
+`symm-mem-no-multicast-fallback` (`50b4f5302d`) keeps it enabled on the
+two-shot path. If a load aborts with `TorchSymmMemCommunicator ...
 communicator is not available` in the log, the allreduce fell back to NCCL and
 the archive is not replayable.
 
 ## Run (expert parallel / DeepEP)
 
-On the `foundry` branch the EP kernel stack is entirely wheel-provided by the sglang
+The EP kernel stack is entirely wheel-provided by the sglang
 install above (`sgl-deep-ep`, `sgl-deep-gemm`; fa3 inside `sglang-kernel`) — there is
 nothing to build. Two things still matter:
 
@@ -213,8 +277,7 @@ allreduce routed through torch symm-mem (`--enable-torch-symm-mem`, custom AR
 off) plus `--cuda-graph-backend-prefill disabled` — the prefill-graph disable
 matters even for baseline runs of this topology, because without DP-attention
 every rank dispatches the full prefill chunk and prefill-graph capture trips
-DeepEP's `num_max_dispatch_tokens_per_rank` assert. `foundry` branch
-only (uses the per-phase cuda-graph flags).
+DeepEP's `num_max_dispatch_tokens_per_rank` assert.
 
 The EP script sets `--enable-dp-attention --enable-torch-symm-mem --moe-a2a-backend deepep --deepep-mode low_latency
 --moe-runner-backend deep_gemm --attention-backend fa3 --disable-custom-all-reduce` and
@@ -308,6 +371,14 @@ Model notes:
   the same cursor. Validated on 8xH200 (Qwen3-30B-A3B EP2: identical output).
 
 ## Validation
+
+**Plugin route on upstream main, 4xH200, 2026-09-29** (sglang `fa090f7755`, foundry `sglang-registry` `d01dac4` /
+`64b23ac`, venv, real Qwen3-30B-A3B-FP8 weights, `experimental/matrix3/coldstart.sh` with the env var instead of the
+flag, not these scripts): EP4 (DP attention + DeepEP) and TP2, 128 decode graphs each, SAVE/LOAD offsets equal on
+every rank, 0 `[HOOK] ERROR`, the activation line from the launcher and every scheduler, greedy output of 20 prompts
+identical to the native graph engine. LOAD to `/health` 52.6 s (EP4) and 37.8 s (TP2), against 53.1 s and 38.7 s
+on the fork with the in-tree flag; TPOT unchanged. Every table below was measured on the fork with the in-tree
+flag.
 
 **8xH200, 2026-09-23** (foundry `coldstart`, sglang fork `foundry` at `03ea13a545`, driver 595, dummy weights,
 every decode batch size captured without padding, `experimental/matrix3/coldstart.sh`): the 100B+ recipes serve
@@ -435,9 +506,10 @@ restore saves 25–50 s per engine start (see the top-level README's Performance
 
 ## Prefill CUDA graphs (experimental)
 
-By default Foundry persists decode graphs only, and SAVE/LOAD run with prefill graphs disabled. On the fork branch
-**`foundry-prefill`** (`4f018fd052`, on top of `a911f6b66b`) with foundry `coldstart` >= `608193b`, pass
-`--cuda-graph-backend-prefill full` (plus the same `--cuda-graph-bs-prefill` list) on **both SAVE and LOAD**.
+By default Foundry persists decode graphs only, and SAVE/LOAD run with prefill graphs disabled. To persist them, pass
+`--cuda-graph-backend-prefill full` (plus the same `--cuda-graph-bs-prefill` list) on **both SAVE and LOAD**. The
+results below were measured on the fork branch **`foundry-prefill`** (`4f018fd052`) with foundry `coldstart`
+`608193b` (in-tree route); prefill graphs have not been run on upstream main with the plugin yet.
 
 - SAVE records the prefill graphs through the same capture hook as decode.
 - LOAD runs sglang's own prefill capture loop and swaps each capture for the archived graph, with an order/shape

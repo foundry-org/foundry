@@ -10,11 +10,13 @@ HOST="0.0.0.0"
 PORT=12000
 MEM_FRACTION_STATIC=0.6
 
-# No LD_PRELOAD / PYTHONPATH here: foundry + the sglang fork are pip-installed, and
-# foundry's setup_ld_preload_env auto-detects libcuda_hook.so and LD_PRELOADs it
-# into every worker at spawn time. (Running from a source checkout instead? Export
-# PYTHONPATH=.../foundry/python:.../sglang/python yourself.)
+# No LD_PRELOAD / PYTHONPATH here: foundry + sglang are pip-installed in one venv
+# (installing foundry registers its sglang plugin entry point; a PYTHONPATH checkout
+# does not), and foundry's setup_ld_preload_env auto-detects libcuda_hook.so and
+# LD_PRELOADs it into every worker at spawn time.
 
+# Foundry is an sglang plugin, switched on by this variable (no CLI flag).
+export FOUNDRY_GRAPH_EXTENSION_CONFIG="$FOUNDRY_TOML"
 sglang serve \
     --model-path "$MODEL_NAME" \
     --trust-remote-code \
@@ -23,11 +25,18 @@ sglang serve \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --disable-radix-cache \
     --attention-backend flashinfer \
-    --cuda-graph-max-bs 512 \
-    --foundry-graph-extension-config-path "$FOUNDRY_TOML"
+    --cuda-graph-max-bs-decode 512
 ```
 
-`--cuda-graph-max-bs 512` is the closest analogue to vLLM's `--max-num-seqs 512` — it drives `capture_bs` to span a similar range of decode batch sizes (52 batch sizes from 1 → 512).
+The recipe scripts wrap this: they export the variable for `--save` / `--load` only, run
+`python -m foundry.integration.sglang.preflight` first (sglang plugin surface, the `foundry`
+entry point, `SGLANG_PLUGINS`, the TOML and, on LOAD, the archive), and after `/health` check
+the engine log for `[Foundry] sglang plugin active` (and `[Foundry] Loaded N SGLang graphs` on
+LOAD). SGLang runs natively without an error when the entry point is not registered in the
+serving venv or `SGLANG_PLUGINS` omits `foundry`; see
+[`recipe/sglang/README.md`](../../recipe/sglang/README.md#foundry-plugin-activation-and-checks).
+
+`--cuda-graph-max-bs-decode 512` is the closest analogue to vLLM's `--max-num-seqs 512` — it drives `capture_bs` to span a similar range of decode batch sizes (52 batch sizes from 1 → 512).
 
 ## TOML configs
 
