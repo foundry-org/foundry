@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Foundry's sglang plugin: strict no-op without FOUNDRY_GRAPH_EXTENSION_CONFIG;
 with it, server-args resolution pins decode to full, prefill to full/disabled,
-profiling/autotune off, and rejects what Foundry cannot persist.
+profiling/autotune off, pins every flag and environment variable that selects
+state Foundry cannot replay (plugin.FIELD_PINS / ENV_PINS), and rejects what
+Foundry cannot persist.
 
 CPU only (no GPU, no server, no weights): resolution runs on a mini
 config.json with device="cuda", like sglang's own
@@ -58,8 +60,22 @@ def restore_environ():
     os.environ.update(saved)
 
 
+_PIN_ENV_NAMES = [pin.name for pin in plugin.ENV_PINS] + [
+    plugin.NCCL_CUMEM_PIN.name,
+    plugin._ENV_PINNED_MARK,
+]
+
+
 @pytest.fixture
-def plugin_hooks(tmp_path, restore_environ):
+def clean_pin_env(restore_environ):
+    """No pinned variable inherited from the calling shell."""
+    for name in _PIN_ENV_NAMES:
+        os.environ.pop(name, None)
+    yield
+
+
+@pytest.fixture
+def plugin_hooks(tmp_path, clean_pin_env):
     """The plugin's resolution hooks registered on a private registry (the
     registry is process-global; the runtime patches are not installed)."""
     cfg = tmp_path / "foundry.toml"
@@ -198,6 +214,180 @@ def test_disable_cuda_graph_is_rejected_not_overridden(model_dir, plugin_hooks, 
 def test_profile_cuda_graph_is_rejected(model_dir, plugin_hooks):
     with pytest.raises(ValueError, match="enable-profile-cuda-graph"):
         _resolve(model_dir, enable_profile_cuda_graph=True)
+
+
+# ---------------------------------------------------------------------------
+# Pinned flags: configs that select state Foundry cannot replay
+# ---------------------------------------------------------------------------
+
+
+def _unresolved(model_dir, **fields):
+    """A ServerArgs record as the CLI builds it, before resolution: the pin
+    step is called on it directly so that no other resolution step can reject
+    the contrary value first."""
+    return ServerArgs(model_path=model_dir, device="cuda", random_seed=42, **fields)
+
+
+def test_every_field_pin_is_applied_on_sglang_defaults(model_dir, plugin_hooks, capsys):
+    sa = _resolve(model_dir)
+    for pin in plugin.FIELD_PINS:
+        assert resolution_result(sa, pin.field) == pin.value, pin.field
+    assert resolution_result(sa, plugin.DSV4_ATTN_FIELD) == "auto"
+    declared = dict(sa._resolved_overrides)[plugin.PIN_RESOLUTION_SOURCE]
+    assert {pin.field for pin in plugin.FIELD_PINS} <= set(declared)
+    err = capsys.readouterr().err
+    for pin in plugin.FIELD_PINS:
+        assert f"[Foundry] pin: {pin.field}={pin.value!r}" in err, pin.field
+
+
+def test_field_pin_defaults_match_the_installed_sglang():
+    """FieldPin.default is what tells a user's contrary value from sglang's
+    default; red if sglang changes one of them."""
+    import dataclasses
+
+    defaults = {f.name: f.default for f in dataclasses.fields(ServerArgs)}
+    for pin in plugin.FIELD_PINS:
+        assert defaults[pin.field] == pin.default, pin.field
+    assert defaults[plugin.DSV4_ATTN_FIELD] == "auto"
+
+
+def test_pinned_value_given_explicitly_is_accepted(model_dir, plugin_hooks):
+    sa = _resolve(model_dir, disable_custom_all_reduce=True, enable_torch_symm_mem=True)
+    assert resolution_result(sa, "disable_custom_all_reduce") is True
+    assert resolution_result(sa, "enable_torch_symm_mem") is True
+
+
+def test_non_trtllm_dsv4_backend_is_kept(model_dir):
+    sa = _unresolved(model_dir, dsv4_attn_backend="flashmla")
+    plugin.pin_unreplayable_fields(sa)
+    assert resolution_result(sa, plugin.DSV4_ATTN_FIELD) == "flashmla"
+
+
+@pytest.mark.parametrize(
+    "fields, match",
+    [
+        (dict(enable_symm_mem=True), r"--enable-symm-mem=True: NCCL symmetric-memory windows"),
+        (dict(enable_nccl_nvls=True), r"--enable-nccl-nvls=True: NVLS multicast"),
+        (dict(enable_mscclpp=True), r"--enable-mscclpp=True: MSCCL\+\+"),
+        (dict(enable_two_batch_overlap=True), r"--enable-two-batch-overlap=True: the per-shape"),
+        (dict(enable_memory_saver=True), r"--enable-memory-saver=True: torch_memory_saver"),
+        (dict(dsv4_attn_backend="trtllm"), r"--dsv4-attn-backend=trtllm: the trtllm"),
+    ],
+)
+def test_explicit_contrary_flag_is_rejected(model_dir, fields, match):
+    with pytest.raises(ValueError, match=match):
+        plugin.pin_unreplayable_fields(_unresolved(model_dir, **fields))
+
+
+@pytest.mark.parametrize("field", ["enable_symm_mem", "enable_mscclpp"])
+def test_explicit_contrary_flag_is_rejected_by_resolution(model_dir, plugin_hooks, field):
+    with pytest.raises(ValueError, match=f"--{field.replace('_', '-')}=True"):
+        _resolve(model_dir, **{field: True})
+
+
+def test_later_step_that_undoes_a_strict_pin_is_rejected(model_dir):
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    sa = _unresolved(model_dir)
+    plugin.pin_unreplayable_fields(sa)
+    declare_resolution(sa, "some_model_override", enable_two_batch_overlap=True)
+    with pytest.raises(ValueError, match="set by some_model_override"):
+        plugin.validate_pinned_fields(sa)
+
+
+def test_torch_symm_mem_may_be_turned_off_by_sglang(model_dir, capsys):
+    """Deterministic inference turns torch symm-mem off (NCCL fallback, still
+    replayable): logged, not rejected."""
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    sa = _unresolved(model_dir)
+    plugin.pin_unreplayable_fields(sa)
+    declare_resolution(sa, "_handle_deterministic_inference", enable_torch_symm_mem=False)
+    plugin.validate_pinned_fields(sa)
+    assert "enable_torch_symm_mem=False (set by _handle_deterministic_inference)" in (
+        capsys.readouterr().err
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pinned environment variables
+# ---------------------------------------------------------------------------
+
+
+def test_launcher_hook_sets_every_env_pin(tmp_path, clean_pin_env, capsys):
+    """activate() is the launcher hook (load_plugins, before the server args
+    are built and before any engine process is spawned)."""
+    cfg = tmp_path / "foundry.toml"
+    cfg.write_text('mode = "save"\n')
+    fake_hooks = SimpleNamespace(install=lambda path: None)
+    with (
+        mock.patch.object(plugin, "_ACTIVATED", False),
+        mock.patch.object(plugin, "register_resolution_hooks"),
+        mock.patch.dict(sys.modules, {"foundry.integration.sglang.hooks": fake_hooks}),
+    ):
+        plugin.activate(str(cfg))
+    for pin in plugin.ENV_PINS:
+        assert os.environ.get(pin.name) == pin.value, pin.name
+    # NCCL_CUMEM_ENABLE waits for the resolved all-to-all backend.
+    assert plugin.NCCL_CUMEM_PIN.name not in os.environ
+    err = capsys.readouterr().err
+    for pin in plugin.ENV_PINS:
+        assert f"[Foundry] pin: {pin.name}={pin.value} (was unset)" in err, pin.name
+
+
+def test_env_pins_are_inherited_by_spawned_processes(clean_pin_env):
+    plugin.apply_env_pins()
+    names = [pin.name for pin in plugin.ENV_PINS]
+    result = _run_python(
+        f"""
+        import os
+        print(",".join(os.environ.get(n, "UNSET") for n in {names!r}))
+        """
+    )
+    assert result.stdout.strip().split(",") == [pin.value for pin in plugin.ENV_PINS]
+
+
+def test_env_pins_are_idempotent_and_quiet_in_descendants(clean_pin_env, capsys):
+    plugin.apply_env_pins()
+    capsys.readouterr()
+    plugin.apply_env_pins()  # a scheduler re-asserting the inherited values
+    assert "[Foundry] pin:" not in capsys.readouterr().err
+
+
+def test_env_pin_already_set_to_the_pinned_value_is_kept(clean_pin_env):
+    os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "false"
+    plugin.apply_env_pins()
+    assert os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] == "false"
+
+
+@pytest.mark.parametrize("pin", plugin.ENV_PINS, ids=lambda pin: pin.name)
+def test_explicit_contrary_env_is_rejected(clean_pin_env, pin):
+    os.environ[pin.name] = "1"
+    with pytest.raises(ValueError, match=f"{pin.name}='1' \\(Foundry needs 0\\)"):
+        plugin.apply_env_pins()
+
+
+def test_nccl_cumem_is_pinned_once_the_a2a_backend_is_known(clean_pin_env):
+    plugin.apply_env_pins(SimpleNamespace(moe_a2a_backend="deepep"))
+    assert os.environ[plugin.NCCL_CUMEM_PIN.name] == "0"
+
+
+def test_nccl_cumem_is_pinned_by_resolution(model_dir, plugin_hooks):
+    _resolve(model_dir)
+    assert os.environ[plugin.NCCL_CUMEM_PIN.name] == "0"
+
+
+def test_explicit_nccl_cumem_is_rejected(clean_pin_env):
+    os.environ[plugin.NCCL_CUMEM_PIN.name] = "1"
+    with pytest.raises(ValueError, match="NCCL_CUMEM_ENABLE='1'"):
+        plugin.apply_env_pins(SimpleNamespace(moe_a2a_backend="none"))
+
+
+def test_nccl_cumem_is_left_to_sglang_for_deepep_v2(clean_pin_env):
+    """DeepEP v2's NCCL windows need cuMem; sglang sets it to 1 for deepep_v2."""
+    os.environ[plugin.NCCL_CUMEM_PIN.name] = "1"
+    plugin.apply_env_pins(SimpleNamespace(moe_a2a_backend="deepep_v2"))
+    assert os.environ[plugin.NCCL_CUMEM_PIN.name] == "1"
 
 
 # ---------------------------------------------------------------------------

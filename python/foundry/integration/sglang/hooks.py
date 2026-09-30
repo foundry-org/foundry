@@ -372,14 +372,12 @@ def _patch_cuda_graph_capture() -> None:
         full_cuda_graph_backend as fcgb,
     )
     from sglang.srt.model_executor.runner_utils.pool import (
-        disable_graph_pool_borrow,
         graph_pool_capture_scope,
     )
 
-    # Foundry manages graph storage at the driver level; borrowing free pool
-    # extents (SGLANG_ENABLE_GRAPH_POOL_BORROW, default off) would hand out VA
-    # ranges that restored graphs reference. Keep it off in foundry modes.
-    disable_graph_pool_borrow("foundry graph save/load manages graph storage")
+    # Graph-pool borrow / precarve, the metadata glue graph and the
+    # memory-saver graph context are pinned off by the plugin's environment
+    # pins (plugin.ENV_PINS), applied before this process started.
 
     backend_cls = fcgb.FullCudaGraphBackend
     runner_cls = dcgr.DecodeCudaGraphRunner
@@ -712,8 +710,9 @@ def _patch_spawn_sites() -> None:
             @functools.wraps(orig_launch)
             def patched_launch(cls, *args, **kwargs):
                 if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-                    _check_resolved_graph_config(args[0] if args else kwargs.get("server_args"))
-                    rt.setup_ld_preload_env()
+                    server_args = args[0] if args else kwargs.get("server_args")
+                    _check_resolved_graph_config(server_args)
+                    rt.setup_ld_preload_env(server_args)
                 return orig_launch(cls, *args, **kwargs)
 
             engine_cls._launch_scheduler_processes = classmethod(patched_launch)
@@ -723,8 +722,9 @@ def _patch_spawn_sites() -> None:
             @functools.wraps(orig_method)
             def patched_method(self, *args, **kwargs):
                 if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-                    _check_resolved_graph_config(args[0] if args else kwargs.get("server_args"))
-                    rt.setup_ld_preload_env()
+                    server_args = args[0] if args else kwargs.get("server_args")
+                    _check_resolved_graph_config(server_args)
+                    rt.setup_ld_preload_env(server_args)
                 return orig_method(self, *args, **kwargs)
 
             engine_cls._launch_scheduler_processes = patched_method

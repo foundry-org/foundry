@@ -418,7 +418,12 @@ def log_alloc_offset(label: str) -> None:
     )
 
 
-def setup_ld_preload_env() -> None:
+def setup_ld_preload_env(server_args=None) -> None:
+    """Spawn sites (launcher before the schedulers, DP controller before its
+    TP groups): LD_PRELOAD for the children, and the plugin's environment
+    pins re-asserted (``plugin.apply_env_pins``; with ``server_args`` also
+    the all-to-all-dependent ``NCCL_CUMEM_ENABLE``) so every child inherits
+    them whichever route loaded Foundry."""
     current = os.environ.get("LD_PRELOAD", "")
     # Prepend, never overwrite: the launcher's own LD_PRELOAD entries stay.
     for path in (get_hook_library_path(), get_nvshmem_host_path(), get_verbs_udev_wait_shim_path()):
@@ -429,12 +434,7 @@ def setup_ld_preload_env() -> None:
     mode = get_graph_extension_mode()
     if mode != CUDAGraphExtensionMode.NONE:
         os.environ["FOUNDRY_MODE"] = mode.value
-        # NCCL registers user buffers of graph-captured collectives (above a
-        # size threshold) and the kernels then read peers' remote addresses
-        # from an array NCCL fills on the host at capture time. A restored
-        # graph replays those kernels without the registration, so the array
-        # holds garbage at LOAD (illegal address in the DP-attention all-gather
-        # at bs>=4 with NCCL 2.30). Keep every size on the unregistered path.
-        os.environ.setdefault("NCCL_GRAPH_REGISTER", "0")
-        os.environ.setdefault("NCCL_LOCAL_REGISTER", "0")
+        from foundry.integration.sglang.plugin import apply_env_pins
+
+        apply_env_pins(server_args)
     os.environ["FOUNDRY_SPAWN_T0_NS"] = str(time.perf_counter_ns())

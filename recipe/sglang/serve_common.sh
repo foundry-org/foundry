@@ -129,6 +129,20 @@ foundry_serve() {
   return "$rc"
 }
 
+# ---- Baseline parity with the plugin's pins ------------------------------------------------------------------------
+# On --save / --load the Foundry plugin pins every config that selects state it cannot replay (custom all-reduce off,
+# torch symm-mem all-reduce on, NCCL buffer registration / cuMem / NVLS off, the DeepGEMM precompile sweep off, ...;
+# table in docs/sglang/overview.md "What the plugin pins and why"), so no script passes them. A baseline or --warm run
+# has no plugin: foundry_baseline_pins (after foundry_select) gives it the pinned values that change what it runs, so
+# it captures the same graph set and warms the same kernels as SAVE. The NCCL cuMem / NVLS pins are sglang's own
+# defaults when the variables are unset, and buffer registration does not change what a baseline computes.
+foundry_baseline_pins() {  # sets FOUNDRY_BASELINE_ARGS (empty with Foundry selected)
+  FOUNDRY_BASELINE_ARGS=""
+  [[ -n "${FOUNDRY_GRAPH_EXTENSION_CONFIG:-}" ]] && return 0
+  FOUNDRY_BASELINE_ARGS="--disable-custom-all-reduce --enable-torch-symm-mem"
+  export SGLANG_JIT_DEEPGEMM_PRECOMPILE="${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-0}"
+}
+
 EP_ATTN="${EP_ATTN-"--attention-backend fa3"}"
 EP_CHUNK="${EP_CHUNK:-256}"
 EP_A2A="${EP_A2A-"--moe-a2a-backend deepep --deepep-mode low_latency --moe-runner-backend deep_gemm"}"
@@ -140,22 +154,22 @@ topology_args() {  # $1 cfg -> sets N, ARGS, GRAPHS
   case "$cfg" in
     single)        N=1; ARGS="--tp-size 1" ;;
     dp2|dp4|dp8)   N=${cfg#dp}; ARGS="--tp-size 1 --dp-size $N" ;;
-    tp2|tp4|tp8)   N=${cfg#tp}; ARGS="--tp-size $N --disable-custom-all-reduce --enable-torch-symm-mem" ;;
+    tp2|tp4|tp8)   N=${cfg#tp}; ARGS="--tp-size $N" ;;
     ep2|ep4|ep8)   N=${cfg#ep}
-      # The DP-attention gather is an all-reduce over the TP group: route it through torch symm-mem like the tp
-      # rows (uniform collective path across topologies).
-      ARGS="--tp-size $N --dp-size $N --ep-size $N --enable-dp-attention $EP_A2A --enable-torch-symm-mem
-            --disable-custom-all-reduce --chunked-prefill-size $EP_CHUNK $EP_ATTN --max-running-requests $(( 256 * N ))"
+      # The DP-attention gather is an all-reduce over the TP group; like the tp rows it runs on torch symm-mem
+      # (pinned by the plugin, see foundry_baseline_pins).
+      ARGS="--tp-size $N --dp-size $N --ep-size $N --enable-dp-attention $EP_A2A
+            --chunked-prefill-size $EP_CHUNK $EP_ATTN --max-running-requests $(( 256 * N ))"
       export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512 NVSHMEM_QP_DEPTH=2048 ;;
     tpep2|tpep4|tpep8) N=${cfg#tpep}
-      ARGS="--tp-size $N --ep-size $N --enable-torch-symm-mem $EP_A2A --disable-custom-all-reduce
+      ARGS="--tp-size $N --ep-size $N $EP_A2A
             --chunked-prefill-size $EP_CHUNK $EP_ATTN --max-running-requests $(( 256 * N ))"
       GRAPHS="--cuda-graph-max-bs-decode $(( maxbs * N )) --cuda-graph-bs-decode $(seq -s' ' $N $N $(( maxbs * N )))
               --disable-cuda-graph-padding --cuda-graph-backend-prefill disabled"
       export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512 NVSHMEM_QP_DEPTH=2048 ;;
     tp2ep4|tp2ep8|tp4ep8) local atp=${cfg%%ep*}; atp=${atp#tp}; N=${cfg##*ep}
-      ARGS="--tp-size $N --dp-size $(( N / atp )) --ep-size $N --enable-dp-attention $EP_A2A --enable-torch-symm-mem
-            --disable-custom-all-reduce --chunked-prefill-size $EP_CHUNK $EP_ATTN --max-running-requests $(( 256 * N ))"
+      ARGS="--tp-size $N --dp-size $(( N / atp )) --ep-size $N --enable-dp-attention $EP_A2A
+            --chunked-prefill-size $EP_CHUNK $EP_ATTN --max-running-requests $(( 256 * N ))"
       GRAPHS="--cuda-graph-max-bs-decode $(( maxbs * atp )) --cuda-graph-bs-decode $(seq -s' ' $atp $atp $(( maxbs * atp )))
               --disable-cuda-graph-padding --cuda-graph-backend-prefill disabled"
       export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512 NVSHMEM_QP_DEPTH=2048 ;;
@@ -191,12 +205,7 @@ serve_main() {
     *)      echo "Usage: $0 <cfg> [--save|--load|--warm]"; exit 1 ;;
   esac
   foundry_select "$mode"
-
-  # Identical on baseline, SAVE and LOAD so the captured graphs match:
-  # - NCCL_CUMEM_ENABLE=0 / NCCL_NVLS_ENABLE=0: NCCL buffers through the plain allocator (deterministic VMM offsets)
-  # - SGLANG_JIT_DEEPGEMM_PRECOMPILE=0: the rank-0-only DeepGEMM precompile warmup would put ~14 GB of scratch into
-  #   rank 0's deterministic range; kernels still JIT lazily per shape.
-  export NCCL_CUMEM_ENABLE=0 NCCL_NVLS_ENABLE=0 SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
+  foundry_baseline_pins
   [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] && export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $(( N - 1 )))
 
   echo "model=$MODEL_PATH cfg=$cfg gpus=$CUDA_VISIBLE_DEVICES mem_fraction_static=$memfrac"
@@ -207,6 +216,6 @@ serve_main() {
       --host 0.0.0.0 --port "${PORT:-12000}" \
       --disable-radix-cache \
       --mem-fraction-static "$memfrac" \
-      $ARGS $GRAPHS $MODEL_EXTRA \
+      $ARGS $GRAPHS $MODEL_EXTRA $FOUNDRY_BASELINE_ARGS \
       ${SGL_EXTRA_ARGS:-}
 }

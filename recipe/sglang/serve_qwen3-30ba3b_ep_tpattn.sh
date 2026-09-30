@@ -31,13 +31,9 @@ MEM_FRACTION_STATIC=0.8
 
 if [[ "$2" == "--save" ]]; then
     FOUNDRY_TOML="${SCRIPT_DIR}/foundry_save.toml"
-    export NCCL_CUMEM_ENABLE=0
-    export NCCL_NVLS_ENABLE=0
     echo "Using foundry SAVE: ${FOUNDRY_TOML}"
 elif [[ "$2" == "--load" ]]; then
     FOUNDRY_TOML="${SCRIPT_DIR}/foundry_load.toml"
-    export NCCL_CUMEM_ENABLE=0
-    export NCCL_NVLS_ENABLE=0
     echo "Using foundry LOAD: ${FOUNDRY_TOML}"
 elif [[ -n "$2" ]]; then
     echo "Usage: $0 <ep_size> [--save|--load]"
@@ -48,6 +44,7 @@ fi
 
 # --save/--load: export FOUNDRY_GRAPH_EXTENSION_CONFIG="$FOUNDRY_TOML" after the preflight; baseline: unset it.
 foundry_select "$2" "${FOUNDRY_TOML:-}"
+foundry_baseline_pins   # baseline only: the plugin's collective pins (custom AR off, torch symm-mem on), see serve_common.sh
 
 # LD_PRELOAD of libcuda_hook.so AND DeepEP's libnvshmem_host.so are set by
 # foundry's setup_ld_preload_env at worker spawn time — both paths auto-detected
@@ -68,15 +65,14 @@ foundry_serve "$2" sglang serve \
     --host "$HOST" --port "$PORT" \
     --tp-size "$EP_SIZE" \
     --ep-size "$EP_SIZE" \
-    --enable-torch-symm-mem \
     --cuda-graph-backend-prefill disabled \
     --moe-a2a-backend deepep \
     --deepep-mode low_latency \
     --moe-runner-backend deep_gemm \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --disable-radix-cache \
-    --disable-custom-all-reduce \
     --chunked-prefill-size 256 \
     --attention-backend fa3 \
     --cuda-graph-max-bs-decode 128 \
+    $FOUNDRY_BASELINE_ARGS \
     ${SGL_EXTRA_ARGS:-}

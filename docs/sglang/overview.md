@@ -9,8 +9,8 @@ Foundry runs as an **SGLang plugin**: `pip install -e foundry` registers the ent
 | Mode | Status | Notes |
 |---|:---:|---|
 | Single GPU | ✅ | Qwen3-1.7B / 4B / 14B |
-| Data parallel (DP) | ✅ | One full replica per rank; validated DP=2. Requires the per-rank device binding (below) and `NCCL_CUMEM_ENABLE=0` / `NCCL_NVLS_ENABLE=0`. |
-| Tensor parallel (TP) | ✅ | torch symmetric-memory allreduce inside the decode graphs (`--enable-torch-symm-mem --disable-custom-all-reduce`); validated TP=2 (Qwen3-1.7B, Qwen3-32B) and TP=4 (Qwen3-32B). Without multicast (no IMEX channels) LOAD needs the optional sglang branch `symm-mem-no-multicast-fallback` (two-shot instead of disabling the communicator). |
+| Data parallel (DP) | ✅ | One full replica per rank; validated DP=2. Requires the per-rank device binding (below); `NCCL_CUMEM_ENABLE=0` / `NCCL_NVLS_ENABLE=0` are pinned by the plugin. |
+| Tensor parallel (TP) | ✅ | torch symmetric-memory allreduce inside the decode graphs (`--enable-torch-symm-mem --disable-custom-all-reduce`, pinned by the plugin); validated TP=2 (Qwen3-1.7B, Qwen3-32B) and TP=4 (Qwen3-32B). Without multicast (no IMEX channels) LOAD needs the optional sglang branch `symm-mem-no-multicast-fallback` (two-shot instead of disabling the communicator). |
 | Expert parallel (DeepEP) | ✅ | DP attention + DeepEP low-latency, TP attention + EP, and attention-TP inside DP groups + EP; DeepEP v2. Validated up to EP8 (Qwen3.5-122B/397B, DeepSeek-V4-Flash, GLM, Inkling; see `recipe/sglang/README.md` **Validation**). See **Expert parallel** below. |
 
 **Expert parallel (DeepEP).** The default EP recipe runs DP-attention + DeepEP for the
@@ -18,8 +18,8 @@ MoE all-to-all (NVSHMEM, foundry-compatible); TP attention + EP (`serve_qwen3-30
 the `tpepN` / `tpAepN` topologies of `serve_common.sh`) routes the attention all-reduce
 through torch symmetric memory. The serve script is `recipe/sglang/serve_qwen3-30ba3b_ep.sh
 <ep_size> [--save|--load]` with: `--enable-dp-attention --moe-a2a-backend deepep
---deepep-mode low_latency --moe-runner-backend deep_gemm --attention-backend fa3
---disable-custom-all-reduce`. The EP kernels (`sgl-deep-ep`, `sgl-deep-gemm`, fa3 inside
+--deepep-mode low_latency --moe-runner-backend deep_gemm --attention-backend fa3`
+(custom all-reduce off and torch symm-mem on come from the plugin's pins). The EP kernels (`sgl-deep-ep`, `sgl-deep-gemm`, fa3 inside
 `sglang-kernel`) come as wheels with the sglang install. `fa3` is used because the
 flashinfer ragged-prefill path has an off-by-one (`q.shape != qo_indptr`) under this
 config. DeepEP low-latency caps dispatch at
@@ -39,6 +39,56 @@ the hook explicitly calls `set_device(self.gpu_id)` before reserving the region 
 otherwise rank > 0 reserves on `cuda:0` and faults. See [`hooks.md`](hooks.md) (patch 1).
 The DP serve script lives at `recipe/sglang/serve_qwen3-1.7b_dp.sh`
 (`<dp_size> [--save|--load]`); pick GPUs with `CUDA_VISIBLE_DEVICES`.
+
+## What the plugin pins and why
+
+Foundry's rule: state that cannot be made static across processes is not supported; Foundry uses the cuMem-backed
+alternatives instead. A graph restored on LOAD replays only what was recorded inside the capture region. A buffer
+registration, IPC handle exchange or pool carve-out made outside it (when `graph_capture()` exits, at first use
+inside the forward, by a second graph or allocator) does not exist in the LOAD process, and the restored kernels read
+addresses nobody set up. Every such feature that a flag or an environment variable can switch off is therefore a
+config the plugin sets, not a recipe requirement:
+
+- each pin prints one `[Foundry] pin: <name>=<value> (<sglang default | as given | overrides sglang default X |
+  was unset | already set>): <reason>` line;
+- a value set explicitly to the contrary (a flag on the command line, a variable in the launcher's environment)
+  stops the launch with that pin's reason, so a pin never overrides a user's choice silently;
+- a later sglang resolution step (model override, platform fallback) that turns a strict pin back is rejected,
+  naming the step, instead of being re-pinned after other fields were derived from it.
+
+Flags are declared by the plugin's resolution hook on `apply_inkling_prefill_cuda_graph_default` (before the CUDA-graph,
+platform and memory steps read them) and re-checked on `handle_other_validations`. Environment variables are set in
+the launcher's `activate()` (before the server args are built and before any engine process is spawned: spawned
+processes inherit `os.environ`, and sglang reads some of them once at import time), re-asserted at the top of every
+scheduler process and at each spawn site (`setup_ld_preload_env`). `NCCL_CUMEM_ENABLE` depends on the all-to-all
+backend and is pinned by the `handle_other_validations` hook, once `--moe-a2a-backend` is resolved.
+
+| Pinned | Value | Why | Error when |
+|---|---|---|---|
+| `--disable-custom-all-reduce` (sglang default off; covers custom all-reduce v1 and v2, `SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2` only picks the class) | on | custom all-reduce registers the graphs' buffers over CUDA IPC when `graph_capture()` exits, outside the recorded region | never (the contrary value is sglang's default) |
+| `--enable-torch-symm-mem` | on | the in-graph all-reduce runs on torch symmetric memory, a cuMem buffer Foundry places at the same address on SAVE and LOAD; sglang may turn it off (deterministic inference), then the all-reduce is NCCL, which replays | never |
+| `--enable-symm-mem` (NCCL windows) | off | registered at first use inside the forward; needs NCCL's cuMem buffers | set on the command line |
+| `--enable-nccl-nvls` | off | NVLS multicast buffers registered at first use inside the forward | set on the command line |
+| `--enable-mscclpp` | off | MSCCL++ registers its buffers at first use inside the forward | set on the command line |
+| `--enable-two-batch-overlap` | off | the per-shape micro-batch metadata is built only by the capture loop, which LOAD does not run | set on the command line |
+| `--enable-memory-saver` | off | torch_memory_saver owns the pools (and, with `SGLANG_MEMORY_SAVER_CUDA_GRAPH`, the graph memory) outside Foundry's region | set on the command line |
+| `--dsv4-attn-backend` | `auto` (resolves to `flashmla`), or the user's `flashmla` | the `trtllm` variant asserts at its first call, which falls inside the capture, and needs an eager bootstrap Foundry does not run | `trtllm` |
+| `NCCL_GRAPH_REGISTER`, `NCCL_LOCAL_REGISTER` | `0` | NCCL registers the buffers of graph-captured collectives on the host at capture time; a restored graph replays the kernels without the registration (illegal address in the DP-attention all-gather at bs >= 4 with NCCL 2.30) | set to anything but 0 |
+| `NCCL_CUMEM_ENABLE` | `0`, except with `--moe-a2a-backend deepep_v2` (left to sglang, which sets 1: v2's NCCL windows need cuMem) | NCCL's cuMem buffers are mapped with driver flags Foundry's VMM region does not carry; the plain allocator keeps them at deterministic offsets | set to anything but 0 (not with deepep_v2) |
+| `NCCL_NVLS_ENABLE` | `0` | NVLS multicast buffers: same mapping and registration problem | set to anything but 0 |
+| `SGLANG_JIT_DEEPGEMM_PRECOMPILE` | `0` | the precompile sweep runs on the first rank inside the first capture: a device synchronization, and scratch only SAVE allocates; kernels still JIT per shape | set to true |
+| `SGLANG_MEMORY_SAVER_CUDA_GRAPH` | `0` | the memory-saver graph context owns the graph memory outside Foundry's region | set to true |
+| `SGLANG_ENABLE_METADATA_GLUE_GRAPH` | `0` | the attention-metadata prep is captured into a second graph Foundry does not save | set to true |
+| `SGLANG_ENABLE_GRAPH_POOL_PRECARVE` | `0` | the graph pool is carved from a span measured on SAVE's eager warmup, which LOAD does not run | set to true |
+| `SGLANG_ENABLE_GRAPH_POOL_BORROW` | `0` | eager allocations would borrow free graph-pool extents whose addresses the restored graphs reference | set to true |
+
+Rejected instead, because Foundry has no logic for them: speculative decoding, LoRA, PD multiplexing, elastic-EP
+recapture, attention graph variants, non-full graph backends, `--disable-cuda-graph`, CUDA-graph profiling,
+`SGLANG_ENABLE_POST_CAPTURE_KV_SIZING`. Profiling and FlashInfer autotune are pinned off with the graph backends.
+
+Still documented requirements (a flag cannot express them): dense no-padding decode capture with an explicit
+batch-size list, DeepEP low-latency on EP rows, JIT caches warm before SAVE, pinned hybrid state pools, and identical
+flags and environment on SAVE and LOAD (see `recipe/sglang/README.md`).
 
 ## How to use
 
