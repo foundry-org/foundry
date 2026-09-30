@@ -26,6 +26,7 @@ from foundry.integration.sglang.config import (
     get_graph_extension_mode,
     get_hook_library_path,
     get_nvshmem_host_path,
+    get_verbs_udev_wait_shim_path,
 )
 from foundry.integration.sglang.nvtx import nvtx_traced
 
@@ -52,6 +53,13 @@ class CUDAGraphExtensionState:
     capture_index: int = 0
     rank: int = 0
     loaded_graphs: dict = field(default_factory=dict)
+    # Set by the first runner capture (prefill when prefill graphs are on,
+    # decode otherwise): the pre-capture bootstraps and the layout start run
+    # there once, and LOAD's preallocation right after them.
+    layout_started: bool = False
+    preallocated: bool = False
+    # Whether this process restored (LOAD) prefill graphs.
+    prefill_graphs_restored: bool = False
 
 
 _state: CUDAGraphExtensionState | None = None
@@ -385,7 +393,8 @@ def log_alloc_offset(label: str) -> None:
 
 def setup_ld_preload_env() -> None:
     current = os.environ.get("LD_PRELOAD", "")
-    for path in (get_hook_library_path(), get_nvshmem_host_path()):
+    # Prepend, never overwrite: the launcher's own LD_PRELOAD entries stay.
+    for path in (get_hook_library_path(), get_nvshmem_host_path(), get_verbs_udev_wait_shim_path()):
         if path and path not in current:
             current = f"{path}:{current}" if current else path
     if current:

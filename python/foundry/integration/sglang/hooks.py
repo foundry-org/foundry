@@ -5,9 +5,9 @@
 Targets the runner architecture introduced after sglang 0.5.16: cuda-graph
 capture lives in per-phase runners (DecodeCudaGraphRunner) that delegate the
 actual graph create/capture/replay to a pluggable backend
-(FullCudaGraphBackend). Foundry only supports the `full` decode backend;
-the activation shim in sglang (foundry_shim.apply_server_args) forces
-decode=full / prefill=disabled.
+(FullCudaGraphBackend). Foundry only supports the `full` backend: sglang's
+handle_graph_extension forces decode=full and keeps prefill disabled unless
+full is requested explicitly (PrefillCudaGraphRunner, captured before decode).
 
 Kernel warmup no longer needs a patch: BaseRunner.warmup() runs no model
 forwards (workspace prealloc + autotune, which foundry disables) and executes
@@ -264,6 +264,9 @@ def _patch_cuda_graph_capture() -> None:
     from sglang.srt.model_executor.runner import (
         decode_cuda_graph_runner as dcgr,
     )
+    from sglang.srt.model_executor.runner import (
+        prefill_cuda_graph_runner as pcgr,
+    )
     from sglang.srt.model_executor.runner_backend import (
         full_cuda_graph_backend as fcgb,
     )
@@ -280,14 +283,103 @@ def _patch_cuda_graph_capture() -> None:
 
     backend_cls = fcgb.FullCudaGraphBackend
     runner_cls = dcgr.DecodeCudaGraphRunner
+    prefill_runner_cls = pcgr.PrefillCudaGraphRunner
     orig_capture_one = backend_cls.capture_one
     orig_capture = runner_cls.capture
+    orig_prefill_capture = prefill_runner_cls.capture
+
+    def begin_graph_layout(runner, mode) -> None:
+        """Pre-capture bootstraps + layout start, once per process, at the
+        first runner capture: the prefill runner's when prefill graphs are on
+        (sglang captures prefill before decode), the decode runner's
+        otherwise. Same sequence point on SAVE and LOAD."""
+        state = rt.get_state()
+        if state is None:
+            raise RuntimeError("Foundry SGLang state is not initialized")
+        if state.layout_started:
+            return
+
+        # Pre-capture bootstraps. Everything sglang initializes lazily on the
+        # first eager forward that a capturing stream rejects, or that must
+        # exist at the same addresses on both modes, is done here, at the same
+        # sequence point on SAVE and LOAD; no model forward runs.
+        from foundry.integration.sglang.graph_ops import (
+            bootstrap_collective_connections,
+            bootstrap_deepep_buffer,
+            bootstrap_lazy_runtimes,
+            bootstrap_logits_gatherer,
+        )
+
+        # 1. NCCL communicators (both modes): their first collective allocates
+        #    and connects, which capture rejects.
+        rt.log_alloc_offset("before_collective_bootstrap")
+        bootstrap_collective_connections()
+        rt.log_alloc_offset("after_collective_bootstrap")
+        # 2. The logits all-gather's symmetric-memory state (both modes): built
+        #    on a host with multicast by any eager forward before capture, and
+        #    invisible to the hook (torch symmetric memory is not cudaMalloc).
+        rt.log_alloc_offset("before_logits_gatherer")
+        bootstrap_logits_gatherer(runner)
+        rt.log_alloc_offset("after_logits_gatherer")
+        # 3. The DeepEP buffer (both modes, DeepEP-family backends): NVSHMEM
+        #    runtime + symmetric heap, otherwise created inside the first
+        #    captured forward, where deep_ep_cpp.Buffer(...) aborts.
+        if _ep_lazy_init_needed():
+            rt.log_alloc_offset("before_deepep_bootstrap")
+            bootstrap_deepep_buffer(runner)
+            rt.log_alloc_offset("after_deepep_bootstrap")
+        # 4. SAVE only, every model: the two one-time runtime initializations
+        #    capture rejects (inductor's lazy init, DeepGEMM's runtime init),
+        #    with the allocation region suspended so their transient tensors
+        #    never move the deterministic cursor. The model's own compiles and
+        #    JIT kernel loads then happen inside the captured forward.
+        if mode == CUDAGraphExtensionMode.SAVE:
+            with rt.allocation_region_suspended():
+                bootstrap_lazy_runtimes()
+            rt.log_alloc_offset("after_lazy_runtimes")
+
+        # The deterministic layout begins here on both modes: same sequence
+        # point, same (empty) caching-allocator state; LOAD's
+        # preallocate_for_load_mode maps and replays from this point.
+        rt.mark_layout_start()
+        state.layout_started = True
+
+    def preallocate_once() -> None:
+        """LOAD: map the recorded layout once, at the first runner capture
+        that restores graphs (it spans both phases' graph memory)."""
+        state = rt.get_state()
+        if state.preallocated:
+            return
+        rt.log_alloc_offset("before_preallocate")
+        rt.preallocate_for_load_mode()
+        rt.log_alloc_offset("after_preallocate")
+        state.preallocated = True
+
+    def prefill_req_slots(backend) -> int | None:
+        """The prefill runner's fixed request-slot count when ``backend`` is
+        that runner's, None for the decode runner's."""
+        runner = backend._cuda_graph_runner
+        if isinstance(runner, prefill_runner_cls):
+            return runner._capture_req_slots
+        return None
 
     @functools.wraps(orig_capture_one)
     def patched_capture_one(
         self, shape_key, forward_fn, capture_inputs=None, post_warmup_hook=None
     ):
         mode = get_graph_extension_mode()
+        req_slots = prefill_req_slots(self) if mode != CUDAGraphExtensionMode.NONE else None
+        if mode == CUDAGraphExtensionMode.LOAD and req_slots is not None:
+            # LOAD, prefill: the upstream capture loop runs (see
+            # patched_prefill_capture) and only the capture is replaced, by the
+            # archived graph for this shape; its allocator events replay here,
+            # at the point SAVE captured it.
+            from foundry.integration.sglang.graph_ops import restore_next_prefill_graph
+
+            graph, out = restore_next_prefill_graph(shape_key, req_slots)
+            self._graphs[shape_key] = graph
+            self._outputs[shape_key] = out
+            return
         if mode != CUDAGraphExtensionMode.SAVE:
             return orig_capture_one(
                 self,
@@ -314,7 +406,56 @@ def _patch_cuda_graph_capture() -> None:
             out = capture_graph(graph, self._pool, self._capture_stream, forward_fn)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
-        save_graph(graph, out, shape_key)
+        save_graph(graph, out, shape_key, prefill_req_slots=req_slots)
+
+    @functools.wraps(orig_prefill_capture)
+    def patched_prefill_capture(self):
+        mode = get_graph_extension_mode()
+        if mode == CUDAGraphExtensionMode.NONE:
+            return orig_prefill_capture(self)
+        if not self._is_full_backend:
+            raise RuntimeError(
+                "[Foundry] prefill CUDA graphs are persisted for the full backend only, got "
+                f"{self.prefill_backend_name!r}: use --cuda-graph-backend-prefill full or disabled"
+            )
+        from sglang.srt.runtime_context import get_flags
+
+        from foundry.integration.sglang.graph_ops import (
+            finish_prefill_graph_restore,
+            save_prefill_graph_state,
+            start_prefill_graph_restore,
+        )
+
+        begin_graph_layout(self, mode)
+        dp_flags = get_flags().dp
+        if mode == CUDAGraphExtensionMode.LOAD:
+            preallocate_once()
+            record = start_prefill_graph_restore()
+            # Latched by the DP gather helpers inside SAVE's captured forwards,
+            # which LOAD does not run; replay reads it
+            # (prefill_graph_tolerates_sum_len) to pick the DP padding mode.
+            # Set before capture() so its log line matches SAVE's.
+            if record.get("prefill_graph_has_dp_gather"):
+                dp_flags.prefill_graph_has_dp_gather = True
+            rt.log_alloc_offset("before_prefill_restore")
+            # Unlike decode, LOAD runs the upstream capture loop itself: its
+            # eager work around each capture (dummy batches, the attention
+            # metadata planned per shape, the chunked-prefix buffers, the
+            # capture session's pool) then allocates exactly as on SAVE, and
+            # patched_capture_one restores each graph where SAVE captured it.
+            result = orig_prefill_capture(self)
+            finish_prefill_graph_restore()
+            rt.log_alloc_offset("after_prefill_restore")
+            return result
+
+        rt.log_alloc_offset("save_before_prefill_capture")
+        result = orig_prefill_capture(self)
+        rt.log_alloc_offset("save_after_prefill_capture")
+        save_prefill_graph_state(
+            req_slots=self._capture_req_slots,
+            has_dp_gather=bool(dp_flags.prefill_graph_has_dp_gather),
+        )
+        return result
 
     @functools.wraps(orig_capture)
     def patched(self):
@@ -322,61 +463,26 @@ def _patch_cuda_graph_capture() -> None:
         if mode == CUDAGraphExtensionMode.NONE:
             return orig_capture(self)
 
-        # Pre-capture bootstraps. Everything sglang initializes lazily on the
-        # first eager forward that a capturing stream rejects, or that must
-        # exist at the same addresses on both modes, is done here, at the same
-        # sequence point on SAVE and LOAD; no model forward runs.
-        from foundry.integration.sglang.graph_ops import (
-            bootstrap_collective_connections,
-            bootstrap_deepep_buffer,
-            bootstrap_lazy_runtimes,
-            bootstrap_logits_gatherer,
-        )
-
-        # 1. NCCL communicators (both modes): their first collective allocates
-        #    and connects, which capture rejects.
-        rt.log_alloc_offset("before_collective_bootstrap")
-        bootstrap_collective_connections()
-        rt.log_alloc_offset("after_collective_bootstrap")
-        # 2. The logits all-gather's symmetric-memory state (both modes): built
-        #    on a host with multicast by any eager forward before capture, and
-        #    invisible to the hook (torch symmetric memory is not cudaMalloc).
-        rt.log_alloc_offset("before_logits_gatherer")
-        bootstrap_logits_gatherer(self)
-        rt.log_alloc_offset("after_logits_gatherer")
-        # 3. The DeepEP buffer (both modes, DeepEP-family backends): NVSHMEM
-        #    runtime + symmetric heap, otherwise created inside the first
-        #    captured forward, where deep_ep_cpp.Buffer(...) aborts.
-        if _ep_lazy_init_needed():
-            rt.log_alloc_offset("before_deepep_bootstrap")
-            bootstrap_deepep_buffer(self)
-            rt.log_alloc_offset("after_deepep_bootstrap")
-        # 4. SAVE only, every model: the two one-time runtime initializations
-        #    capture rejects (inductor's lazy init, DeepGEMM's runtime init),
-        #    with the allocation region suspended so their transient tensors
-        #    never move the deterministic cursor. The model's own compiles and
-        #    JIT kernel loads then happen inside the captured forward.
-        if mode == CUDAGraphExtensionMode.SAVE:
-            with rt.allocation_region_suspended():
-                bootstrap_lazy_runtimes()
-            rt.log_alloc_offset("after_lazy_runtimes")
-
-        # The deterministic layout begins here on both modes: same sequence
-        # point, same (empty) caching-allocator state; LOAD's
-        # preallocate_for_load_mode below maps and replays from this point.
-        rt.mark_layout_start()
+        # No-op when the prefill runner captured first.
+        begin_graph_layout(self, mode)
 
         if mode == CUDAGraphExtensionMode.LOAD:
             import torch
 
             from foundry.integration.sglang.graph_ops import (
+                has_prefill_graphs,
                 initialize_all_attention_metadata,
                 load_all_graphs,
             )
 
             state = rt.get_state()
-            if state is None:
-                raise RuntimeError("Foundry SGLang state is not initialized")
+            if has_prefill_graphs() and not state.prefill_graphs_restored:
+                # SAVE's layout includes the prefill runner and its graphs;
+                # without them every later address would be off.
+                raise RuntimeError(
+                    "Foundry archive holds prefill graphs but this LOAD runs without them: "
+                    "pass the same --cuda-graph-backend-prefill as SAVE"
+                )
 
             # Kernel warmup normally runs at the top of orig capture(); it is
             # a no-op here when EagerRunner already ran it, but keep the call
@@ -391,9 +497,8 @@ def _patch_cuda_graph_capture() -> None:
                 backend._pool = get_or_create_global_graph_memory_pool(self.device_module)
             set_graph_pool_id(backend._pool)
 
-            rt.log_alloc_offset("before_preallocate")
-            rt.preallocate_for_load_mode()
-            rt.log_alloc_offset("after_preallocate")
+            # Already done at the prefill capture when prefill graphs are on.
+            preallocate_once()
 
             # Mirror capture()'s buffer seeding so the metadata pre-pass plans
             # against the same values on both modes.
@@ -541,7 +646,33 @@ def _patch_cuda_graph_capture() -> None:
 
     backend_cls.capture_one = patched_capture_one
     runner_cls.capture = patched
+    prefill_runner_cls.capture = patched_prefill_capture
     runner_cls._resolve_shared_read_ends = patched_resolve_ends
+
+    if os.environ.get("FOUNDRY_SGLANG_CAPTURE_TRACE") == "1":
+        # Diagnostic: log every shape the SAVE capture loop asks sglang for,
+        # and which one fails. sglang's per-shape metadata sizing runs inside
+        # capture_one_shape before any foundry code for that shape, so a
+        # failure there is state carried over from earlier shapes.
+        orig_capture_one_shape = runner_cls.capture_one_shape
+
+        @functools.wraps(orig_capture_one_shape)
+        def traced_capture_one_shape(self, size, forward, *args, **kwargs):
+            width = getattr(self, "captured_req_width", 1)
+            logger.info(
+                "[Foundry] capture shape size=%d num_tokens=%d ragged=%s max_bs=%s",
+                size,
+                size * width,
+                getattr(self, "ragged_verify_mode", None),
+                getattr(self, "max_bs", None),
+            )
+            try:
+                return orig_capture_one_shape(self, size, forward, *args, **kwargs)
+            except Exception:
+                logger.error("[Foundry] capture shape size=%d FAILED", size)
+                raise
+
+        runner_cls.capture_one_shape = traced_capture_one_shape
 
 
 def _patch_spawn_sites() -> None:
