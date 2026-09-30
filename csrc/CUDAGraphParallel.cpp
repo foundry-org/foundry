@@ -598,8 +598,9 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       // Add kernel node
       bt.json_ms += bt_ms(t_json);
       auto t_add = bt_clock::now();
-      ensure_dynamic_smem_optin(node_params, graph->capture_dev_, "LOAD");
-      CUresult kernel_result = cuGraphAddKernelNode(&cuNode, cuGraph, nullptr, 0, &node_params);
+      CUresult kernel_result =
+          add_restored_kernel_node(&cuNode, cuGraph, node_params, graph->capture_dev_,
+                                   cluster_width, cluster_height, cluster_depth, "LOAD");
       bt.add_ms += bt_ms(t_add);
       t_nattr = bt_clock::now();
       if (kernel_result != CUDA_SUCCESS) {
@@ -1733,8 +1734,12 @@ void CUDAGraph::build_template_graph_binary(const BinaryGraphFile& bin_file, CUD
     auto t_add = bt_clock::now();
     switch (entry.type) {
       case bf::NODE_KERNEL: {
-        ensure_dynamic_smem_optin(u.kernel_params, graph.capture_dev_, "LOAD");
-        CUresult r = cuGraphAddKernelNode(&cuNode, cuGraph, nullptr, 0, &u.kernel_params);
+        // u.kernel_attrs: the node's cluster dims merged with the function's compiled ones.
+        const auto& ka = u.kernel_attrs;
+        CUresult r = add_restored_kernel_node(&cuNode, cuGraph, u.kernel_params, graph.capture_dev_,
+                                              ka.has_cluster_dim ? ka.clusterDimX : 0,
+                                              ka.has_cluster_dim ? ka.clusterDimY : 0,
+                                              ka.has_cluster_dim ? ka.clusterDimZ : 0, "LOAD");
         if (r != CUDA_SUCCESS) {
           fprintf(stderr,
                   "[foundry LOAD ERROR] cuGraphAddKernelNode FAILED for node %u with error %d\n",
@@ -1978,8 +1983,11 @@ CUgraph build_prewarm_graph(const BinaryGraphFile& b, CUcontext ctx, CUdevice de
           ptrs[j] = const_cast<uint8_t*>(pd + pe[j].data_offset);
         p.kernelParams = ptrs.data();
       }
-      ensure_dynamic_smem_optin(p, dev, "PREWARM");
-      r = cuGraphAddKernelNode(&n, g, nullptr, 0, &p);
+      // No node attributes here, so only a compiled cluster (func_attrs) reaches the driver.
+      auto dim = [](int32_t v) { return v > 0 ? static_cast<unsigned>(v) : 0u; };
+      r = add_restored_kernel_node(&n, g, p, dev, dim(k.required_cluster_width),
+                                   dim(k.required_cluster_height), dim(k.required_cluster_depth),
+                                   "PREWARM");
     } else {
       r = cuGraphAddEmptyNode(&n, g, nullptr, 0);
     }

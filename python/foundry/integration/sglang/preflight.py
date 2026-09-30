@@ -10,10 +10,12 @@ cannot report itself, because its code never runs:
   (Foundry not installed there, or a stale install from before the plugin);
 - ``SGLANG_PLUGINS`` is set and does not name ``foundry``.
 
-Run it with the interpreter that runs ``sglang serve``::
+Run it with the interpreter that runs ``sglang serve``, with ``-P`` (or from a
+directory without an ``sglang/`` checkout) so the cwd cannot shadow the
+installed package::
 
-    python -m foundry.integration.sglang.preflight --toml foundry_save.toml --save
-    python -m foundry.integration.sglang.preflight --toml foundry_load.toml --load
+    python -P -m foundry.integration.sglang.preflight --toml foundry_save.toml --save
+    python -P -m foundry.integration.sglang.preflight --toml foundry_load.toml --load
 
 It prints one ``[Foundry preflight] ok: ...`` line per check, or a single
 ``[Foundry preflight] FAILED: <reason>`` line on stderr and exits 1. Relative
@@ -70,12 +72,47 @@ def _sglang_commit(pkg_dir: Path, version: str) -> tuple[str, str]:
     return (m.group(1) if m else "unknown"), "unknown"
 
 
+def check_sglang_origin(sglang_mod, cwd: Path | None = None) -> str | None:
+    """``sglang`` is the installed package, not a source directory shadowing it.
+
+    ``python -m`` (and ``-c``) put the current directory first on ``sys.path``;
+    run from a workspace that holds the ``sglang/`` checkout, ``import sglang``
+    finds that directory (a namespace package, ``__file__`` None: raises) or,
+    from inside ``sglang/python``, the source tree through the cwd entry (a
+    warning: it is the installed package only if that is the editable
+    checkout). ``sglang serve`` itself does not add the cwd."""
+    cwd = (cwd or Path.cwd()).resolve()
+    hint = (
+        "run the preflight from another directory or with PYTHONSAFEPATH=1 (python -P), "
+        "as recipe/sglang/serve_common.sh does"
+    )
+    file = getattr(sglang_mod, "__file__", None)
+    if file is None:
+        paths = list(dict.fromkeys(str(p) for p in getattr(sglang_mod, "__path__", [])))
+        raise PreflightError(
+            f"'import sglang' resolved to a namespace package at {paths} (no __init__.py): a "
+            f"directory named sglang on sys.path (the source checkout in {cwd}?) shadows the "
+            f"installed sglang; {hint}"
+        )
+    pkg_dir = Path(file).resolve().parent
+    if pkg_dir.parent == cwd and sys.path and sys.path[0] in ("", ".", str(cwd)):
+        return (
+            f"'import sglang' resolved to {pkg_dir} through the current directory on sys.path, "
+            f"which sglang serve does not see (fine only if that is the editable install); {hint}"
+        )
+    return None
+
+
 def check_sglang() -> tuple[str, str | None]:
     """SGLang has the plugin framework and the resolution steps Foundry wraps.
 
     Returns (info line, warning or None)."""
     try:
         import sglang
+    except Exception as exc:
+        raise PreflightError(f"cannot import sglang ({exc!r}): run in the SGLang venv") from exc
+    origin_warning = check_sglang_origin(sglang)
+    try:
         import sglang.srt.plugins as plugins
     except Exception as exc:
         raise PreflightError(
@@ -111,13 +148,13 @@ def check_sglang() -> tuple[str, str | None]:
         f"sglang {version} commit {commit} at {pkg_dir} "
         f"(contains validated {VALIDATED_SGLANG_COMMIT}: {contains})"
     )
-    warning = None
+    warnings = [origin_warning] if origin_warning else []
     if contains == "no":
-        warning = (
+        warnings.append(
             f"sglang {commit} does not contain the validated commit {VALIDATED_SGLANG_COMMIT}; "
             "it has the plugin surface, so continuing (the fork base is known to work)"
         )
-    return info, warning
+    return info, "; ".join(warnings) or None
 
 
 def check_entry_point() -> str:

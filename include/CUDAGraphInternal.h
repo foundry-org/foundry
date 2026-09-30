@@ -4,6 +4,7 @@
 // Not part of the public API.
 
 #include "CUDAGraph.h"
+#include "ClusterOptIn.h"
 #include <cuda.h>
 #include <future>
 #include <variant>
@@ -31,6 +32,13 @@ void apply_saved_function_attributes(const std::variant<CUfunction, CUkernel>& h
                                      int preferred_shared_memory_carveout, const char* where);
 void ensure_dynamic_smem_optin(const CUDA_KERNEL_NODE_PARAMS& params, CUdevice dev,
                                const char* where);
+
+// ensure_dynamic_smem_optin + add_kernel_node_cluster_optin (ClusterOptIn.h): cuGraphAddKernelNode
+// for a restored kernel node with both function-level opt-ins the LOAD process lacks.
+// (cx, cy, cz): the node's cluster dims merged with the function's compiled ones; 0 = none.
+CUresult add_restored_kernel_node(CUgraphNode* node, CUgraph graph,
+                                  const CUDA_KERNEL_NODE_PARAMS& params, CUdevice dev, unsigned cx,
+                                  unsigned cy, unsigned cz, const char* where);
 
 // Holds deferred metadata for the split start/finish graph loading flow.
 // Returned by start_graph_builds_impl, consumed by finish_graph_loads_impl.

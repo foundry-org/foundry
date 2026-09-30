@@ -52,11 +52,15 @@ foundry_sglang_python() {
 foundry_preflight() {
   local toml=$1 mode=$2 py
   py=$(foundry_sglang_python) || exit 1
-  if ! "$py" -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("foundry") is None)' 2>/dev/null; then
+  # -c / -m put the cwd first on sys.path, and a workspace root holding the sglang/ (or foundry/) checkout would
+  # shadow the installed package that `sglang serve` imports. PYTHONSAFEPATH=1 (python >= 3.11) drops that entry;
+  # the neutral cwd covers older interpreters, and --cwd keeps relative TOML paths resolving against this directory.
+  local here=$PWD
+  if ! (cd / && PYTHONSAFEPATH=1 "$py" -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("foundry") is None)') 2>/dev/null; then
     echo "[Foundry preflight] FAILED: foundry is not importable by $py: pip install -e foundry (in this venv)" >&2
     exit 1
   fi
-  "$py" -m foundry.integration.sglang.preflight --toml "$toml" "$mode" || exit 1
+  (cd / && PYTHONSAFEPATH=1 "$py" -m foundry.integration.sglang.preflight --toml "$toml" --cwd "$here" "$mode") || exit 1
 }
 
 # foundry_select <mode> [toml]: --save / --load export FOUNDRY_GRAPH_EXTENSION_CONFIG (default: the recipe TOML for
