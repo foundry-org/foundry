@@ -12,6 +12,7 @@
 # on hosts where multicast is unavailable (e.g. no IMEX channels).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/serve_common.sh"   # foundry_select / foundry_serve (plugin route + preflight)
 
 TP_SIZE=${1:?Usage: $0 <tp_size> [--save|--load]}
 MODEL_NAME="Qwen/Qwen3-1.7B"
@@ -38,17 +39,15 @@ else
     echo "Running without foundry (baseline SGLang)"
 fi
 
-FOUNDRY_ARGS=()
-if [[ -n "${FOUNDRY_TOML:-}" ]]; then
-    FOUNDRY_ARGS+=( --foundry-graph-extension-config-path "${FOUNDRY_TOML}" )
-fi
+# --save/--load: export FOUNDRY_GRAPH_EXTENSION_CONFIG="$FOUNDRY_TOML" after the preflight; baseline: unset it.
+foundry_select "$2" "${FOUNDRY_TOML:-}"
 
 # LD_PRELOAD of libcuda_hook.so is set by foundry's setup_ld_preload_env at
 # worker spawn time (path auto-detected; propagated to every rank's scheduler
-# child). Assumes foundry + the sglang fork are pip-installed (see README)
+# child). Assumes foundry + sglang are pip-installed (see README)
 # so both import without PYTHONPATH.
 
-sglang serve \
+foundry_serve "$2" sglang serve \
     --model-path "$MODEL_NAME" \
     --trust-remote-code \
     --host "$HOST" --port "$PORT" \
@@ -59,5 +58,4 @@ sglang serve \
     --disable-radix-cache \
     --attention-backend flashinfer \
     --cuda-graph-max-bs-decode 128 \
-    "${FOUNDRY_ARGS[@]}" \
     ${SGL_EXTRA_ARGS:-}

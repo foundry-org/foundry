@@ -9,6 +9,7 @@
 # nvshmem_host_path unset in the TOMLs — see README §EP).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/serve_common.sh"   # foundry_select / foundry_serve (plugin route + preflight)
 
 EP_SIZE=${1:?Usage: $0 <ep_size> [--save|--load]}
 # bf16 is the validated default on the `foundry` branch (sgl-deep-gemm's masked bf16
@@ -35,17 +36,15 @@ else
     echo "Running without foundry (baseline SGLang)"
 fi
 
-FOUNDRY_ARGS=()
-if [[ -n "${FOUNDRY_TOML:-}" ]]; then
-    FOUNDRY_ARGS+=( --foundry-graph-extension-config-path "${FOUNDRY_TOML}" )
-fi
+# --save/--load: export FOUNDRY_GRAPH_EXTENSION_CONFIG="$FOUNDRY_TOML" after the preflight; baseline: unset it.
+foundry_select "$2" "${FOUNDRY_TOML:-}"
 
 # LD_PRELOAD of libcuda_hook.so AND DeepEP's libnvshmem_host.so are set by
 # foundry's setup_ld_preload_env at worker spawn time — both paths auto-detected
 # (the hook from the foundry install, NVSHMEM from the nvidia-nvshmem wheel via
 # config._detect_nvshmem_host_path), so nothing is preloaded by the shell. Set
 # nvshmem_host_path in the TOML only to override the NVSHMEM auto-detection.
-# Assumes foundry + the sglang fork are pip-installed (see README).
+# Assumes foundry + sglang are pip-installed (see README).
 
 # DeepEP low-latency caps tokens/rank at SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
 # (default 128; (n+1)*2 must be <= NVSHMEM_QP_DEPTH). Raise to 256 ((256+1)*2=514
@@ -61,7 +60,7 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
 # ranks take the same allocation path; kernels still JIT lazily per shape.
 export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
 
-sglang serve \
+foundry_serve "$2" sglang serve \
     --model-path "$MODEL_NAME" \
     --trust-remote-code \
     --host "$HOST" --port "$PORT" \
@@ -79,5 +78,4 @@ sglang serve \
     --chunked-prefill-size 256 \
     --attention-backend fa3 \
     --cuda-graph-max-bs-decode 128 \
-    "${FOUNDRY_ARGS[@]}" \
     ${SGL_EXTRA_ARGS:-}

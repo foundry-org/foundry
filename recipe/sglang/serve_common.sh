@@ -1,5 +1,6 @@
 #!/bin/bash
-# Shared driver for the multi-topology recipes (serve_qwen3.5-*.sh, serve_deepseek-v4-flash.sh).
+# Shared driver for the multi-topology recipes (serve_qwen3.5-*.sh, serve_deepseek-v4-flash.sh), and the Foundry
+# plugin helpers every serve_*.sh script uses (foundry_select, foundry_serve; see "Foundry plugin route" below).
 #
 # A model script sets MODEL_PATH (and optionally the per-model knobs below), then calls
 #     serve_main <cfg> [--save|--load|--warm]
@@ -23,9 +24,107 @@
 #   memfrac_default <cfg>  optional function returning the validated --mem-fraction-static for a topology
 #
 # Both modes share the TOMLs next to this file (workspace_root = "foundry_archive"): rm -rf foundry_archive before a
-# SAVE for a different model or topology. Baseline runs (no flag) capture the same decode-graph set natively.
+# SAVE for a different model or topology. Baseline runs (no mode) capture the same decode-graph set natively.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---- Foundry plugin route -------------------------------------------------------------------------------------------
+# Foundry runs as an SGLang plugin (entry point `foundry` in group sglang.srt.plugins, registered by installing foundry)
+# and is switched on by FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML> in the launcher's environment; there is no CLI flag.
+# SGLang silently runs natively when the entry point is not registered in the serving venv or when SGLANG_PLUGINS is
+# set without `foundry`, so --save/--load run a preflight first (python -m foundry.integration.sglang.preflight, in
+# the interpreter of the `sglang` launcher on PATH; SGL_PYTHON overrides it) and, once /health answers, check the
+# engine log for the plugin's activation line (and, on LOAD, the restored-graph count).
+
+# Interpreter of the `sglang` launcher on PATH, i.e. the venv that will serve.
+foundry_sglang_python() {
+  if [[ -n "${SGL_PYTHON:-}" ]]; then echo "$SGL_PYTHON"; return 0; fi
+  local bin py
+  bin=$(command -v sglang) || { echo "[Foundry preflight] FAILED: no 'sglang' on PATH (activate the SGLang venv)" >&2; return 1; }
+  py=$(head -n 1 "$bin"); py=${py#\#!}; py=${py%% *}
+  if [[ "$py" == /*python* && -x "$py" ]]; then echo "$py"; return 0; fi
+  py="$(dirname "$bin")/python"                       # '#!/usr/bin/env python' or pip's '#!/bin/sh' long-path wrapper
+  if [[ -x "$py" ]]; then echo "$py"; return 0; fi
+  echo "[Foundry preflight] FAILED: cannot tell which python runs $bin; set SGL_PYTHON" >&2; return 1
+}
+
+# foundry_preflight <toml> <--save|--load>: exits the script with a one-line reason when Foundry would not run.
+foundry_preflight() {
+  local toml=$1 mode=$2 py
+  py=$(foundry_sglang_python) || exit 1
+  if ! "$py" -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("foundry") is None)' 2>/dev/null; then
+    echo "[Foundry preflight] FAILED: foundry is not importable by $py: pip install -e foundry (in this venv)" >&2
+    exit 1
+  fi
+  "$py" -m foundry.integration.sglang.preflight --toml "$toml" "$mode" || exit 1
+}
+
+# foundry_select <mode> [toml]: --save / --load export FOUNDRY_GRAPH_EXTENSION_CONFIG (default: the recipe TOML for
+# the mode) and run the preflight. Any other mode (baseline, --warm) unsets it, so a stray export in the calling shell
+# cannot turn a baseline run into a SAVE.
+foundry_select() {
+  local mode=$1 toml=${2:-}
+  case "$mode" in
+    --save) toml=${toml:-${SCRIPT_DIR}/foundry_save.toml} ;;
+    --load) toml=${toml:-${SCRIPT_DIR}/foundry_load.toml} ;;
+    *)      unset FOUNDRY_GRAPH_EXTENSION_CONFIG; return 0 ;;
+  esac
+  foundry_preflight "$toml" "$mode"
+  export FOUNDRY_GRAPH_EXTENSION_CONFIG="$toml"
+  echo "FOUNDRY_GRAPH_EXTENSION_CONFIG=$FOUNDRY_GRAPH_EXTENSION_CONFIG"
+}
+
+# foundry_verify <mode> <log>: after /health, report whether the plugin ran (it cannot report its own absence).
+foundry_verify() {
+  local mode=$1 log=$2 url="http://127.0.0.1:${PORT:-12000}/health" waited=0 limit=${FOUNDRY_HEALTH_TIMEOUT:-3600}
+  until curl -sf -o /dev/null "$url"; do
+    kill -0 $$ 2>/dev/null || return 0                  # the script (and its server) is gone
+    sleep 2; waited=$(( waited + 2 ))
+    if (( waited >= limit )); then echo "[Foundry verify] no /health after ${limit} s; log not checked" >&2; return 1; fi
+  done
+  local active loaded errors
+  active=$(( $(grep -a -o '\[Foundry\] sglang plugin active: pid=[0-9]*' "$log" | sort -u | wc -l) ))
+  if (( active == 0 )); then
+    echo "[Foundry verify] WARNING: /health is up but '$log' has no '[Foundry] sglang plugin active' line:" \
+         "SGLang ran NATIVELY, nothing was saved or restored (entry point not registered in this venv, or" \
+         "SGLANG_PLUGINS without foundry)" >&2
+    return 1
+  fi
+  echo "[Foundry verify] plugin active in $active process(es)"
+  if [[ "$mode" == --load ]]; then
+    loaded=$(grep -a -o '\[Foundry\] Loaded [0-9]* SGLang graphs in [0-9.]*s' "$log")
+    if [[ -z "$loaded" ]]; then
+      echo "[Foundry verify] WARNING: LOAD reached /health without a '[Foundry] Loaded N SGLang graphs' line in $log" >&2
+    else
+      echo "$loaded" | sed 's/^/[Foundry verify] /'
+    fi
+  fi
+  errors=$(grep -a -c '\[HOOK\] ERROR' "$log")
+  if (( errors > 0 )); then echo "[Foundry verify] WARNING: $errors '[HOOK] ERROR' line(s) in $log" >&2; fi
+  return 0
+}
+
+# foundry_serve <mode> <command...>: run the server in the foreground. With Foundry selected, its output is also
+# written to FOUNDRY_SERVE_LOG (default logs/sglang_<mode>_<time>.log) and checked by foundry_verify in the background.
+foundry_serve() {
+  local mode=$1; shift
+  if [[ -z "${FOUNDRY_GRAPH_EXTENSION_CONFIG:-}" ]]; then "$@"; return; fi
+  local log=${FOUNDRY_SERVE_LOG:-logs/sglang_${mode#--}_$(date +%Y%m%d_%H%M%S).log} verifier rc
+  if curl -sf -o /dev/null "http://127.0.0.1:${PORT:-12000}/health"; then
+    echo "port ${PORT:-12000} already answers /health: stop that server first (the log check would read the wrong engine)" >&2
+    return 1
+  fi
+  mkdir -p "$(dirname "$log")"
+  echo "engine log: $log"
+  foundry_verify "$mode" "$log" &
+  verifier=$!
+  "$@" 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  kill "$verifier" 2>/dev/null
+  wait "$verifier" 2>/dev/null
+  return "$rc"
+}
+
 EP_ATTN="${EP_ATTN-"--attention-backend fa3"}"
 EP_CHUNK="${EP_CHUNK:-256}"
 EP_A2A="${EP_A2A-"--moe-a2a-backend deepep --deepep-mode low_latency --moe-runner-backend deep_gemm"}"
@@ -68,10 +167,9 @@ serve_main() {
   if [[ -z "$memfrac" ]] && declare -F memfrac_default >/dev/null; then memfrac=$(memfrac_default "$cfg"); fi
   memfrac=${memfrac:-0.8}
 
-  local foundry_args=()
   case "$mode" in
-    --save) foundry_args=( --foundry-graph-extension-config-path "${SCRIPT_DIR}/foundry_save.toml" ); echo "Using foundry SAVE" ;;
-    --load) foundry_args=( --foundry-graph-extension-config-path "${SCRIPT_DIR}/foundry_load.toml" ); echo "Using foundry LOAD"
+    --save) echo "Using foundry SAVE" ;;
+    --load) echo "Using foundry LOAD"
             # Map the packed kernel image instead of reading it: the eager read of the 4.7-5.5 GB image was 1.6-1.8 s
             # of every rank's LOAD (Qwen3.5-122B-FP8 EP8: 1.67 s -> 0.10 s with mmap, identical output). Measured with
             # the archive in the page cache; set FOUNDRY_MMAP_ARCHIVE=0 to read eagerly.
@@ -88,6 +186,7 @@ serve_main() {
     "")     echo "Running without foundry (baseline SGLang, same decode-graph set)" ;;
     *)      echo "Usage: $0 <cfg> [--save|--load|--warm]"; exit 1 ;;
   esac
+  foundry_select "$mode"
 
   # Identical on baseline, SAVE and LOAD so the captured graphs match:
   # - NCCL_CUMEM_ENABLE=0 / NCCL_NVLS_ENABLE=0: NCCL buffers through the plain allocator (deterministic VMM offsets)
@@ -98,13 +197,12 @@ serve_main() {
 
   echo "model=$MODEL_PATH cfg=$cfg gpus=$CUDA_VISIBLE_DEVICES mem_fraction_static=$memfrac"
   # shellcheck disable=SC2086
-  sglang serve \
+  foundry_serve "$mode" sglang serve \
       --model-path "$MODEL_PATH" \
       --trust-remote-code \
       --host 0.0.0.0 --port "${PORT:-12000}" \
       --disable-radix-cache \
       --mem-fraction-static "$memfrac" \
       $ARGS $GRAPHS $MODEL_EXTRA \
-      "${foundry_args[@]}" \
       ${SGL_EXTRA_ARGS:-}
 }
