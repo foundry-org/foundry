@@ -565,6 +565,11 @@ Not usable in plain sglang on Hopper, because the native engine already fails to
 all-to-all over DeepEP v2 (`--moe-a2a-backend deepep_v2`), i.e. NCCL
 symmetric-memory windows and NCCL GIN (GDAKI/DOCA) rather than NVSHMEM.
 Prototype status: validated on H100 EP=2/EP=4 with all 256 decode graphs.
+Not yet validated on the plugin route (upstream main). v2 needs NCCL GIN, i.e.
+an RDMA-capable NIC visible to the process: on a host whose verbs devices are
+blocked, `ElasticBuffer.__init__` asserts `NCCL GIN is unavailable` at the
+first MoE dispatch in plain SGLang, before any Foundry code runs (4xH200 bare
+host, 2026-09-30).
 
 Extra requirements:
 
