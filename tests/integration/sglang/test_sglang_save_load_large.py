@@ -5,7 +5,8 @@ models the SGLang base test (test/registered/e2e/plugins/test_foundry_graph_pers
 in SGLang, Qwen3.5-2B on 1 GPU) does not cover. Same assertions as the base test:
 
   (a) greedy token ids of SAVE and LOAD identical to native (8 prompts x 64 tokens, temperature 0);
-  (b) LOAD median TPOT within TPOT_REL_TOL of native (32 requests, concurrency 8);
+  (b) LOAD median TPOT not more than TPOT_REL_TOL above native (32 requests, concurrency 8,
+      after a throwaway bench on each engine; one-sided, a slow native run is not a failure);
   (c) LOAD graph restore ("[Foundry] Loaded N SGLang graphs in Xs", max over ranks) below the case's bound;
   (d) plugin active in the launcher and every scheduler, no "[HOOK] ERROR";
   (e) SAVE wrote one archive directory per rank, and SAVE final_alloc_offset == LOAD after_load_all_graphs per rank.
@@ -177,6 +178,10 @@ def _bench_tpot(model, out_path):
         max_concurrency=8,
         seed=0,
     )
+    # Throwaway pass first: the first requests of a fresh engine carry one-time
+    # costs (lazy kernel loading, JIT) that are not what (b) measures.
+    args.output_file = str(out_path.with_suffix(".warm.jsonl"))
+    run_benchmark(args)
     args.output_file = str(out_path)
     return run_benchmark(args)["median_tpot_ms"]
 
@@ -268,7 +273,9 @@ def test_save_then_load_large(case, tmp_path, request):
     )
 
     # (b)
-    rel = abs(load["tpot_ms"] - native["tpot_ms"]) / native["tpot_ms"]
+    # One-sided: LOAD must not be slower than native by more than the tolerance;
+    # a stalled native bench must not fail the test.
+    rel = (load["tpot_ms"] - native["tpot_ms"]) / native["tpot_ms"]
     assert rel <= TPOT_REL_TOL, (
         f"median TPOT native {native['tpot_ms']:.3f} ms, LOAD {load['tpot_ms']:.3f} ms"
     )
