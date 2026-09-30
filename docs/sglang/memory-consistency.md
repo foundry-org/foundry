@@ -85,6 +85,8 @@ No allocation. Captured graph references the pre-pass wrapper's address; LOAD's 
 
 The `attn_backend.forward_metadata = None` between the pre-pass and the patch install drops the last bs's `DecodeMetadata` reference — defensive, not strictly required by `reuse_pre_pass_init`.
 
+**Current design** (`capture_loop_version = 2`). The pre-pass and the reuse shim are gone. SAVE and LOAD both run the upstream decode capture loop and substitute only `FullCudaGraphBackend.capture_one`, so the per-bs init allocations (wrappers, `_int_workspace_buffer`) happen at the same point and in the same order in both modes. On LOAD each graph's allocator events replay right where SAVE captured it, between the same per-shape eager work, so the cursor trajectory matches without any backend-specific code. Archives saved with the pre-pass layout are refused on LOAD and must be re-saved.
+
 ## Bug 4 — Per-graph `start_graph_builds` broke template/on-demand linking
 
 ### Symptom
@@ -101,11 +103,13 @@ An earlier (interleaved) LOAD called `start_graph_builds([single_path])` once pe
 
 `load_all_graphs(self)` calls `start_graph_builds(all_paths)` exactly once, then `finish_graph_loads(pending)` once. All N graphs go through the manifest's template/on-demand linking in a single pass. `finish_graph_loads` then replays each graph's allocator events sequentially, walking the cursor through every `start_base_addr_X` in order.
 
+**Current design.** The single `start_graph_builds(all_paths)` call is kept (`start_decode_graph_restore`, before the upstream loop). The finish is per graph: `finish_one_graph_load(pending, i)` runs from the patched `capture_one` for each shape inside the loop, so each graph's allocator events replay at its SAVE capture point (see Bug 3's current design). `load_all_graphs` is gone.
+
 ## Bug 5 — `_resolve_memory_pool_config`'s hidden `empty_cache`
 
 ### Symptom
 
-After bugs 1-4: cursors at `after_setup_graph_ext`, `after_init_torch_dist`, `after_scratch_skip`, `before_init_memory_pool`, and `after_init_memory_pool` all matched between SAVE and LOAD. But `save_before_pre_init` (29698 MB on SAVE) was 20 MB ahead of LOAD's `before_preallocate` (29678 MB).
+After bugs 1-4: cursors at `after_setup_graph_ext`, `after_init_torch_dist`, `after_scratch_skip`, `before_init_memory_pool`, and `after_init_memory_pool` all matched between SAVE and LOAD. But `save_before_pre_init` (29698 MB on SAVE; a label of the old pre-pass path, since removed) was 20 MB ahead of LOAD's `before_preallocate` (29678 MB).
 
 ### Root cause
 

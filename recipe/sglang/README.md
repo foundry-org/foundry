@@ -585,10 +585,16 @@ saved before this (or without the flag) still load unchanged, but their template
 before, so they do not get that speedup: re-SAVE to get it. The format stays v2, so older foundry builds read new
 archives too.
 
+**Archive compatibility note (decode capture loop).** `region_layout.json` records `capture_loop_version = 2`: SAVE
+and LOAD both run sglang's own decode capture loop and substitute only the capture. LOAD refuses, at setup, an
+archive without it or with another value (saved by the older pre-pass code, whose allocation order it cannot
+replay): re-SAVE.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
+| LOAD aborts at setup: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the current code` | Archive saved by the older decode capture code. `rm -rf` it and re-SAVE. |
 | `Reserved address … != requested base 0x600000000000` | VMM base collided with another allocation. Re-run; non-deterministic, the next run usually succeeds. |
 | EP replay `illegal memory access` / `nvshmemx_cumodule_init not found` | `libnvshmem_host.so.3` not preloaded — foundry couldn't auto-detect the `nvidia-nvshmem` wheel. Confirm it's installed (`pip show nvidia-nvshmem-cu13`), or set `nvshmem_host_path` in both TOMLs. |
 | `NVSHMEM device library version does not match with NVSHMEM host library version`, then segfault | A custom `nvshmem_host_path` in the TOMLs points at a different NVSHMEM build than the one inside the `sgl-deep-ep` wheel. Remove the override; foundry's auto-detected `nvidia-nvshmem` wheel matches. |

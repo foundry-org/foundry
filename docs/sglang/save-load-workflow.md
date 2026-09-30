@@ -147,17 +147,23 @@ LOAD (success):
 [Foundry] SGLang kernel_warmup skipped in load mode
 [Foundry] SGLang alloc_offset[before_preallocate]=… (… MB)
 [Foundry] SGLang alloc_offset[after_preallocate]=… (… MB)
-[Foundry] SGLang alloc_offset[after_pre_init]=… (… MB)
 [CGE] Using graph_manifest.json (9 topology groups)
 [CGE] Phase 1: 52 graphs parsed in 0.x ms, 9 topologies, 4 threads, 52 binary + 0 json
 [CGE BUILD] Template 0 (...): N nodes, done in X.X ms
 …
 [CGE] Phase 2: 9 templates + 43 on-demand = 52 graphs built in xx.x ms
-[CGE] finish_graph_loads: 52 graphs, xx.x ms
-[Foundry] Loaded 52 SGLang graphs in 0.0x s
+[Foundry] SGLang alloc_offset[before_decode_restore]=… (… MB)
+[Foundry] Loaded 52 SGLang graphs in 0.x s (restore calls 0.0x s)
 [Foundry] SGLang alloc_offset[after_load_all_graphs]=22785556480 (… MB)
 …
 INFO:     Application startup complete.
 ```
 
 The `after_load_all_graphs` value **must** equal SAVE's `final_alloc_offset`. If it doesn't, see [`memory-consistency.md`](memory-consistency.md).
+The build lines (`[CGE] Phase 1/2`) come from the background build thread and may interleave with the offset lines.
+The graphs are finished one per shape inside sglang's capture loop, so the `Loaded` time spans the whole loop
+(per-shape prep included); `restore calls` is the part spent in foundry's restore.
+
+An archive saved by older code (no `capture_loop_version` in `region_layout.json`) is refused at setup, before the
+weights load: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the current code`.
+Re-run both SAVE passes.

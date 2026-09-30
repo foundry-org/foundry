@@ -1,5 +1,14 @@
 # Known issues — SGLang integration
 
+## Archives from before capture_loop_version 2 (RULE, 2026-09-30)
+
+SAVE and LOAD now both run sglang's own decode capture loop and substitute only `FullCudaGraphBackend.capture_one`;
+the old code ran a FlashInfer metadata pre-pass before the loop, which allocates the per-bs wrappers in another
+order, and LOAD cannot replay that layout. `region_layout.json` (per rank) records `capture_loop_version = 2`
+(`runtime.CAPTURE_LOOP_VERSION`); LOAD checks it at setup, before the weights load, and refuses an archive without it
+or with another value: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the
+current code`. Rule: re-SAVE every archive saved by the old code.
+
 ## SAVE spends ~30 s in `Init torch distributed` (and ~20 s more elsewhere) copying over-read fatbins (FIXED, 2026-09-25)
 
 SAVE only (LOAD skips fatbin processing). The hook sized each registered fatbin by walking every following
@@ -151,6 +160,15 @@ metadata, whose contents (built from initial buffer values, no warmup
 forward) differ from what upstream capture would have left — wrong
 attention state → confidently wrong last-position logits, entangled with
 the other rank via the dp-attention gather.
+
+*Update (capture_loop_version 2).* The leftover described above belongs to the
+old LOAD path, which ran a post-load fa3 metadata pre-pass after
+`load_all_graphs`. LOAD now runs sglang's own decode capture loop (only
+`capture_one` is substituted), so `attn_backend.forward_metadata` after LOAD
+is whatever that loop leaves, the same as on SAVE and native sglang; the
+"pre-pass's last-bs decode metadata" leftover no longer exists on LOAD. This
+dp-attention symptom has not been re-tested on the new path (the DeepEP
+buffer fix below resolved it on the old one).
 
 The plain-DP (no dp-attention) flashinfer path shows a much milder analog
 (token-trajectory divergence from baseline on 1/4 probe prompts, no stray
