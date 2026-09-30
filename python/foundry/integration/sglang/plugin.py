@@ -355,8 +355,8 @@ FIELD_PINS: tuple[FieldPin, ...] = (
         False,
         False,
         "--enable-two-batch-overlap",
-        "the per-shape micro-batch metadata is built only by the capture loop, which LOAD "
-        "does not run",
+        "not validated with Foundry (children micro-batch graphs and DeepEP capture events); "
+        "pinned off until a TBO row is validated",
     ),
     FieldPin(
         "enable_memory_saver",
@@ -427,8 +427,9 @@ ENV_PINS: tuple[EnvPin, ...] = (
     EnvPin(
         "SGLANG_ENABLE_GRAPH_POOL_PRECARVE",
         "0",
-        "the graph pool is carved from a span measured on SAVE's eager warmup, which LOAD "
-        "does not run",
+        "only upstream capture_one runs the precarve (measured over its two eager warmups, "
+        "minted at the first capture); Foundry's capture_one replaces it on SAVE and LOAD, so "
+        "the flag would be a no-op and the graph pool would not match a native run's layout",
     ),
     EnvPin(
         "SGLANG_ENABLE_GRAPH_POOL_BORROW",

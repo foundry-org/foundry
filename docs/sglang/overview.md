@@ -70,7 +70,7 @@ backend and is pinned by the `handle_other_validations` hook, once `--moe-a2a-ba
 | `--enable-symm-mem` (NCCL windows) | off | registered at first use inside the forward; needs NCCL's cuMem buffers | set on the command line |
 | `--enable-nccl-nvls` | off | NVLS multicast buffers registered at first use inside the forward | set on the command line |
 | `--enable-mscclpp` | off | MSCCL++ registers its buffers at first use inside the forward | set on the command line |
-| `--enable-two-batch-overlap` | off | the per-shape micro-batch metadata is built only by the capture loop, which LOAD does not run | set on the command line |
+| `--enable-two-batch-overlap` | off | not validated with Foundry (children micro-batch graphs and DeepEP capture events); pinned off until a TBO row is validated | set on the command line |
 | `--enable-memory-saver` | off | torch_memory_saver owns the pools (and, with `SGLANG_MEMORY_SAVER_CUDA_GRAPH`, the graph memory) outside Foundry's region | set on the command line |
 | `--dsv4-attn-backend` | `auto` (resolves to `flashmla`), or the user's `flashmla` | the `trtllm` variant asserts at its first call, which falls inside the capture, and needs an eager bootstrap Foundry does not run | `trtllm` |
 | `NCCL_GRAPH_REGISTER`, `NCCL_LOCAL_REGISTER` | `0` | NCCL registers the buffers of graph-captured collectives on the host at capture time; a restored graph replays the kernels without the registration (illegal address in the DP-attention all-gather at bs >= 4 with NCCL 2.30) | set to anything but 0 |
@@ -79,7 +79,7 @@ backend and is pinned by the `handle_other_validations` hook, once `--moe-a2a-ba
 | `SGLANG_JIT_DEEPGEMM_PRECOMPILE` | `0` | the precompile sweep runs on the first rank inside the first capture: a device synchronization, and scratch only SAVE allocates; kernels still JIT per shape | set to true |
 | `SGLANG_MEMORY_SAVER_CUDA_GRAPH` | `0` | the memory-saver graph context owns the graph memory outside Foundry's region | set to true |
 | `SGLANG_ENABLE_METADATA_GLUE_GRAPH` | `0` | the attention-metadata prep is captured into a second graph Foundry does not save | set to true |
-| `SGLANG_ENABLE_GRAPH_POOL_PRECARVE` | `0` | the graph pool is carved from a span measured on SAVE's eager warmup, which LOAD does not run | set to true |
+| `SGLANG_ENABLE_GRAPH_POOL_PRECARVE` | `0` | only upstream `capture_one` runs the precarve (measured over its two eager warmups, minted at the first capture); Foundry's `capture_one` replaces it on SAVE and LOAD, so the flag would be a no-op and the graph pool would not match a native run's layout | set to true |
 | `SGLANG_ENABLE_GRAPH_POOL_BORROW` | `0` | eager allocations would borrow free graph-pool extents whose addresses the restored graphs reference | set to true |
 
 Rejected instead, because Foundry has no logic for them: speculative decoding, LoRA, PD multiplexing, elastic-EP
