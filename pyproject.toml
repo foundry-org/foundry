@@ -18,6 +18,12 @@ dependencies = [
     "torch",
 ]
 
+# SGLang discovers general plugins through this entry-point group
+# (sglang.srt.plugins.load_plugins). The entry module imports only the
+# standard library; Foundry activates when FOUNDRY_GRAPH_EXTENSION_CONFIG is set.
+[project.entry-points."sglang.srt.plugins"]
+foundry = "foundry_sglang_plugin:load"
+
 [project.optional-dependencies]
 dev = [
     "pytest",
@@ -30,6 +36,7 @@ packages = [
     "foundry.integration.vllm",
     "foundry.integration.sglang",
 ]
+py-modules = ["foundry_sglang_plugin"]
 package-dir = {"" = "python"}
 include-package-data = true
 zip-safe = false

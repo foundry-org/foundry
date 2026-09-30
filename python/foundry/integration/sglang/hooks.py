@@ -5,9 +5,11 @@
 Targets the runner architecture introduced after sglang 0.5.16: cuda-graph
 capture lives in per-phase runners (DecodeCudaGraphRunner) that delegate the
 actual graph create/capture/replay to a pluggable backend
-(FullCudaGraphBackend). Foundry only supports the `full` backend: sglang's
-handle_graph_extension forces decode=full and keeps prefill disabled unless
-full is requested explicitly (PrefillCudaGraphRunner, captured before decode).
+(FullCudaGraphBackend). Foundry only supports the `full` backend: server-args
+resolution forces decode=full and keeps prefill disabled unless full is
+requested explicitly (PrefillCudaGraphRunner, captured before decode). The
+pins come from the plugin's resolution hooks (plugin.py) or, on the fork base,
+from the in-tree handle_graph_extension.
 
 Kernel warmup no longer needs a patch: BaseRunner.warmup() runs no model
 forwards (workspace prealloc + autotune, which foundry disables) and executes
@@ -50,18 +52,30 @@ def _ep_lazy_init_needed() -> bool:
         return False
 
 
-def _resolve_dp_rank(model_runner) -> int | None:
-    """Foundry workspace rank derivation. ParallelState carries both the
-    regular dp_rank and the dp-attention rank, so no recomputation is needed."""
-    ps = model_runner.ps
-    if model_runner.server_args.enable_dp_attention:
-        return ps.attn_dp_rank
-    return ps.dp_rank
+def _workspace_ranks(parallel, enable_dp_attention: bool) -> tuple[int, int, int | None]:
+    """(tp_rank, pp_rank, dp_rank) for the Foundry workspace rank.
+
+    ``parallel`` is whatever carries this process's placement: the fork's
+    per-runner ``ModelRunner.ps`` record, or upstream's ``get_parallel()``
+    context (stamped by ``publish(ranks=...)`` before any process group
+    exists; ``ModelRunner.ps`` was removed upstream, sglang #40343). Both carry
+    the regular dp_rank and the dp-attention rank under the same names."""
+    dp_rank = parallel.attn_dp_rank if enable_dp_attention else parallel.dp_rank
+    return parallel.tp_rank, parallel.pp_rank, dp_rank
 
 
 def install_hooks(server_args) -> None:
+    """In-tree shim entry (fork base: ``--foundry-graph-extension-config-path``)."""
+    install(getattr(server_args, "foundry_graph_extension_config_path", None))
+
+
+def install(cfg_path: str | None) -> None:
+    """Install the runtime patches for the TOML at ``cfg_path`` (idempotent).
+
+    Reached from the in-tree shim on the fork base, or from the sglang plugin
+    (``foundry.integration.sglang.plugin``) in every process that runs
+    ``load_plugins()``."""
     global _INSTALLED
-    cfg_path = server_args.foundry_graph_extension_config_path
     if not cfg_path:
         return
     if _INSTALLED:
@@ -81,7 +95,7 @@ def install_hooks(server_args) -> None:
         get_workspace_root(),
     )
 
-    _patch_init_torch_distributed()
+    _patch_distributed_init()
     _patch_alloc_memory_pool()
     _patch_cuda_graph_capture()
     _patch_spawn_sites()
@@ -90,7 +104,129 @@ def install_hooks(server_args) -> None:
     logger.info("[Foundry] SGLang hooks installed")
 
 
+def _before_distributed_init(server_args, device: str, gpu_id: int, ranks) -> None:
+    """Bind this rank's VMM region before any communicator exists.
+
+    Same sequence point on SAVE and LOAD on both sglang layouts: the head of
+    the process-group bring-up (``bootstrap.init_parallel_runtime`` upstream,
+    ``ModelRunner.init_torch_distributed`` on the fork base)."""
+    mode = get_graph_extension_mode()
+    # Bind this rank's CUDA device BEFORE reserving the VMM region. The
+    # distributed bring-up calls set_device(gpu_id) itself, but foundry's
+    # set_allocation_region (inside setup_graph_extension) reserves the region
+    # on the *current* device. For DP rank > 0 the current device is still
+    # cuda:0 at this point, so without setting it first the region lands on the
+    # wrong GPU and the rank's later allocations fault with an async illegal
+    # memory access (surfacing at the first Stream()/kernel). Single-GPU is
+    # unaffected (gpu_id == 0).
+    if device == "cuda":
+        import torch
+
+        torch.get_device_module(device).set_device(gpu_id)
+
+    tp_rank, pp_rank, dp_rank = ranks
+    rt.setup_graph_extension(server_args, tp_rank=tp_rank, pp_rank=pp_rank, dp_rank=dp_rank)
+    rt.log_alloc_offset("after_setup_graph_ext")
+    if mode == CUDAGraphExtensionMode.LOAD:
+        # Grow the driver's graph-exec memory now, on a background thread,
+        # so Phase 2's instantiates at the capture point reuse it (see
+        # graph_ops.start_exec_pool_prewarm).
+        from foundry.integration.sglang.graph_ops import start_exec_pool_prewarm
+
+        start_exec_pool_prewarm()
+    if mode == CUDAGraphExtensionMode.LOAD and _early_graph_builds_enabled():
+        # Start rebuilding the CUDA graphs now, on foundry's background
+        # thread, so template builds and member instantiation overlap
+        # torch-distributed init, weight loading and the memory-pool
+        # setup instead of sitting on the critical path at the capture
+        # point. Only CUDA graph objects are created here (no torch
+        # allocations: allocator replay and output-tensor reconstruction
+        # happen in finish_graph_loads at the capture point, and NVSHMEM
+        # module init still precedes it), so the deterministic layout is
+        # unchanged. Opt-in (FOUNDRY_SGLANG_EARLY_GRAPH_BUILDS=1): see
+        # _early_graph_builds_enabled for why it is off by default.
+        from foundry.integration.sglang.graph_ops import start_graph_builds
+
+        start_graph_builds()
+
+
+def _after_runner_distributed_init() -> None:
+    """End of ModelRunner.init_torch_distributed (both layouts): the groups
+    exist and pre-model-load memory has been measured; everything allocated
+    since the region was bound sits in the scratch space, and the cursor jumps
+    to the scratch boundary so weight loading starts at the same offset on
+    SAVE and LOAD."""
+    rt.log_alloc_offset("after_init_torch_dist")
+    rt.skip_to_scratch_boundary()
+    rt.log_alloc_offset("after_scratch_skip")
+
+
+def _patch_distributed_init() -> None:
+    """Pick the bring-up site by attribute, not by version: upstream moved
+    process-group creation out of the model runner into
+    ``bootstrap.init_parallel_runtime``, called from ``Scheduler.__init__``
+    before any ModelRunner exists (sglang #40345)."""
+    try:
+        from sglang.srt.distributed import bootstrap
+    except ImportError:
+        bootstrap = None
+    if bootstrap is not None and hasattr(bootstrap, "init_parallel_runtime"):
+        _patch_init_parallel_runtime(bootstrap)
+    else:
+        _patch_init_torch_distributed()
+
+
+def _patch_init_parallel_runtime(bootstrap) -> None:
+    from sglang.srt.model_executor import model_runner as mr
+
+    orig = bootstrap.init_parallel_runtime
+
+    @functools.wraps(orig)
+    def patched(*args, **kwargs):
+        if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
+            return orig(*args, **kwargs)
+        # Keyword-only upstream: (*, server_args, device, dist_port).
+        from sglang.srt.runtime_context import get_device, get_parallel
+
+        parallel = get_parallel()
+        # get_parallel() answers from the published placement (resolved
+        # dp-attention flag and widths), unlike the raw record fields.
+        _before_distributed_init(
+            parallel,
+            kwargs.get("device", get_device().device),
+            get_device().gpu_id,
+            _workspace_ranks(parallel, parallel.enable_dp_attention),
+        )
+        result = orig(*args, **kwargs)
+        rt.log_alloc_offset("after_init_parallel_runtime")
+        return result
+
+    # Scheduler.__init__ calls it as ``bootstrap.init_parallel_runtime``, so
+    # the module attribute is the dispatch target.
+    bootstrap.init_parallel_runtime = patched
+
+    cls = mr.ModelRunner
+    orig_runner_init = cls.init_torch_distributed
+
+    @functools.wraps(orig_runner_init)
+    def patched_runner_init(self, *args, **kwargs):
+        result = orig_runner_init(self, *args, **kwargs)
+        # Draft workers reuse the target's groups and never reach
+        # init_parallel_runtime; only the target runner closes the window.
+        if (
+            get_graph_extension_mode() != CUDAGraphExtensionMode.NONE
+            and not self.is_draft_worker
+            and rt.get_state() is not None
+        ):
+            _after_runner_distributed_init()
+        return result
+
+    cls.init_torch_distributed = patched_runner_init
+
+
 def _patch_init_torch_distributed() -> None:
+    """Fork base: ModelRunner.init_torch_distributed still creates the process
+    groups (and measures pre-model-load memory)."""
     from sglang.srt.model_executor import model_runner as mr
 
     cls = mr.ModelRunner
@@ -98,56 +234,16 @@ def _patch_init_torch_distributed() -> None:
 
     @functools.wraps(orig)
     def patched(self, *args, **kwargs):
-        mode = get_graph_extension_mode()
-        if mode == CUDAGraphExtensionMode.NONE:
+        if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
             return orig(self, *args, **kwargs)
-
-        # Bind this rank's CUDA device BEFORE reserving the VMM region.
-        # init_torch_distributed (orig) calls set_device(self.gpu_id)
-        # internally, but foundry's set_allocation_region (inside
-        # setup_graph_extension) reserves the region on the *current* device.
-        # For DP rank > 0 the current device is still cuda:0 at this point, so
-        # without setting it first the region lands on the wrong GPU and the
-        # rank's later allocations fault with an async illegal memory access
-        # (surfacing at the first Stream()/kernel). Mirrors model_runner's own
-        # set_device(self.gpu_id). Single-GPU is unaffected (gpu_id == 0).
-        if self.device == "cuda":
-            import torch
-
-            torch.get_device_module(self.device).set_device(self.gpu_id)
-
-        rt.setup_graph_extension(
+        _before_distributed_init(
             self.server_args,
-            tp_rank=self.ps.tp_rank,
-            pp_rank=self.ps.pp_rank,
-            dp_rank=_resolve_dp_rank(self),
+            self.device,
+            self.gpu_id,
+            _workspace_ranks(self.ps, self.server_args.enable_dp_attention),
         )
-        rt.log_alloc_offset("after_setup_graph_ext")
-        if mode == CUDAGraphExtensionMode.LOAD:
-            # Grow the driver's graph-exec memory now, on a background thread,
-            # so Phase 2's instantiates at the capture point reuse it (see
-            # graph_ops.start_exec_pool_prewarm).
-            from foundry.integration.sglang.graph_ops import start_exec_pool_prewarm
-
-            start_exec_pool_prewarm()
-        if mode == CUDAGraphExtensionMode.LOAD and _early_graph_builds_enabled():
-            # Start rebuilding the CUDA graphs now, on foundry's background
-            # thread, so template builds and member instantiation overlap
-            # torch-distributed init, weight loading and the memory-pool
-            # setup instead of sitting on the critical path at the capture
-            # point. Only CUDA graph objects are created here (no torch
-            # allocations: allocator replay and output-tensor reconstruction
-            # happen in finish_graph_loads at the capture point, and NVSHMEM
-            # module init still precedes it), so the deterministic layout is
-            # unchanged. Opt-in (FOUNDRY_SGLANG_EARLY_GRAPH_BUILDS=1): see
-            # _early_graph_builds_enabled for why it is off by default.
-            from foundry.integration.sglang.graph_ops import start_graph_builds
-
-            start_graph_builds()
         result = orig(self, *args, **kwargs)
-        rt.log_alloc_offset("after_init_torch_dist")
-        rt.skip_to_scratch_boundary()
-        rt.log_alloc_offset("after_scratch_skip")
+        _after_runner_distributed_init()
         return result
 
     cls.init_torch_distributed = patched
@@ -384,6 +480,10 @@ def _patch_cuda_graph_capture() -> None:
             from foundry.integration.sglang.graph_ops import restore_next_prefill_graph
 
             graph, out = restore_next_prefill_graph(shape_key, req_slots)
+            # Every graph placed in ``_graphs`` (here, SAVE's FoundryCUDAGraph,
+            # LOAD's decode graphs below) is a foundry ``ops.CUDAGraph``, which
+            # binds ``reset()`` (csrc/binding.cpp): upstream's
+            # FullCudaGraphBackend.cleanup() calls ``graph.reset()`` on each.
             self._graphs[shape_key] = graph
             self._outputs[shape_key] = out
             return
@@ -470,6 +570,7 @@ def _patch_cuda_graph_capture() -> None:
         if mode == CUDAGraphExtensionMode.NONE:
             return orig_capture(self)
 
+        reject_unsupported_decode_runner(self)
         # No-op when the prefill runner captured first.
         begin_graph_layout(self, mode)
 
@@ -689,15 +790,33 @@ def _patch_spawn_sites() -> None:
         engine_mod = None
 
     if engine_mod is not None:
-        orig_launch = engine_mod.Engine._launch_scheduler_processes
+        engine_cls = engine_mod.Engine
+        raw = engine_cls.__dict__.get("_launch_scheduler_processes")
+        if isinstance(raw, classmethod):
+            # Upstream calls it as ``cls._launch_scheduler_processes(...)`` and
+            # subclasses override it (RayEngine): keep it a classmethod so a
+            # subclass inheriting it still receives its own ``cls``.
+            orig_launch = raw.__func__
 
-        @functools.wraps(orig_launch)
-        def patched_launch(self, *args, **kwargs):
-            if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-                rt.setup_ld_preload_env()
-            return orig_launch(self, *args, **kwargs)
+            @functools.wraps(orig_launch)
+            def patched_launch(cls, *args, **kwargs):
+                if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
+                    _check_resolved_graph_config(args[0] if args else kwargs.get("server_args"))
+                    rt.setup_ld_preload_env()
+                return orig_launch(cls, *args, **kwargs)
 
-        engine_mod.Engine._launch_scheduler_processes = patched_launch
+            engine_cls._launch_scheduler_processes = classmethod(patched_launch)
+        elif raw is not None:
+            orig_method = raw
+
+            @functools.wraps(orig_method)
+            def patched_method(self, *args, **kwargs):
+                if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
+                    _check_resolved_graph_config(args[0] if args else kwargs.get("server_args"))
+                    rt.setup_ld_preload_env()
+                return orig_method(self, *args, **kwargs)
+
+            engine_cls._launch_scheduler_processes = patched_method
 
     try:
         from sglang.srt.managers import data_parallel_controller as dpc
@@ -714,3 +833,68 @@ def _patch_spawn_sites() -> None:
             return orig_start(self, *args, **kwargs)
 
         dpc.DataParallelController.launch_tensor_parallel_group = patched_start
+
+
+def _check_resolved_graph_config(server_args) -> None:
+    """Launcher, before any scheduler is spawned: the record must have been
+    resolved with Foundry's graph pins (decode ``full``, prefill ``full`` or
+    ``disabled``). They are declared by a resolution step (the in-tree
+    ``handle_graph_extension`` on the fork base, the plugin's resolution hooks
+    otherwise); a record resolved before the plugin loaded would otherwise
+    start without them and SAVE / LOAD would disagree with the archive."""
+    if server_args is None:
+        return
+    try:
+        from sglang.srt.arg_groups.overrides import resolution_result
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+    except ImportError:
+        return
+    cfg = resolution_result(server_args, "cuda_graph_config")
+    if cfg is None:
+        return
+    decode = cfg.decode.backend
+    prefill = cfg.prefill.backend
+    if decode != Backend.FULL or prefill not in (Backend.FULL, Backend.DISABLED):
+        raise RuntimeError(
+            "[Foundry] the resolved CUDA-graph config is "
+            f"decode={decode!r} prefill={prefill!r}; Foundry needs decode 'full' and "
+            "prefill 'full' or 'disabled'. The server args were resolved without "
+            "Foundry's resolution hooks: load plugins (sglang.srt.plugins.load_plugins) "
+            "before resolving them, or pass the Foundry config at launch."
+        )
+
+
+def reject_unsupported_decode_runner(runner) -> None:
+    """Runtime guard at the first decode capture, both modes and layouts.
+
+    Things Foundry's archive cannot represent and that cannot all be seen
+    from the server args (they depend on the GPU or on the model config):
+    - a decode backend other than ``FullCudaGraphBackend``;
+    - attention graph variants (``ShapeKey.attention_variant``, e.g. DSV4.1
+      candidate-indexer graphs on SM100, the HIP DSA dual graph);
+    - elastic-EP CUDA-graph recapture (upstream #33723): a scale event drops
+      and recaptures the decode graphs after startup, which LOAD cannot
+      replay from the archive."""
+    from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+        FullCudaGraphBackend,
+    )
+
+    backend = getattr(runner, "backend", None)
+    if not isinstance(backend, FullCudaGraphBackend):
+        raise RuntimeError(
+            "[Foundry] decode CUDA graphs must use the full backend, got "
+            f"{type(backend).__name__}; Foundry pins --cuda-graph-backend-decode full"
+        )
+    if getattr(runner, "attention_graph_variants", None) is not None:
+        raise RuntimeError(
+            "[Foundry] this model captures attention graph variants "
+            f"({type(runner.attention_graph_variants).__name__}); Foundry save/load "
+            "does not support graph variants"
+        )
+    model_runner = getattr(runner, "model_runner", None)
+    elastic = getattr(model_runner, "_elastic_cuda_graph_enabled", None)
+    if callable(elastic) and elastic():
+        raise RuntimeError(
+            "[Foundry] elastic-EP CUDA-graph recapture is enabled (elastic EP with "
+            "--max-ep-size > tp size); Foundry cannot restore recaptured graphs"
+        )

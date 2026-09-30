@@ -32,6 +32,9 @@ PUBLIC_MODULES = [
     "foundry.integration.sglang.hooks",
     "foundry.integration.sglang.runtime",
     "foundry.integration.sglang.graph_ops",
+    "foundry.integration.sglang.plugin",
+    # sglang plugin entry point (pyproject [project.entry-points."sglang.srt.plugins"])
+    "foundry_sglang_plugin",
 ]
 
 # Names that have historically been ruff --fix victims because they live in
