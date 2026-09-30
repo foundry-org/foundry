@@ -240,15 +240,14 @@ def test_every_field_pin_is_applied_on_sglang_defaults(model_dir, plugin_hooks, 
         assert f"[Foundry] pin: {pin.field}={pin.value!r}" in err, pin.field
 
 
-def test_field_pin_defaults_match_the_installed_sglang():
+def test_field_pin_defaults_match_the_installed_sglang(model_dir):
     """FieldPin.default is what tells a user's contrary value from sglang's
-    default; red if sglang changes one of them."""
-    import dataclasses
-
-    defaults = {f.name: f.default for f in dataclasses.fields(ServerArgs)}
+    default; red if sglang changes one of them. ServerArgs is a msgspec
+    struct, not a dataclass: read the defaults off an unresolved record."""
+    sa = _unresolved(model_dir)
     for pin in plugin.FIELD_PINS:
-        assert defaults[pin.field] == pin.default, pin.field
-    assert defaults[plugin.DSV4_ATTN_FIELD] == "auto"
+        assert getattr(sa, pin.field) == pin.default, pin.field
+    assert getattr(sa, plugin.DSV4_ATTN_FIELD) == "auto"
 
 
 def test_pinned_value_given_explicitly_is_accepted(model_dir, plugin_hooks):
@@ -269,7 +268,10 @@ def test_non_trtllm_dsv4_backend_is_kept(model_dir):
         (dict(enable_symm_mem=True), r"--enable-symm-mem=True: NCCL symmetric-memory windows"),
         (dict(enable_nccl_nvls=True), r"--enable-nccl-nvls=True: NVLS multicast"),
         (dict(enable_mscclpp=True), r"--enable-mscclpp=True: MSCCL\+\+"),
-        (dict(enable_two_batch_overlap=True), r"--enable-two-batch-overlap=True: the per-shape"),
+        (
+            dict(enable_two_batch_overlap=True),
+            r"--enable-two-batch-overlap=True: not validated with Foundry",
+        ),
         (dict(enable_memory_saver=True), r"--enable-memory-saver=True: torch_memory_saver"),
         (dict(dsv4_attn_backend="trtllm"), r"--dsv4-attn-backend=trtllm: the trtllm"),
     ],
