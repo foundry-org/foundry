@@ -132,11 +132,7 @@ CASES = [
     _case("dsv4_flash_fp8_ep4", "sgl-project/DeepSeek-V4-Flash-FP8", 4, _ep(4, 2048, []),
           decode_max_bs=64, memfrac=0.7, weights="dummy", restore_bound_s=3.0,
           env={**_EP_ENV, "SGLANG_DSV4_FP4_EXPERTS": "0"},
-          marks=[
-              pytest.mark.xlarge,
-              # On SGLang main the restored topk_small_batch_cluster_kernel node lacks its cluster dims.
-              pytest.mark.xfail(reason="LOAD: cuGraphAddKernelNode error 912 on a cluster-launch kernel", strict=False),
-          ]),
+          marks=pytest.mark.xlarge),
 ]  # fmt: skip
 
 
