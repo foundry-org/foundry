@@ -1,11 +1,14 @@
+# foundry.ops is a torch C++/CUDA extension: it must be compiled against the torch
+# that will import it. Install with --no-build-isolation into an environment that
+# already has that torch (and cmake>=4.0, ninja); an isolated build would compile
+# against whatever torch pip resolves here, not the runtime one.
 [build-system]
 requires = [
     "setuptools>=80",
     "wheel",
     "cmake>=4.0",
     "ninja",
-    "pytest",
-    "torch==2.9.0"
+    "torch",
 ]
 build-backend = "setuptools.build_meta"
 
