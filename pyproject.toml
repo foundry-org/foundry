@@ -110,3 +110,7 @@ docstring-code-format = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "xlarge: 4-GPU, 100+ GB model end-to-end cases; deselected by default, run with -m xlarge",
+]
+addopts = "-m 'not xlarge'"
