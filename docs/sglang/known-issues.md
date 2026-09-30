@@ -1,5 +1,26 @@
 # Known issues — SGLang integration
 
+## SAVE spends ~30 s in `Init torch distributed` (and ~20 s more elsewhere) copying over-read fatbins (FIXED, 2026-09-25)
+
+SAVE only (LOAD skips fatbin processing). The hook sized each registered fatbin by walking every following
+container of the library's `.nv_fatbin` section (`compute_fatbin_size`), so each image was read to the end of the
+section: NCCL's 127 MB linked library as 5.95 GB, a 6200-byte cuBLASLt image as 140 MB. SAVE copied and CRC-64'd
+7.8 GB per rank during NCCL init (30 s of a 31.5 s dist init) and 14-15 GB / 51-56 s per rank over the run, and
+the pack wrote the tails into `fatbin_image_packed.img`. Fixed by sizing a fatbin by its own header
+(`header_size + size`). Qwen3-30B-A3B ep4, MAXBS=16, 4xH200: dist init 32 -> 1.6-2.7 s, weight load 4.1 -> 0.26 s,
+SAVE health 106 -> 45 s (= native graph), archive 16.7 GB -> 329 MB; parity and every kernel lookup unchanged.
+Archives saved before the fix still load (LOAD does not recompute hashes). Details:
+`claude-doc/report_coldstart/h200_8gpu_venv/fatbin_overread_fix.md`.
+
+## Bare-host DeepEP engines start ~40 s late: rdma-core's udev wait on blocked verbs devices (FIXED with a shim, 2026-09-25)
+
+Not a Foundry bug, but it hits SAVE and LOAD as hard as the native engines: on a host where
+`/dev/infiniband/uverbs*` exist but cannot be opened, DeepEP low-latency's forced IBGDA transport makes
+rdma-core wait up to 5 s per HCA for udev in the first DeepEP buffer creation (the first captured shape
+natively, the pre-capture bootstrap on SAVE/LOAD). Restore time is unaffected. Cause, evidence and the
+`LD_PRELOAD` shim that removes it: [../bare-host-verbs-udev-wait.md](../bare-host-verbs-udev-wait.md)
+(`tools/host/no_cdev_wait.c`).
+
 ## SAVE fails cold: inductor autotunes a fresh Triton kernel inside the capture window (LIMITATION, 2026-09-24)
 
 **Symptom.** GLM-5.3-Flash EP8 (dummy weights) as the FIRST engine ever run for that model in a fresh container:

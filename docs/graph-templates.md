@@ -32,7 +32,9 @@ LOAD (`CUDAGraph::start_graph_builds` / `finish_graph_loads`, parallel path in
 1. **Phase 1** — parse all `.cugraph` binaries on a thread pool (~30 ms for 256).
 2. **Phase 2a** — build each template's `CUgraph` node by node
    (`build_graph_from_parsed`) and instantiate it. This is the only place the
-   37 ms/graph cost is paid.
+   37 ms/graph cost is paid. The template's full JSON (the `.cugraph` has no
+   node list for `build_graph_from_parsed`) is parsed on an async thread one
+   template ahead, and its own on-demand data is read from the `.cugraph`.
 3. **Phase 2b/2c** — for each member: apply its parameter set to the template's
    `CUgraph` with `cuGraphKernelNodeSetParams` (`apply_on_demand_updates`) and
    `cudaGraphInstantiate` a **dedicated** exec (`materialize_on_demand_exec`).
@@ -84,5 +86,5 @@ site of `materialize_on_demand_exec` differs.
 | `graph_templates = true/false` | SAVE TOML | group graphs into templates (default) or store every graph in full |
 | `FOUNDRY_LAZY_GRAPH_EXEC=1` | LOAD env | defer member instantiation to first replay |
 | `FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0` | SAVE env | group graphs that differ only in per-node cluster *dimensions* (deep_gemm picks the cluster size by M): Qwen3-30B-A3B EP2 goes from 26 to 10 templates, Phase 2 2.26 s -> 1.74 s. Members set their own cluster dims before instantiation (`apply_on_demand_updates` neutralises the template's dims first so the params update passes the driver's grid/cluster check). Default keeps the exact dims in the key. |
-| `FOUNDRY_MMAP_ARCHIVE=1` | LOAD env | mmap `fatbin_image_packed.img` instead of reading it into memory before `cuLibraryLoadData` (images are loaded with `CU_LIBRARY_BINARY_IS_PRESERVED`, so the mapping stays alive). EP archives carry ~5 GB of sgl-kernel FlashAttention-3 fatbins (sm_80 + sm_86 + sm_90a, of which the driver parses only what it uses): `setup_graph_extension` drops from 3.1 s to 0.16 s on Qwen3-30B-A3B EP2. |
+| `FOUNDRY_MMAP_ARCHIVE` (default on; `0`/`false` disables) | LOAD env | mmap `fatbin_image_packed.img` instead of reading it into memory before `cuLibraryLoadData` (images are loaded with `CU_LIBRARY_BINARY_IS_PRESERVED`, so the mapping stays alive). EP archives carry ~5 GB of sgl-kernel FlashAttention-3 fatbins (sm_80 + sm_86 + sm_90a, of which the driver parses only what it uses): `setup_graph_extension` drops from 3.1 s to 0.16 s on Qwen3-30B-A3B EP2. |
 | `FOUNDRY_DEBUG` build | compile flag | logs per-graph edge verification and template/member decisions |
