@@ -120,6 +120,23 @@ Earlier measurement (before the pipeline and the prewarm), Qwen3-30B-A3B EP=4,
 The gap grows linearly with graph count; at 20–52 graphs templating saves
 0.2–1.1 s.
 
+## Cluster launches
+
+A kernel node's cluster comes from the function's compiled `__cluster_dims__` (SAVE
+records it as `func_attrs.required_cluster_*`) or from a cluster-dimension launch
+attribute (`kernel_node_attrs.clusterDim*`); every builder (JSON, binary template,
+member update, exec-pool prewarm) merges the two the same way. A cluster wider than 8
+blocks is non-portable: the driver rejects the node (`cuGraphAddKernelNode`, member
+`SetParams`, or the cluster attribute) with `CUDA_ERROR_INVALID_CLUSTER_SIZE` (912)
+unless the function has `CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED=1`. The
+capturing process sets that itself before its first launch (sglang main's cluster-16
+DSA top-k, `topk_small_batch_cluster_kernel<..., 16, 1>`); the function LOAD resolves
+from the archive never sees that launch. `include/ClusterOptIn.h` sets it (once per
+handle) whenever the merged cluster exceeds 8 blocks; the attribute is not stored
+because the dims imply it, so archives saved before this need no migration. If the
+recorded dims miss a compiled cluster, the add retries once after reading the compiled
+dims from the driver. Test: `tests/test_cluster_optin.py` (driver-level, no archive).
+
 ## Why a dedicated exec per member, not one shared exec
 
 The first design kept one `CUgraphExec` per template and switched batch sizes

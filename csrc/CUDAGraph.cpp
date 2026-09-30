@@ -548,6 +548,10 @@ void CUDAGraph::apply_on_demand_updates() {
           }
         }
         ensure_dynamic_smem_optin(u.kernel_params, capture_dev_, "ON-DEMAND");
+        if (u.kernel_attrs.has_cluster_dim)
+          ensure_cluster_size_optin(u.kernel_params, capture_dev_, u.kernel_attrs.clusterDimX,
+                                    u.kernel_attrs.clusterDimY, u.kernel_attrs.clusterDimZ,
+                                    "ON-DEMAND");
         CUresult sp = cuGraphKernelNodeSetParams(node, &u.kernel_params);
         if (sp != CUDA_SUCCESS && u.kernel_params.kern && !u.kernel_params.func) {
           // Re-targeting a node to another CUkernel can be rejected; retry
@@ -556,6 +560,10 @@ void CUDAGraph::apply_on_demand_updates() {
           alt.kern = nullptr;
           if (cuKernelGetFunction(&alt.func, u.kernel_params.kern) == CUDA_SUCCESS && alt.func) {
             ensure_dynamic_smem_optin(alt, capture_dev_, "ON-DEMAND");
+            if (u.kernel_attrs.has_cluster_dim)
+              ensure_cluster_size_optin(alt, capture_dev_, u.kernel_attrs.clusterDimX,
+                                        u.kernel_attrs.clusterDimY, u.kernel_attrs.clusterDimZ,
+                                        "ON-DEMAND");
             CUresult sp2 = cuGraphKernelNodeSetParams(node, &alt);
             fprintf(stderr,
                     "[foundry ON-DEMAND] graph %d node %zu: kern-based SetParams failed (%d), "
@@ -2051,10 +2059,9 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
 
         apply_saved_function_attributes(func_handle_variant, graph->capture_dev_, max_shared,
                                         preferred_carveout, "LOAD");
-        // NOTE: We do not set CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH,
-        // CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH,
-        // and CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED because these are
-        // kernel properties may not be changed at runtime.
+        // NOTE: CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_{WIDTH,HEIGHT,DEPTH} are not set: a compiled
+        // cluster cannot be changed at runtime. NON_PORTABLE_CLUSTER_SIZE_ALLOWED can, and is set
+        // by add_restored_kernel_node when the cluster exceeds the portable size.
       }
 
       const json::array& kernel_params_array = params.at("kernelParams").as_array();
@@ -2138,8 +2145,9 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
         node_params.extra = extra_config.data();
       }
 
-      ensure_dynamic_smem_optin(node_params, graph->capture_dev_, "LOAD");
-      CUresult kernel_result = cuGraphAddKernelNode(&cuNode, cuGraph, nullptr, 0, &node_params);
+      CUresult kernel_result =
+          add_restored_kernel_node(&cuNode, cuGraph, node_params, graph->capture_dev_,
+                                   cluster_width, cluster_height, cluster_depth, "LOAD");
       if (kernel_result != CUDA_SUCCESS) {
         std::string function_name = params.at("function_name").as_string().c_str();
         fprintf(stderr,
@@ -2533,6 +2541,13 @@ void ensure_dynamic_smem_optin(const CUDA_KERNEL_NODE_PARAMS& params, CUdevice d
                                const char* where) {
   raise_dynamic_smem_cap(params.kern, params.func, dev, static_cast<int>(params.sharedMemBytes),
                          where);
+}
+
+CUresult add_restored_kernel_node(CUgraphNode* node, CUgraph graph,
+                                  const CUDA_KERNEL_NODE_PARAMS& params, CUdevice dev, unsigned cx,
+                                  unsigned cy, unsigned cz, const char* where) {
+  ensure_dynamic_smem_optin(params, dev, where);
+  return add_kernel_node_cluster_optin(node, graph, params, dev, cx, cy, cz, where);
 }
 
 }  // namespace foundry
