@@ -44,7 +44,7 @@ from sglang.test.test_utils import (  # noqa: E402
     terminate_and_kill_process_tree,
 )
 
-# Placeholder until measured over 3 runs per case.
+# H200, 3 real-weight runs per 35B case: tp2 within 1.3%; ep2 -0.4%, +1.2%, +12.3%.
 TPOT_REL_TOL = 0.15
 LAUNCH_TIMEOUT_S = 3600
 
@@ -117,7 +117,8 @@ def _case(
     )
 
 
-# restore_bound_s values are placeholders (to be set from 3 measured runs); decode_max_bs is per DP rank on EP rows.
+# restore_bound_s: 35B measured max 0.26 s (tp2) / 0.34 s (ep2) over 3 H200 runs; the 4-GPU values are unmeasured.
+# decode_max_bs is per DP rank on EP rows.
 CASES = [
     _case("q35_tp2", "Qwen/Qwen3.5-35B-A3B", 2, _tp(2),
           decode_max_bs=64, memfrac=0.8, weights="real", restore_bound_s=2.0),
