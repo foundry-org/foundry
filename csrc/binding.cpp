@@ -124,7 +124,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readonly("offset_and_sizes", &::foundry::KernelNodeMetadata::offset_and_sizes);
 
   py::class_<::foundry::PendingGraphLoads, std::shared_ptr<::foundry::PendingGraphLoads>>(
-      m, "PendingGraphLoads");
+      m, "PendingGraphLoads")
+      // Seconds from start_graph_builds' entry to the end of Phase 2; waits
+      // for the background builds first (0 for an empty or failed build).
+      .def_property_readonly("build_seconds", [](::foundry::PendingGraphLoads& self) {
+        if (self.build_complete_.valid()) {
+          py::gil_scoped_release release;
+          self.build_complete_.wait();
+        }
+        return *self.build_seconds_;
+      });
 
   shared_ptr_class_<::foundry::CUDAGraph>(m, "CUDAGraph")
       .def(py::init<bool>(), py::arg("keep_graph") = false)

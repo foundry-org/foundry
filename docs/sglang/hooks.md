@@ -43,8 +43,9 @@ with an async illegal memory access. Patch 1 therefore calls `set_device(gpu_id)
 template / on-demand linking needs all graphs in one build. Per-graph builds leave on-demand graphs without a
 `shared_exec` and replay aborts with `Called CUDAGraph::replay without a preceding successful capture or load`. The
 builds are finished one per shape inside the loop (`finish_one_graph_load`, from patch 3). `finish_decode_graph_restore`
-checks the count and logs `[Foundry] Loaded N SGLang graphs in X s (restore calls Y s)`: X spans the whole loop
-(per-shape prep included), Y only the restore calls (build wait + allocator replay + output reconstruction).
+checks the count and logs `[Foundry] Loaded N SGLang graphs in X s (builds B s, handover H s)`, only Foundry's restore
+work, and `[Foundry] SGLang decode capture loop on LOAD: Y s (N shapes, restore X s, per-shape prep Z s)` for the loop
+wall (the prefill runner logs the same pair; see [`save-load-workflow.md`](save-load-workflow.md)).
 
 **Archive compatibility.** SAVE writes `capture_loop_version = 2` (`runtime.CAPTURE_LOOP_VERSION`) into each rank's
 `region_layout.json`. LOAD checks it at setup (`check_capture_loop_version`, right after `setup_graph_extension`,

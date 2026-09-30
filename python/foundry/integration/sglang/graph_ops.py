@@ -9,7 +9,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -28,7 +28,8 @@ from foundry.integration.sglang.runtime import get_state
 
 logger = logging.getLogger(__name__)
 
-_pending_graph_builds: tuple[Any, list[tuple[int, str, dict[str, Any]]]] | None = None
+# (pending, graph files, perf_counter when the builds were started).
+_pending_graph_builds: tuple[Any, list[tuple[int, str, dict[str, Any]]], float] | None = None
 _GRAPH_FILENAME_RE = re.compile(r"^graph_(?P<index>\d+)_FULL_t(?P<bs>\d+)_r\d+_UX_pcN\.json$")
 # Full-backend prefill graphs: one per token bucket t and cached-prefix variant
 # pc (prefix chunks, 0 = suffix-only), captured with r request slots. Their own
@@ -267,6 +268,71 @@ def _scan_prefill_graph_files(workspace_dir: str) -> list[tuple[int, str, dict[s
     return graph_files
 
 
+@dataclass
+class _RestoreTiming:
+    """LOAD: timing of one runner's graph restore, logged by _log_restore."""
+
+    # When this runner's restore started (its capture, before the builds are
+    # launched or taken over) and when its start_graph_builds was called
+    # (earlier than t0 only for the builds started at setup).
+    t0: float
+    builds_t0: float
+    # (start, end) of each restore_next_* call.
+    calls: list[tuple[float, float]] = field(default_factory=list)
+
+
+_warned_no_build_seconds = False
+
+
+def _log_restore(what: str, n: int, pending: Any, timing: _RestoreTiming, loop_s: float) -> None:
+    """Log the restore work and, separately, the capture loop around it.
+
+    ``Loaded`` counts only foundry's work: the builds (Phase 1 + Phase 2, from
+    this runner's restore start to the last build / instantiate) plus the
+    part of each restore_next_* call after the builds finished (allocator
+    replay, output reconstruction). A call's wait for the builds is already
+    in the builds. The loop line is the upstream capture() wall around it;
+    ``per-shape prep`` is that wall minus the time inside the restore calls
+    (warmup, freeze_gc, dummy batches, attention metadata, ...). The builds
+    run on the background thread during the loop, so restore + prep can
+    exceed the loop wall."""
+    global _warned_no_build_seconds
+    build_s = getattr(pending, "build_seconds", None)
+    if build_s is None:
+        # Extension built before PendingGraphLoads.build_seconds: count the
+        # waits inside the restore calls instead of the builds.
+        if not _warned_no_build_seconds:
+            _warned_no_build_seconds = True
+            logger.warning(
+                "[Foundry] the foundry extension has no PendingGraphLoads.build_seconds "
+                "(rebuild it); the restore time below counts only the restore calls"
+            )
+        build_end = timing.t0
+    else:
+        build_end = timing.builds_t0 + build_s
+    builds = max(0.0, build_end - timing.t0)
+    handover = sum(max(0.0, end - max(start, build_end)) for start, end in timing.calls)
+    in_calls = sum(end - start for start, end in timing.calls)
+    graphs = "SGLang prefill graphs" if what == "prefill" else "SGLang graphs"
+    logger.info(
+        "[Foundry] Loaded %d %s in %.3fs (builds %.3fs, handover %.3fs)",
+        n,
+        graphs,
+        builds + handover,
+        builds,
+        handover,
+    )
+    logger.info(
+        "[Foundry] SGLang %s capture loop on LOAD: %.3fs (%d shapes, restore %.3fs, "
+        "per-shape prep %.3fs)",
+        what,
+        loop_s,
+        n,
+        builds + handover,
+        max(0.0, loop_s - in_calls),
+    )
+
+
 def has_prefill_graphs() -> bool:
     cfg = get_config()
     if cfg is None or cfg.workspace_dir is None:
@@ -279,7 +345,7 @@ class _PrefillRestore:
     pending: Any
     graph_files: list[tuple[int, str, dict[str, Any]]]
     output_specs: dict[str, Any]
-    t0: float
+    timing: _RestoreTiming
     next: int = 0
 
 
@@ -315,7 +381,7 @@ def start_prefill_graph_restore() -> dict[str, Any]:
         pending=pending,
         graph_files=graph_files,
         output_specs=record.get("output_specs", {}),
-        t0=t0,
+        timing=_RestoreTiming(t0=t0, builds_t0=t0),
     )
     logger.info(
         "[Foundry] Started SGLang prefill graph builds for %d graphs in %.3fs",
@@ -347,7 +413,9 @@ def restore_next_prefill_graph(key: Any, req_slots: int) -> tuple[Any, Any]:
             "capture shapes (--cuda-graph-bs-prefill, full_prefill_max_req, chunked-prefix "
             "settings) differ between SAVE and LOAD."
         )
+    t = time.perf_counter()
     graph, tensors = FoundryCUDAGraph.finish_one_graph_load(r.pending, r.next)
+    r.timing.calls.append((t, time.perf_counter()))
     r.next += 1
     output = _unflatten_prefill_output(r.output_specs.get(filename, "T"), tensors)
     # Strong reference, like the decode graphs.
@@ -355,7 +423,9 @@ def restore_next_prefill_graph(key: Any, req_slots: int) -> tuple[Any, Any]:
     return graph, output
 
 
-def finish_prefill_graph_restore() -> None:
+def finish_prefill_graph_restore(loop_s: float) -> None:
+    """LOAD, after the upstream prefill capture loop (``loop_s`` is its
+    wall): check that it restored every archived prefill graph."""
     global _prefill_restore
     r = _prefill_restore
     _prefill_restore = None
@@ -368,11 +438,7 @@ def finish_prefill_graph_restore() -> None:
             f"restored {r.next}: the prefill capture shapes differ from SAVE"
         )
     state.prefill_graphs_restored = True
-    logger.info(
-        "[Foundry] Loaded %d SGLang prefill graphs in %.3fs",
-        r.next,
-        time.perf_counter() - r.t0,
-    )
+    _log_restore("prefill", r.next, r.pending, r.timing, loop_s)
 
 
 @nvtx_traced("foundry.save.pack_fatbins")
@@ -423,7 +489,7 @@ def start_graph_builds() -> None:
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
     t0 = time.perf_counter()
     pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
-    _pending_graph_builds = (pending, graph_files)
+    _pending_graph_builds = (pending, graph_files, t0)
     logger.info(
         "[Foundry] Started SGLang graph builds for %d graphs in %.3fs",
         len(paths),
@@ -849,8 +915,7 @@ def _bootstrap_deepep_v2_buffer(cuda_graph_runner) -> bool:
 class _DecodeRestore:
     pending: Any
     graph_files: list[tuple[int, str, dict[str, Any]]]
-    t0: float
-    restore_s: float = 0.0
+    timing: _RestoreTiming
     next: int = 0
 
 
@@ -884,7 +949,7 @@ def start_decode_graph_restore() -> None:
         # background thread during torch-distributed init, weight loading and
         # the memory-pool setup; allocator replay and output reconstruction
         # still happen per shape below, at the capture points.
-        pending, early_files = _pending_graph_builds
+        pending, early_files, builds_t0 = _pending_graph_builds
         _pending_graph_builds = None
         if [f for _, f, _ in early_files] != [f for _, f, _ in graph_files]:
             raise RuntimeError("Foundry: graph file list changed between setup and load")
@@ -892,7 +957,12 @@ def start_decode_graph_restore() -> None:
     else:
         paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
         pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
-    _decode_restore = _DecodeRestore(pending=pending, graph_files=graph_files, t0=t0)
+        builds_t0 = t0
+    _decode_restore = _DecodeRestore(
+        pending=pending,
+        graph_files=graph_files,
+        timing=_RestoreTiming(t0=t0, builds_t0=builds_t0),
+    )
 
 
 def restore_next_decode_graph(key: Any) -> tuple[Any, Any]:
@@ -919,7 +989,7 @@ def restore_next_decode_graph(key: Any) -> tuple[Any, Any]:
     t = time.perf_counter()
     with nvtx_range("foundry.graph_restore.finish_one"):
         graph, tensors = FoundryCUDAGraph.finish_one_graph_load(r.pending, r.next)
-    r.restore_s += time.perf_counter() - t
+    r.timing.calls.append((t, time.perf_counter()))
     r.next += 1
     output = _unpack_output(tensors)
     # Strong reference next to the backend's own.
@@ -927,9 +997,9 @@ def restore_next_decode_graph(key: Any) -> tuple[Any, Any]:
     return graph, output
 
 
-def finish_decode_graph_restore() -> None:
-    """LOAD, after the upstream decode capture loop: check that it restored
-    every archived decode graph."""
+def finish_decode_graph_restore(loop_s: float) -> None:
+    """LOAD, after the upstream decode capture loop (``loop_s`` is its
+    wall): check that it restored every archived decode graph."""
     global _decode_restore
     r = _decode_restore
     _decode_restore = None
@@ -940,12 +1010,4 @@ def finish_decode_graph_restore() -> None:
             f"Foundry archive holds {len(r.graph_files)} decode graphs, the capture loop "
             f"restored {r.next}: the decode capture sizes (--cuda-graph-bs) differ from SAVE"
         )
-    # The first number spans the whole upstream loop (per-shape eager prep +
-    # the restores), the second only the restore calls (build wait + allocator
-    # replay + output reconstruction).
-    logger.info(
-        "[Foundry] Loaded %d SGLang graphs in %.3fs (restore calls %.3fs)",
-        r.next,
-        time.perf_counter() - r.t0,
-        r.restore_s,
-    )
+    _log_restore("decode", r.next, r.pending, r.timing, loop_s)

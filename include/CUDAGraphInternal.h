@@ -57,6 +57,11 @@ struct PendingGraphLoads {
   // Signaled when background graph building (Phase 2) completes.
   // finish_graph_loads_impl waits on this before allocator replay.
   std::shared_future<void> build_complete_;
+
+  // Seconds from start_graph_builds' entry (Phase 1 start) to the end of
+  // Phase 2 (the last build / instantiate). Written by the build thread
+  // before build_complete_ is signaled; read it only after that wait.
+  std::shared_ptr<double> build_seconds_ = std::make_shared<double>(0.0);
 };
 
 // Split load: JSON parse + template build + on-demand prep (synchronous).

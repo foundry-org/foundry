@@ -2495,7 +2495,8 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
                          json_path_list = std::move(json_path_list), build_promise, main_ctx,
                          actual_threads, template_for = std::move(template_for),
                          topology_groups = std::move(topology_groups),
-                         graph_names = std::move(graph_names)]() mutable {
+                         graph_names = std::move(graph_names),
+                         build_seconds = pending->build_seconds_, t_start]() mutable {
     auto t_phase2 = std::chrono::steady_clock::now();
     size_t num = all_parsed.size();
 
@@ -2780,6 +2781,8 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
               prewarm_done ? "finished before Phase 2" : "not used",
               ((double)free_before - (double)free_after) / (1024.0 * 1024.0), phase2_start_epoch);
 
+      *build_seconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
       build_promise->set_value();
     } catch (...) {
       build_promise->set_exception(std::current_exception());

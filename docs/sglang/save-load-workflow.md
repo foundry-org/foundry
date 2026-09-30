@@ -153,7 +153,8 @@ LOAD (success):
 …
 [CGE] Phase 2: 9 templates + 43 on-demand = 52 graphs built in xx.x ms
 [Foundry] SGLang alloc_offset[before_decode_restore]=… (… MB)
-[Foundry] Loaded 52 SGLang graphs in 0.x s (restore calls 0.0x s)
+[Foundry] Loaded 52 SGLang graphs in 0.0xs (builds 0.0xs, handover 0.00xs)
+[Foundry] SGLang decode capture loop on LOAD: 0.xs (52 shapes, restore 0.0xs, per-shape prep 0.xs)
 [Foundry] SGLang alloc_offset[after_load_all_graphs]=22785556480 (… MB)
 …
 INFO:     Application startup complete.
@@ -161,8 +162,23 @@ INFO:     Application startup complete.
 
 The `after_load_all_graphs` value **must** equal SAVE's `final_alloc_offset`. If it doesn't, see [`memory-consistency.md`](memory-consistency.md).
 The build lines (`[CGE] Phase 1/2`) come from the background build thread and may interleave with the offset lines.
-The graphs are finished one per shape inside sglang's capture loop, so the `Loaded` time spans the whole loop
-(per-shape prep included); `restore calls` is the part spent in foundry's restore.
+The graphs are finished one per shape inside sglang's capture loop. The two timing lines, logged once per runner
+(decode above; the prefill runner logs `Loaded N SGLang prefill graphs in ...` and `SGLang prefill capture loop on
+LOAD: ...` the same way when prefill graphs are on), mean:
+
+- `Loaded N ... in X s`: only Foundry's restore work. `builds` is the time from the start of this runner's restore
+  (the builds being launched, or taken over when they were started at setup) to the last build / instantiate
+  finishing (Phase 1 + Phase 2). `handover` is the part of the per-shape `restore_next_*` calls after the builds
+  finished (allocator replay, output reconstruction). A call's wait for the builds is counted once, in `builds`.
+  X = builds + handover.
+- `capture loop on LOAD: Y s`: the wall time of sglang's own `capture()` on LOAD. `per-shape prep` is Y minus the time
+  spent inside the restore calls: sglang's work around the restores (the run-once kernel `warmup()`, the two
+  `gc.collect()` of `freeze_gc`, and per shape the dummy batch and the attention metadata). The builds run on the
+  background thread while the loop runs, so restore + prep can exceed Y.
+
+On Qwen3-1.7B (FlashInfer, prefill 8-64 + decode 1-8, one H200) Phase 2 took ~11 ms (prefill) and ~19 ms (decode),
+so the restore is tens of milliseconds per runner, while the loops take ~1.1 s (prefill, which also runs the run-once
+`warmup()`) and ~0.7 s (decode).
 
 An archive saved by older code (no `capture_loop_version` in `region_layout.json`) is refused at setup, before the
 weights load: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the current code`.

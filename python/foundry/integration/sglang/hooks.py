@@ -554,8 +554,9 @@ def _patch_cuda_graph_capture() -> None:
             # metadata planned per shape, the chunked-prefix buffers, the
             # capture session's pool) then allocates exactly as on SAVE, and
             # patched_capture_one restores each graph where SAVE captured it.
+            t_loop = time.perf_counter()
             result = orig_prefill_capture(self)
-            finish_prefill_graph_restore()
+            finish_prefill_graph_restore(time.perf_counter() - t_loop)
             rt.log_alloc_offset("after_prefill_restore")
             return result
 
@@ -609,8 +610,9 @@ def _patch_cuda_graph_capture() -> None:
             # it. Every host-side object is thus re-created by sglang's code
             # and lands at SAVE's address through the deterministic
             # allocation replay.
+            t_loop = time.perf_counter()
             result = orig_capture(self)
-            finish_decode_graph_restore()
+            finish_decode_graph_restore(time.perf_counter() - t_loop)
             rt.log_alloc_offset("after_load_all_graphs")
 
             # Surrender torch-cached-but-free segments so later eager
