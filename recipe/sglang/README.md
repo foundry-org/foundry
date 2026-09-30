@@ -7,7 +7,7 @@ integration.
 
 | Component | Commit | Notes |
 |---|---|---|
-| SGLang fork `foundry-org/sglang`, branch **`foundry`** | `6272eb04c5` | = upstream `main` `03ea13a545` (2026-09-16) + one 8-file integration commit (`[foundry] SGLang integration: fast cold start by CUDA graph context materialization`). Check out this commit; `main` alone has no `--foundry-graph-extension-config-path`. |
+| SGLang fork `foundry-org/sglang`, branch **`foundry`** | `6272eb04c5` | = upstream `main` `03ea13a545` (2026-09-16) + one 8-file integration commit (`[foundry] SGLang integration: fast cold start by CUDA graph context materialization`). Check out this commit; `main` alone has no `--foundry-graph-extension-config-path`. Inkling-Small needs the branch head instead (`a911f6b66b`: five DP-attention fixes plus the `_run_mlp` fix that every TP-attention topology needs, report findings 14 and 18); every other validated model runs on `6272eb04c5`. |
 | Foundry, branch **`coldstart`** | `b4c2a84` (or later) | The sglang integration in `python/foundry/integration/sglang/` plus the hook/graph fixes the Qwen3.5 / DeepSeek rows needed. Archives written by earlier foundry commits (`final_alloc_offset.json` + `live_ranges.json` layout) do not load on this version: re-run `--save`. |
 
 The fork commit pins **torch 2.13.0+cu130**, sglang-kernel 0.4.7, sgl-deep-ep 0.1.2, sgl-deep-gemm 0.2.0 and
@@ -82,6 +82,10 @@ under `SGLANG_CACHE_DIR` hold exactly the artifacts SAVE loads. An eager run
 instead of views of the static batch buffers, dynamo guards differently, and the artifacts
 differ. Any earlier graph-mode run of the same model on the machine (a baseline, a previous
 SAVE) warms the caches too; a fresh container or a restored radix host does not.
+
+LOAD maps the packed kernel image (default; `FOUNDRY_MMAP_ARCHIVE=0` reads it eagerly) instead of reading
+4.7-5.5 GB into memory first: on 8xH200 that took the binary restore from 1.67 s to 0.10 s per rank
+with identical output (measured with the archive in the page cache).
 
 Because the two TOMLs are shared (single `workspace_root = "foundry_archive"`), one
 archive is written per host; run a fresh `rm -rf foundry_archive` whenever you change
@@ -318,14 +322,87 @@ graph / LOAD and LOAD TPOT vs native at bs 1 / 8 / 32 / 128:
 | Qwen3.5-122B-A10B-FP8, attn-TP4 + EP8 | 64 | 67 / 90 / 75 s | 2.0 s | eager bs1 / -0.6 / +4.7 / +2.6 % |
 | Qwen3.5-122B-A10B bf16, EP8 | 256 | 65 / 141 / 71 s | 5.8 s | +2.5 / -0.1 / +20 (single run) / +4.0 % |
 | DeepSeek-V4-Flash-FP8, EP8 | 256 | 99 (cold caches: 360 graph) / - / 72 s | 7.0 s | +0.6 / +1.0 / -10 / -6 % (single run) |
+| Inkling-Small bf16, TP8+EP8 (state pool pinned) | 64 | 48 / 71 / 57 s | 1.9 s | -0.6 (bs 1 eager) / 0.0 / +1.7 / +12 % (single run) |
+| Inkling-Small bf16, EP8 (DP attention; fork fixes 04b357d7f7..62854bec83) | 64 | - / 76 / 69 s | 2.8 s | -0.5 / -0.3 / +1.4 / -40 % (single run, bs 128 wave includes prefills) |
 
 Also validated there (SAVE + LOAD, identical parity): Qwen3.5-122B attn-TP2+EP4 (FP8 and bf16), Qwen3.5-397B-FP8
 attn-TP4+EP8, gpt-oss-120b EP4 / attn-TP4+EP4 / EP8, Qwen3.5-35B-A3B EP8 and attn-TP2+EP4, GLM-4.7-Flash EP8,
 Qwen3-Next-80B EP8, Qwen3-30B-A3B (bf16, FP8) EP2 / TP2 / attn-TP2+EP2, Qwen3-1.7B single / DP2 / TP2. Not
 servable in plain sglang on that host: DeepSeek-V4-Flash-FP8 (DeepGEMM has no ue8m0 layout on SM90),
-Inkling-Small before the fork's idle-rank fixes (see the report). DeepSeek-V4-Flash-FP8 needs
-`SGLANG_DSV4_FP4_EXPERTS=0` without a probe-able checkpoint (the script sets it). Hybrid (GDN/KDA) models: size
-`--max-mamba-cache-size` to at least `dp_size * cuda-graph-max-bs-decode`, or sglang silently caps the graph set.
+Inkling-Small needs the fork's five DP-attention fixes (04b357d7f7..62854bec83), a911f6b66b for every TP-attention
+topology (78112c5026 passed `reduce=` to the dense MLP layers, which failed at capture), and a pinned state pool
+(report findings 14, 17 and 18). DeepSeek-V4-Flash-FP8 needs
+`SGLANG_DSV4_FP4_EXPERTS=0` without a probe-able checkpoint (the script sets it). Hybrid (GDN/KDA/sconv) models: always set
+`--max-mamba-cache-size` explicitly (at least `dp_size * cuda-graph-max-bs-decode` slots per request-slot): sglang
+otherwise sizes the pool from free memory, silently caps the graph set, and the cap differs between the native
+engine, SAVE and LOAD by a few requests, which breaks the capture of the largest shape.
+
+**4xH200, 2026-09-24, reduced-layer validation** (foundry `coldstart` @ b4a1f7f, sglang fork `foundry` @ a911f6b66b,
+driver 595, dummy weights, `--max-mamba-cache-size 4096`, 3 bench runs). Inkling-Small does not fit 4 ranks in bf16,
+so these rows serve a 21-of-42-layer copy of its config (`experimental/matrix3/make_inkling_reduced.py`: same
+per-layer architecture and local/global pattern). They validate restore and parity, not serving performance.
+TPOT LOAD vs native at global concurrency 1 / 8 / 32 / 128 / 256 / 512:
+
+| Model, topology | graphs/rank | eager / graph / LOAD to `/health` | restore | TPOT LOAD vs native |
+|---|---:|---|---:|---|
+| Inkling-Small-21L dummy (reduced-layer), EP4 (DP attention dp4) | 128 (1..128) | 48 / 96 / 56 s | 2.0 s | +0.2 / 0.0 / -0.8 / +0.2 / 0.0 / +1.3 % |
+| Inkling-Small-21L dummy (reduced-layer), TP4 attention + EP4 | 128 (4..512 step 4) | 39 / 61 / 46 s | 1.6 s | eager C=1 / +1.3 / +0.7 / +0.6 / +2.7 / +2.6 % |
+
+Per rank, sglang's capture-window `mem usage` is 13.6-15.1 GB (EP4) / 16.8-18.2 GB (TP4+EP4) under Foundry against
+2.1 / 5.4 GB natively. The graphs themselves are 266 / 256 MiB. The rest is Foundry's pre-capture bootstraps, mainly
+a 10.7 GiB DeepEP/NVSHMEM buffer that Inkling's TP-style MoE never uses (report finding 19). Foundry bootstraps every
+runtime the flags declare, so do not declare backends the model does not use: serve Inkling with
+`--moe-a2a-backend none` on SAVE and LOAD, as the Kimi / gpt-oss rows do. The KV pool is unaffected; post-capture
+headroom is. That rerun has not been verified yet.
+
+**8xH200, venv mode (no container), 2026-09-25** (foundry `coldstart` 220896e, sglang fork `foundry-prefill`
+4f018fd052, driver 595 with the CUDA 13.3 forward-compat libcuda, environment from `experimental/host_setup_venv.sh`,
+dummy weights, dense decode graph sets, `experimental/matrix3/coldstart.sh`, single bench run). Every row: `DONE
+failed=[]`, greedy output identical between native graph and LOAD, 0 `[HOOK]` errors. Time to `/health` native graph
+/ SAVE / LOAD, and LOAD TPOT vs native at global bs 1 / 8 / 32 / 128 (Inkling also 256 / 512):
+
+| Model, topology | graphs/rank | graph / SAVE / LOAD to `/health` | restore | parity | TPOT LOAD vs native |
+|---|---:|---|---:|---|---|
+| Qwen3.5-122B-A10B-FP8, EP8 | 128 | 115 / 206 / 61 s | 2.05 s | OK | +1.0 / +0.7 / 0.0 / -2.8 % |
+| Qwen3.5-122B-A10B-FP8, attn-TP2 + EP8 | 128 (2..256 step 2 per DP group) | 113 / 185 / 65 s | 4.27 s | OK | eager bs1 / -2.2 / -1.6 / -1.2 % |
+| Qwen3.5-397B-A17B-FP8, EP8 | 128 | 132 / 177 / 64 s | 2.31 s | OK | +3.4 / +0.3 / +1.5 / -1.4 % |
+| DeepSeek-V4-Flash-FP8, EP8 | 128 | 120 / 157 / 57 s | 2.77 s | OK | -1.0 / +0.4 / +4.8 / +0.7 % |
+| GLM-5.3-Flash, EP8 | 128 | 168 / 303 / 112 s | 4.00 s | OK | -0.3 / -0.5 / +18 / +9.9 % (single run) |
+| Inkling-Small bf16, TP8+EP8 (`--moe-a2a-backend none`) | 64 (8..512 step 8) | 65 / 109 / 51 s | 1.99 s | OK | eager bs1 / -0.6 / -0.8 / +3.5 / +2.1 / -3.2 % |
+| Inkling-Small bf16, EP8 DP attention (a2a none) | 102 (pool cap) | 88 / 149 / 62 s | 3.60 s | OK | -0.4 / -0.5 / -0.3 / +8.4 / +0.1 / +0.2 % |
+| Inkling-Small bf16, attn-TP4 + EP8 (a2a none, `--max-mamba-cache-size 5120`) | 128 (4..512 step 4 per DP group) | 105 / 141 / 64 s | 5.18 s | OK | eager bs1 / -1.4 / -0.4 / +2.9 / -0.2 / +11.8 % |
+| Qwen3.5-27B, TP2 | 128 | 61 / 117 / 39 s | 1.03 s | OK | +0.3 / +0.2 / +0.5 / +0.1 % |
+| Qwen3.5-27B, TP4 | 128 | 61 / 120 / 40 s | 1.03 s | OK | +0.5 / 0.0 / 0.0 / +0.6 % |
+| Qwen3.5-122B-A10B-FP8, EP4 (4xH200, foundry d81543b, 2026-09-25) | 128 | 94 / 110 / 49 s | 1.70 s | OK | +2.8 / +0.1 / -1.4 / +7.2 % |
+| Qwen3-30B-A3B, EP4 (4xH200, foundry d81543b, 2026-09-25) | 128 | 68 / 75 / 51 s | 1.49 s | OK | 0.0 / +0.3 / -7.6 / +3.7 % |
+
+The SAVE column of every row above except the two `d81543b` rows predates foundry `d81543b`, which fixed the SAVE hook
+over-reading every recorded fatbin to the end of its library's `.nv_fatbin` section (~30 s of dist init and GBs of
+packed image per rank; the same holds for the SAVE numbers of the other tables here). After the fix the packed image
+is 35 / 29 MB per rank (was 4-5 GB) and SAVE is 7-17 s behind the native graph engine at 128 graphs (serialization and
+the manifest scale with the graph count). LOAD and TPOT are unaffected; archives saved before the fix still load.
+
+Prefill graphs (`--cuda-graph-backend-prefill full`, buckets 64 / 128 / 256 / 512, 1024-token prompts at C = 8 / 32 /
+128):
+
+| Model, topology | graphs | native decode-only / native prefill / SAVE / LOAD to `/health` | restore prefill + decode | input tok/s, eager prefill -> LOAD | TTFT, eager prefill -> LOAD |
+|---|---|---|---|---|---|
+| Qwen3-235B-A22B-FP8, attn-TP4 + EP8 | 4 + 128 | 127 / 128 / 186 / 59 s | 0.91 + 4.64 s | 1.3k -> 5.0-6.3k (3.6-4.8x native) | 5.7-6.2x lower |
+| Qwen3-30B-A3B, EP4 DP attention (4 GPUs) | 4 + 128 | 70 / 69 / 145 / 51 s | 0.77 + 1.39 s | 3.4-3.9k -> 8.3-15.6k | 2.8-4.7x lower |
+| Qwen3-30B-A3B, TP4 + EP4 (4 GPUs) | 4 + 128 | 67 / 64 / 127 / 37 s | 0.80 + 1.83 s | 3.2k -> 10.1-11.5k | 3.1-4.1x lower |
+
+LOAD matches the native prefill-graph engine: input throughput -5..+6%, TTFT -10..+9% (single runs). Under attention-TP4 x DP2 the per-group chunk is
+128 tokens, so only the 64 and 128 buckets replay.
+
+**Bare-host requirements.** A venv run on a host whose InfiniBand verbs devices exist but cannot be opened
+(`/dev/infiniband/uverbs*` present, `open()` = `EPERM`) needs, before its numbers match the container's:
+(1) `NCCL_IB_DISABLE=1` (plus `NVSHMEM_REMOTE_TRANSPORT=none`), or every engine spends ~40 s in NCCL's HCA probe
+during `Init torch distributed`; (2) the `no_cdev_wait` `LD_PRELOAD` shim, or every DeepEP low-latency engine spends
+~40 s once in NVSHMEM's IBGDA probe (native: the first captured shape; SAVE/LOAD: the pre-capture DeepEP bootstrap).
+For SAVE and LOAD set `verbs_udev_wait_shim_path` in the graph-extension TOML; export it in the shell for native
+engines as well so both sides are comparable; (3) memlock unlimited (checked by the probe; it was on that host) and a
+pid limit well above the ~2800 tasks of an 8-rank engine. Details: `docs/bare-host-verbs-udev-wait.md`. With (1) and
+(2), native capture and restore per graph match the container (397B EP8: 73.9 vs 75 s capture, 2.3 vs 2.9 s restore).
 
 **8xH100, 2026-09-05.** Every recipe in this directory was run as shipped (8×H100 host, 2 GPUs
 per multi-GPU run, foundry v0.0.3, sglang fork branch `foundry` at `f1d688e52`, CUDA 13.3
@@ -355,6 +432,36 @@ With the recipes' default graph sets (20–52 decode graphs) capture is only a f
 seconds, so time-to-health is dominated by weight loading and the differences above
 are small; with all 256 decode graphs (`--cuda-graph-max-bs-decode 256 --disable-cuda-graph-padding`)
 restore saves 25–50 s per engine start (see the top-level README's Performance table).
+
+## Prefill CUDA graphs (experimental)
+
+By default Foundry persists decode graphs only, and SAVE/LOAD run with prefill graphs disabled. On the fork branch
+**`foundry-prefill`** (`4f018fd052`, on top of `a911f6b66b`) with foundry `coldstart` >= `608193b`, pass
+`--cuda-graph-backend-prefill full` (plus the same `--cuda-graph-bs-prefill` list) on **both SAVE and LOAD**.
+
+- SAVE records the prefill graphs through the same capture hook as decode.
+- LOAD runs sglang's own prefill capture loop and swaps each capture for the archived graph, with an order/shape
+  check.
+- A LOAD without the flag of an archive that has prefill graphs is rejected.
+
+Validated on 4xH200 (dummy weights; identical SAVE/LOAD allocation offsets, parity OK, decode-only path unchanged):
+
+- Qwen3-1.7B single GPU;
+- Qwen3-30B-A3B EP4 (DP attention + DeepEP LL) at 4 prefill + 128 decode graphs: input throughput 3.3-4.0k ->
+  8.1-16.2k tok/s at 1024-token prompts, TTFT 3-6x lower, TPOT unchanged, LOAD to `/health` 57 s vs 66 s native;
+- Qwen3-30B-A3B TP4+EP4 at 6 + 16 graphs.
+
+Under DP attention the per-rank prefill chunk is `chunked_prefill_size / dp`, and only buckets up to it replay
+(64 tokens for Qwen3-30B at chunk 256, dp 4). Larger buckets are captured and restored but never used, so end the
+bucket list there. Under TP attention every bucket up to the chunk replays.
+
+Not usable in plain sglang on Hopper, because the native engine already fails to capture FULL prefill graphs
+(report finding 21):
+
+- Qwen3.5 hybrids: `hybrid_linear_attn_backend.py:665` IndexError, since the GDN state indices are initialized only
+  by the decode runner;
+- DeepSeek-V4-Flash: the dsv4 backend does not support EXTEND;
+- Inkling: the triton backend rejects EXTEND capture, and fa3 is not allowed for the model.
 
 ## DeepEP v2 (NCCL)
 
