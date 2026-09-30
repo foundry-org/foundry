@@ -164,3 +164,6 @@ LOAD:
 - [`memory-lifecycle.md`](memory-lifecycle.md) — VMM region setup, the SAVE↔LOAD allocation parity contract, and the `final_alloc_offset` watermark
 - [`save-load-workflow.md`](save-load-workflow.md) — serve scripts, TOML schema, expected logs, validation checks
 - [`memory-consistency.md`](memory-consistency.md) — the five known divergences that caused silent LOAD failures and how each was fixed
+- [`known-issues.md`](known-issues.md) — open issues and their status
+- [`graph-state-checklist.md`](graph-state-checklist.md) — what a restored graph must reproduce: the four divergence mechanisms, every SGLang flag / backend / kernel that changes graph attributes or contents, pinned vs. rejected settings, and the open gaps (with the driver-side and SGLang-side reviews it merges)
+- [`validated-configs.md`](validated-configs.md) — every model and configuration that passed SAVE + LOAD, with timings; the stage breakdown is `figs/stages_pr.png`
