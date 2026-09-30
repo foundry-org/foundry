@@ -22,13 +22,40 @@ pins land at the same pipeline positions as the former in-tree step):
   step the in-tree ``handle_graph_extension`` ran right before. Decode is
   pinned to ``full``, prefill to ``disabled`` unless ``full`` / ``disabled`` was
   given, profiling and FlashInfer autotune off (SAVE and LOAD must allocate
-  identically). Conflicting flags raise instead of being overridden.
+  identically). Conflicting flags raise instead of being overridden. The
+  same step pins the flags that select state Foundry cannot replay
+  (:data:`FIELD_PINS`, see "Pins" below).
 - ``handle_cuda_graph_config`` (wrapped, validates after): the resolved
   config, which also covers ``--cuda-graph-config`` JSON (it outranks the
   per-phase flags).
 - ``handle_other_validations`` (wrapped, validates after): features Foundry
   does not support, once speculative decoding, LoRA and elastic EP are
-  resolved; the graph config is checked again after the later cascades.
+  resolved; the graph config and the pinned flags are checked again after
+  the later cascades, and ``NCCL_CUMEM_ENABLE`` is pinned once the MoE
+  all-to-all backend is known.
+
+Pins. State that cannot be made static across processes is not supported;
+Foundry uses the cuMem-backed alternatives instead. A graph restored on LOAD
+replays only what was recorded inside the capture region: a buffer
+registration, IPC handle exchange or pool carve-out made outside it (at
+``graph_capture()`` exit, at first use inside the forward, by a second graph
+or allocator) does not exist in the LOAD process, and the restored kernels
+read addresses nobody set up. Every such feature that a flag or an
+environment variable can switch off is pinned here rather than left to the
+recipe: each pin prints one ``[Foundry] pin:`` line, and a value the user
+set explicitly to the contrary raises with the reason (never a silent
+override). Features with no Foundry logic at all are rejected instead
+(:func:`reject_unsupported_features`, ``hooks.reject_unsupported_decode_runner``).
+
+Environment pins (:data:`ENV_PINS`) are applied in :func:`activate`, which
+runs in the launcher before the server args are built (so the resolution
+steps that read them see the pinned values) and before any engine process is
+spawned (spawned processes inherit ``os.environ``; values that sglang caches
+at import time, such as ``SGLANG_JIT_DEEPGEMM_PRECOMPILE``, are only correct
+this way). They are re-asserted at the top of every scheduler process
+(``activate`` runs there too) and at each spawn site
+(``runtime.setup_ld_preload_env``), which also covers processes that do not
+descend from a launcher that ran the plugin (the fork base's in-tree route).
 """
 
 from __future__ import annotations
@@ -36,6 +63,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -43,6 +71,9 @@ logger = logging.getLogger(__name__)
 CONFIG_ENV = "FOUNDRY_GRAPH_EXTENSION_CONFIG"
 # Declaration source recorded in the resolution stash.
 RESOLUTION_SOURCE = "foundry_graph_extension"
+# Source of the unreplayable-state pins (FIELD_PINS), kept apart so that each
+# declaration can be read back on its own.
+PIN_RESOLUTION_SOURCE = "foundry_graph_extension_pins"
 _FLAG = f"Foundry graph persistence ({CONFIG_ENV})"
 # Whitelisted resolution steps the plugin wraps (register_resolution_hooks);
 # the preflight checks that the installed sglang still offers them.
@@ -66,6 +97,7 @@ def activate(cfg_path: str) -> None:
     try:
         if not os.path.isfile(cfg_path):
             raise FileNotFoundError(f"{cfg_path!r} does not exist")
+        apply_env_pins()
         register_resolution_hooks()
         from foundry.integration.sglang.hooks import install
 
@@ -102,6 +134,7 @@ def register_resolution_hooks() -> None:
 
 def _pin_then_previous(server_args: Any, previous) -> None:
     pin_graph_fields(server_args)
+    pin_unreplayable_fields(server_args)
     previous(server_args)
 
 
@@ -114,6 +147,8 @@ def _previous_then_reject_unsupported(server_args: Any, previous) -> None:
     previous(server_args)
     reject_unsupported_features(server_args)
     validate_resolved_graph_config(server_args)
+    validate_pinned_fields(server_args)
+    apply_env_pins(server_args)
 
 
 # ---------------------------------------------------------------------------
@@ -252,3 +287,312 @@ def reject_unsupported_features(server_args: Any) -> None:
             f"not supported with the Foundry graph extension ({CONFIG_ENV}): "
             + "; ".join(unsupported)
         )
+
+
+# ---------------------------------------------------------------------------
+# Pins: configs that select state Foundry cannot replay (module docstring)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FieldPin:
+    """A ServerArgs field the plugin declares to ``value``. ``default`` is
+    sglang's default (fa090f7755): a raw value other than the pin and the
+    default can only come from the user, and raises. ``strict`` pins are
+    re-checked after the later resolution steps; a non-strict one may be
+    turned off by sglang (the fallback is still replayable)."""
+
+    field: str
+    value: Any
+    default: Any
+    flag: str
+    reason: str
+    strict: bool = True
+
+
+FIELD_PINS: tuple[FieldPin, ...] = (
+    FieldPin(
+        "disable_custom_all_reduce",
+        True,
+        False,
+        "--disable-custom-all-reduce",
+        "custom all-reduce (v1 and v2) registers the graphs' buffers over CUDA IPC when "
+        "graph_capture() exits, outside the recorded region",
+    ),
+    FieldPin(
+        "enable_torch_symm_mem",
+        True,
+        False,
+        "--enable-torch-symm-mem",
+        "the in-graph all-reduce uses torch symmetric memory, a cuMem buffer Foundry places "
+        "at the same address on SAVE and LOAD",
+        strict=False,
+    ),
+    FieldPin(
+        "enable_symm_mem",
+        False,
+        False,
+        "--enable-symm-mem",
+        "NCCL symmetric-memory windows are registered at first use inside the forward and "
+        "need NCCL's cuMem buffers",
+    ),
+    FieldPin(
+        "enable_nccl_nvls",
+        False,
+        False,
+        "--enable-nccl-nvls",
+        "NVLS multicast buffers are registered at first use inside the forward",
+    ),
+    FieldPin(
+        "enable_mscclpp",
+        False,
+        False,
+        "--enable-mscclpp",
+        "MSCCL++ registers its buffers at first use inside the forward",
+    ),
+    FieldPin(
+        "enable_two_batch_overlap",
+        False,
+        False,
+        "--enable-two-batch-overlap",
+        "the per-shape micro-batch metadata is built only by the capture loop, which LOAD "
+        "does not run",
+    ),
+    FieldPin(
+        "enable_memory_saver",
+        False,
+        False,
+        "--enable-memory-saver",
+        "torch_memory_saver owns the pools (and, with SGLANG_MEMORY_SAVER_CUDA_GRAPH, the "
+        "graph memory) outside Foundry's region",
+    ),
+)
+
+# --dsv4-attn-backend: 'auto' (resolves to flashmla) or 'flashmla'; never trtllm.
+DSV4_ATTN_FIELD = "dsv4_attn_backend"
+DSV4_ATTN_REASON = (
+    "the trtllm DeepSeek-V4 attention backend asserts at its first call, which falls "
+    "inside the capture, and needs an eager bootstrap Foundry does not run"
+)
+
+
+@dataclass(frozen=True)
+class EnvPin:
+    name: str
+    value: str
+    reason: str
+
+
+ENV_PINS: tuple[EnvPin, ...] = (
+    # NCCL registers user buffers of graph-captured collectives (above a size
+    # threshold) and the kernels then read peers' remote addresses from an
+    # array NCCL fills on the host at capture time. A restored graph replays
+    # those kernels without the registration, so the array holds garbage at
+    # LOAD (illegal address in the DP-attention all-gather at bs>=4 with NCCL
+    # 2.30). Keep every size on the unregistered path.
+    EnvPin(
+        "NCCL_GRAPH_REGISTER",
+        "0",
+        "NCCL registers the user buffers of graph-captured collectives on the host at capture "
+        "time; a restored graph replays the kernels without the registration",
+    ),
+    EnvPin(
+        "NCCL_LOCAL_REGISTER",
+        "0",
+        "same as NCCL_GRAPH_REGISTER for buffers registered outside a graph",
+    ),
+    EnvPin(
+        "NCCL_NVLS_ENABLE",
+        "0",
+        "NVLS multicast buffers are mapped with driver flags Foundry's VMM region does not "
+        "carry and are registered outside the recorded region",
+    ),
+    EnvPin(
+        "SGLANG_JIT_DEEPGEMM_PRECOMPILE",
+        "0",
+        "the DeepGEMM precompile sweep runs on the first rank inside the first capture: it "
+        "synchronizes the device and allocates scratch only SAVE sees; kernels still JIT "
+        "per shape",
+    ),
+    EnvPin(
+        "SGLANG_MEMORY_SAVER_CUDA_GRAPH",
+        "0",
+        "the memory-saver graph context owns the graph memory outside Foundry's region",
+    ),
+    EnvPin(
+        "SGLANG_ENABLE_METADATA_GLUE_GRAPH",
+        "0",
+        "the attention-metadata prep is captured into a second graph Foundry does not save",
+    ),
+    EnvPin(
+        "SGLANG_ENABLE_GRAPH_POOL_PRECARVE",
+        "0",
+        "the graph pool is carved from a span measured on SAVE's eager warmup, which LOAD "
+        "does not run",
+    ),
+    EnvPin(
+        "SGLANG_ENABLE_GRAPH_POOL_BORROW",
+        "0",
+        "eager allocations would borrow free graph-pool extents whose addresses the restored "
+        "graphs reference",
+    ),
+)
+
+# NCCL_CUMEM_ENABLE=0 unless the MoE all-to-all is DeepEP v2, whose NCCL
+# windows need cuMem (sglang defaults it to 1 for deepep_v2); pinned during
+# resolution, once the backend is known, and at the spawn sites.
+NCCL_CUMEM_PIN = EnvPin(
+    "NCCL_CUMEM_ENABLE",
+    "0",
+    "NCCL's cuMem buffers (P2P, NVLS) are mapped with driver flags Foundry's VMM region "
+    "does not carry; the plain allocator keeps them at deterministic offsets",
+)
+_CUMEM_EXEMPT_A2A = ("deepep_v2",)
+# Set once the launcher applied the env pins: descendants log only changes.
+_ENV_PINNED_MARK = "FOUNDRY_SGLANG_ENV_PINNED"
+_CUMEM_EXEMPT_LOGGED = False
+_KEPT_LOGGED: set[str] = set()
+
+
+def _pin_log(message: str) -> None:
+    # Logging is not configured yet in the launcher when resolution runs.
+    print(f"[Foundry] pin: {message}", file=sys.stderr, flush=True)
+
+
+def _contrary(pin: FieldPin, raw: Any) -> bool:
+    return raw != pin.value and raw != pin.default
+
+
+def pin_unreplayable_fields(server_args: Any) -> None:
+    """Declare :data:`FIELD_PINS` and the DeepSeek-V4 attention backend. Raw
+    (user) values are read from ``server_args`` itself: declarations never
+    change the raw inputs. Fields the installed sglang does not have are
+    skipped."""
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    errors = []
+    fields: dict[str, Any] = {}
+    lines = []
+    for pin in FIELD_PINS:
+        if not hasattr(server_args, pin.field):
+            continue
+        raw = getattr(server_args, pin.field)
+        if _contrary(pin, raw):
+            errors.append(f"{pin.flag}={raw!r}: {pin.reason}")
+            continue
+        fields[pin.field] = pin.value
+        if raw != pin.value:
+            state = f"overrides sglang default {pin.default!r}"
+        elif raw == pin.default:
+            state = "sglang default"
+        else:
+            state = "as given"
+        lines.append(f"{pin.field}={pin.value!r} ({state}): {pin.reason}")
+    if hasattr(server_args, DSV4_ATTN_FIELD):
+        raw = getattr(server_args, DSV4_ATTN_FIELD)
+        if raw == "trtllm":
+            errors.append(f"--dsv4-attn-backend=trtllm: {DSV4_ATTN_REASON}")
+        else:
+            value = raw or "auto"
+            fields[DSV4_ATTN_FIELD] = value
+            lines.append(f"{DSV4_ATTN_FIELD}={value!r} (not trtllm): {DSV4_ATTN_REASON}")
+    if errors:
+        raise ValueError(f"not supported with {_FLAG}: " + "; ".join(errors))
+    for line in lines:
+        _pin_log(line)
+    if fields:
+        declare_resolution(server_args, PIN_RESOLUTION_SOURCE, **fields)
+
+
+def _last_source(server_args: Any, field: str) -> str:
+    for source, declared in reversed(getattr(server_args, "_resolved_overrides", None) or ()):
+        if field in declared:
+            return source
+    return "the raw input"
+
+
+def validate_pinned_fields(server_args: Any) -> None:
+    """After the later resolution steps (model overrides, platform fallbacks):
+    a strict pin must still hold. A later sglang step that switched one back
+    raises (naming it) rather than being overridden after other fields were
+    derived from it."""
+    from sglang.srt.arg_groups.overrides import resolving_view
+
+    cfg = resolving_view(server_args)
+    errors = []
+    for pin in FIELD_PINS:
+        if not hasattr(server_args, pin.field):
+            continue
+        value = getattr(cfg, pin.field)
+        if value == pin.value:
+            continue
+        source = _last_source(server_args, pin.field)
+        if pin.strict:
+            errors.append(f"{pin.field}={value!r} (set by {source}): {pin.reason}")
+        else:
+            _pin_log(f"{pin.field}={value!r} (set by {source}); the collective falls back to NCCL")
+    if hasattr(server_args, DSV4_ATTN_FIELD) and getattr(cfg, DSV4_ATTN_FIELD) == "trtllm":
+        errors.append(
+            f"{DSV4_ATTN_FIELD}='trtllm' (set by {_last_source(server_args, DSV4_ATTN_FIELD)}): "
+            f"{DSV4_ATTN_REASON}"
+        )
+    if errors:
+        raise ValueError(f"not supported with {_FLAG}: " + "; ".join(errors))
+
+
+def _normalize_env(value: str) -> str:
+    v = value.strip().lower()
+    if v in ("0", "false", "no", "n", "off"):
+        return "0"
+    if v in ("1", "true", "yes", "y", "on"):
+        return "1"
+    return v
+
+
+def _a2a_backend(server_args: Any) -> str | None:
+    try:
+        from sglang.srt.arg_groups.overrides import resolving_view
+
+        value = getattr(resolving_view(server_args), "moe_a2a_backend", None)
+    except ImportError:
+        value = getattr(server_args, "moe_a2a_backend", None)
+    return None if value is None else str(getattr(value, "value", value))
+
+
+def apply_env_pins(server_args: Any = None) -> None:
+    """Set :data:`ENV_PINS` in ``os.environ`` (and :data:`NCCL_CUMEM_PIN` when
+    ``server_args`` is given, i.e. once the all-to-all backend is known). An
+    unset variable is set; one set to the pinned value is kept; one set to
+    anything else raises. Idempotent: every process that loads the plugin and
+    every spawn site calls it."""
+    global _CUMEM_EXEMPT_LOGGED
+    pins = list(ENV_PINS)
+    if server_args is not None:
+        a2a = _a2a_backend(server_args)
+        if a2a not in _CUMEM_EXEMPT_A2A:
+            pins.append(NCCL_CUMEM_PIN)
+        elif not _CUMEM_EXEMPT_LOGGED:
+            _CUMEM_EXEMPT_LOGGED = True
+            _pin_log(
+                f"{NCCL_CUMEM_PIN.name} left to sglang: --moe-a2a-backend {a2a} needs NCCL's "
+                "cuMem windows"
+            )
+    first = os.environ.get(_ENV_PINNED_MARK) is None
+    errors = []
+    for pin in pins:
+        current = os.environ.get(pin.name)
+        if current is None:
+            os.environ[pin.name] = pin.value
+            _pin_log(f"{pin.name}={pin.value} (was unset): {pin.reason}")
+        elif _normalize_env(current) != pin.value:
+            errors.append(f"{pin.name}={current!r} (Foundry needs {pin.value}): {pin.reason}")
+        elif (first or pin is NCCL_CUMEM_PIN) and pin.name not in _KEPT_LOGGED:
+            _KEPT_LOGGED.add(pin.name)
+            _pin_log(f"{pin.name}={pin.value} (already set): {pin.reason}")
+    if errors:
+        raise ValueError(
+            f"environment not supported with {_FLAG}: "
+            + "; ".join(errors)
+            + " -- unset these variables, Foundry sets them"
+        )
+    os.environ[_ENV_PINNED_MARK] = "1"

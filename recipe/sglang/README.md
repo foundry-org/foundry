@@ -100,8 +100,8 @@ model or topology before SAVE.
 | Mode | Script | Model | Notes |
 |---|---|---|---|
 | Single GPU | `serve_qwen3-mini.sh` | Qwen3-1.7B | FlashInfer backend |
-| Tensor parallel | `serve_qwen3-1.7b_tp.sh` | Qwen3-1.7B | torch symm-mem allreduce (`--enable-torch-symm-mem --disable-custom-all-reduce`); mirrors the vLLM TP recipe |
-| Data parallel | `serve_qwen3-1.7b_dp.sh` | Qwen3-1.7B | one full replica/rank; `NCCL_CUMEM_ENABLE=0`/`NCCL_NVLS_ENABLE=0` |
+| Tensor parallel | `serve_qwen3-1.7b_tp.sh` | Qwen3-1.7B | torch symm-mem allreduce (pinned by the plugin); mirrors the vLLM TP recipe |
+| Data parallel | `serve_qwen3-1.7b_dp.sh` | Qwen3-1.7B | one full replica/rank |
 | Expert parallel | `serve_qwen3-30ba3b_ep.sh` | Qwen3-30B-A3B | DP-attention + DeepEP; fa3 backend; `SGL_MODEL=Qwen/Qwen3-30B-A3B-FP8` for FP8 |
 | Expert parallel, TP attention | `serve_qwen3-30ba3b_ep_tpattn.sh` | Qwen3-30B-A3B | symm-mem allreduce + DeepEP (vLLM-shaped EP); uses the per-phase cuda-graph flags |
 | Expert parallel, DeepEP v2 | `serve_qwen3-30ba3bfp8_ep_v2.sh` | Qwen3-30B-A3B-FP8 | NCCL symmetric windows + GIN instead of NVSHMEM; needs NCCL >= 2.30.7 (see below) |
@@ -148,6 +148,28 @@ The end-to-end test (`tests/integration/sglang/test_sglang_save_load_e2e.py`) ru
 (`FOUNDRY_SERVE_LOG` overrides it). Once `/health` answers, the script reads that log and prints the number of
 processes that logged the plugin's activation line and, on `--load`, the `[Foundry] Loaded N SGLang graphs` lines. If
 the activation line is missing it prints a warning that SGLang ran natively. It also counts `[HOOK] ERROR` lines.
+
+### What the plugin pins, and what the scripts still set
+
+On `--save` / `--load` the plugin itself sets every config that selects state Foundry cannot replay (custom
+all-reduce off, torch symm-mem all-reduce on, NCCL buffer registration / cuMem / NVLS off, NCCL symmetric memory,
+NVLS and MSCCL++ off, the DeepGEMM precompile sweep off, two-batch overlap off, the memory-saver and graph-pool
+variants off, `--dsv4-attn-backend` not `trtllm`), prints one `[Foundry] pin:` line per value, and stops with the
+reason if you set a contrary value yourself. The table and the reasons are in
+[`docs/sglang/overview.md`](../../docs/sglang/overview.md#what-the-plugin-pins-and-why). The scripts therefore do not
+pass these flags or variables on SAVE / LOAD; a baseline or `--warm` run (no plugin) gets the pinned collective flags
+and `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0` from `foundry_baseline_pins` in `serve_common.sh`, so it captures the same
+graphs and warms the same kernels.
+
+What the plugin cannot pin, and the scripts keep doing:
+
+- dense decode capture without padding and an explicit batch-size list (`--cuda-graph-max-bs-decode`,
+  `--cuda-graph-bs-decode`, `--disable-cuda-graph-padding`): the archive holds exactly the captured sizes;
+- DeepEP low-latency on the EP rows (`--moe-a2a-backend deepep --deepep-mode low_latency`) with the dispatch cap
+  raised identically on SAVE and LOAD;
+- warm JIT caches before SAVE (`--warm`, once per machine and model): SAVE compiles inside the capture window;
+- pinned hybrid state pools (`MODEL_EXTRA`, e.g. the Mamba/GDN state-pool cap);
+- identical flags and environment on SAVE and LOAD.
 
 ### Verify the plugin is active
 
@@ -232,8 +254,8 @@ CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-1.7b_tp.sh 2 --load
 ```
 
 TP notes: custom all-reduce (IPC-buffer registration per graph) and in-graph
-pynccl are both replay paths foundry does not support; the TP script disables
-them and enables `--enable-torch-symm-mem`, so every decode-graph allreduce is a
+pynccl are both replay paths foundry does not support; the plugin disables
+custom all-reduce and enables `--enable-torch-symm-mem`, so every decode-graph allreduce is a
 `symm_mem.two_shot_all_reduce_` (TP=2 on Hopper) on the persistent symmetric
 buffer foundry places deterministically. On hosts without usable multicast (no
 IMEX channels), upstream sglang disables the communicator and silently falls
@@ -275,14 +297,15 @@ curl -s http://0.0.0.0:12000/v1/completions -H 'Content-Type: application/json' 
 The default EP recipe uses DP-attention, which needs no allreduce in the decode
 graphs. This variant mirrors the vLLM EP topology instead: TP attention with its
 allreduce routed through torch symm-mem (`--enable-torch-symm-mem`, custom AR
-off) plus `--cuda-graph-backend-prefill disabled` — the prefill-graph disable
+off, both pinned by the plugin) plus `--cuda-graph-backend-prefill disabled` — the prefill-graph disable
 matters even for baseline runs of this topology, because without DP-attention
 every rank dispatches the full prefill chunk and prefill-graph capture trips
 DeepEP's `num_max_dispatch_tokens_per_rank` assert.
 
-The EP script sets `--enable-dp-attention --enable-torch-symm-mem --moe-a2a-backend deepep --deepep-mode low_latency
---moe-runner-backend deep_gemm --attention-backend fa3 --disable-custom-all-reduce` and
-`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256`. `--enable-torch-symm-mem` routes the DP-attention gather
+The EP script sets `--enable-dp-attention --moe-a2a-backend deepep --deepep-mode low_latency
+--moe-runner-backend deep_gemm --attention-backend fa3` and
+`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256`; the plugin adds `--enable-torch-symm-mem
+--disable-custom-all-reduce`. `--enable-torch-symm-mem` routes the DP-attention gather
 all-reduce through torch symmetric memory, the same path the TP recipes use; without it sglang uses pynccl for
 that all-reduce (NCCL LL kernels do replay from restored graphs; the flag keeps the collective path uniform).
 Communication state that sglang builds lazily on the first eager forward (the DeepEP buffer, the logits
@@ -559,9 +582,11 @@ Any later `pip install -e` of foundry re-resolves torch's NCCL pin; use
 What foundry does for v2 (all automatic): creates the `ElasticBuffer` at the
 same pre-capture point on SAVE and LOAD (`_bootstrap_deepep_v2_buffer`),
 reports success for `cuPointerSetAttribute(SYNC_MEMOPS)` on region memory
-(DOCA requires it), and sets `NCCL_GRAPH_REGISTER=0`/`NCCL_LOCAL_REGISTER=0`
+(DOCA requires it), and pins `NCCL_GRAPH_REGISTER=0`/`NCCL_LOCAL_REGISTER=0`
 so no collective in a captured graph depends on registration state that a
-restored graph cannot replay. Do not force `NCCL_CUMEM_ENABLE=0` with v2.
+restored graph cannot replay. `NCCL_CUMEM_ENABLE`, which the plugin pins to 0
+for every other all-to-all backend, is left to sglang (1) with v2: do not
+force it to 0.
 
 ## Archive layout
 

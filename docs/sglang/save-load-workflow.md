@@ -36,6 +36,10 @@ LOAD). SGLang runs natively without an error when the entry point is not registe
 serving venv or `SGLANG_PLUGINS` omits `foundry`; see
 [`recipe/sglang/README.md`](../../recipe/sglang/README.md#foundry-plugin-activation-and-checks).
 
+The command carries no collective or graph-memory flags: the plugin pins custom all-reduce off, torch symm-mem
+all-reduce on, the NCCL registration / cuMem / NVLS variables and the other unreplayable features itself, and stops
+the launch if one was set to the contrary ([`overview.md`](overview.md#what-the-plugin-pins-and-why)).
+
 `--cuda-graph-max-bs-decode 512` is the closest analogue to vLLM's `--max-num-seqs 512` — it drives `capture_bs` to span a similar range of decode batch sizes (52 batch sizes from 1 → 512).
 
 ## TOML configs
