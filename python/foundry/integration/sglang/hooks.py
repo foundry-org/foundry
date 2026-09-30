@@ -128,6 +128,7 @@ def _before_distributed_init(server_args, device: str, gpu_id: int, ranks) -> No
     rt.setup_graph_extension(server_args, tp_rank=tp_rank, pp_rank=pp_rank, dp_rank=dp_rank)
     rt.log_alloc_offset("after_setup_graph_ext")
     if mode == CUDAGraphExtensionMode.LOAD:
+        rt.check_capture_loop_version()
         # Grow the driver's graph-exec memory now, on a background thread,
         # so Phase 2's instantiates at the capture point reuse it (see
         # graph_ops.start_exec_pool_prewarm).
@@ -361,9 +362,6 @@ def _patch_alloc_memory_pool() -> None:
 
 
 def _patch_cuda_graph_capture() -> None:
-    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-        set_graph_pool_id,
-    )
     from sglang.srt.model_executor.runner import (
         decode_cuda_graph_runner as dcgr,
     )
@@ -375,7 +373,6 @@ def _patch_cuda_graph_capture() -> None:
     )
     from sglang.srt.model_executor.runner_utils.pool import (
         disable_graph_pool_borrow,
-        get_or_create_global_graph_memory_pool,
         graph_pool_capture_scope,
     )
 
@@ -472,17 +469,24 @@ def _patch_cuda_graph_capture() -> None:
     ):
         mode = get_graph_extension_mode()
         req_slots = prefill_req_slots(self) if mode != CUDAGraphExtensionMode.NONE else None
-        if mode == CUDAGraphExtensionMode.LOAD and req_slots is not None:
-            # LOAD, prefill: the upstream capture loop runs (see
-            # patched_prefill_capture) and only the capture is replaced, by the
-            # archived graph for this shape; its allocator events replay here,
-            # at the point SAVE captured it.
-            from foundry.integration.sglang.graph_ops import restore_next_prefill_graph
+        if mode == CUDAGraphExtensionMode.LOAD:
+            # LOAD, both runners: the upstream capture loop runs (see
+            # patched_prefill_capture / patched) and only the capture is
+            # replaced, by the archived graph for this shape; its allocator
+            # events replay here, at the point SAVE captured it, after the
+            # same per-shape eager work. No warm-up forwards, as on SAVE.
+            from foundry.integration.sglang.graph_ops import (
+                restore_next_decode_graph,
+                restore_next_prefill_graph,
+            )
 
-            graph, out = restore_next_prefill_graph(shape_key, req_slots)
-            # Every graph placed in ``_graphs`` (here, SAVE's FoundryCUDAGraph,
-            # LOAD's decode graphs below) is a foundry ``ops.CUDAGraph``, which
-            # binds ``reset()`` (csrc/binding.cpp): upstream's
+            if req_slots is not None:
+                graph, out = restore_next_prefill_graph(shape_key, req_slots)
+            else:
+                graph, out = restore_next_decode_graph(shape_key)
+            # Every graph placed in ``_graphs`` (SAVE's FoundryCUDAGraph, LOAD's
+            # restored graphs) is a foundry ``ops.CUDAGraph``, which binds
+            # ``reset()`` (csrc/binding.cpp): upstream's
             # FullCudaGraphBackend.cleanup() calls ``graph.reset()`` on each.
             self._graphs[shape_key] = graph
             self._outputs[shape_key] = out
@@ -545,7 +549,7 @@ def _patch_cuda_graph_capture() -> None:
             if record.get("prefill_graph_has_dp_gather"):
                 dp_flags.prefill_graph_has_dp_gather = True
             rt.log_alloc_offset("before_prefill_restore")
-            # Unlike decode, LOAD runs the upstream capture loop itself: its
+            # LOAD runs the upstream capture loop itself (as for decode): its
             # eager work around each capture (dummy batches, the attention
             # metadata planned per shape, the chunked-prefix buffers, the
             # capture session's pool) then allocates exactly as on SAVE, and
@@ -578,10 +582,9 @@ def _patch_cuda_graph_capture() -> None:
             import torch
 
             from foundry.integration.sglang.graph_ops import (
-                flashinfer_decode_backend,
+                finish_decode_graph_restore,
                 has_prefill_graphs,
-                initialize_all_attention_metadata,
-                load_all_graphs,
+                start_decode_graph_restore,
             )
 
             state = rt.get_state()
@@ -593,42 +596,21 @@ def _patch_cuda_graph_capture() -> None:
                     "pass the same --cuda-graph-backend-prefill as SAVE"
                 )
 
-            # Kernel warmup normally runs at the top of orig capture(); it is
-            # a no-op here when EagerRunner already ran it, but keep the call
-            # so the sequence point matches SAVE exactly.
-            self.warmup()
-
-            # Set up the shared graph memory pool once — upstream does this in
-            # backend.capture_session, which LOAD never enters. Runtime replay
-            # also requires set_graph_pool_id so pynccl knows the pool.
-            backend = self.backend
-            if backend._pool is None:
-                backend._pool = get_or_create_global_graph_memory_pool(self.device_module)
-            set_graph_pool_id(backend._pool)
-
             # Already done at the prefill capture when prefill graphs are on.
             preallocate_once()
-
-            # Mirror capture()'s buffer seeding so the metadata pre-pass plans
-            # against the same values on both modes.
-            self.buffers.seq_lens.fill_(self.seq_len_fill_value)
-            self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
-
-            # Pre-pass (FlashInfer only): allocate every per-bs wrapper in
-            # ``reversed(capture_bs)`` order, matching the order SAVE used.
-            # SAVE's reuse shim makes the in-capture allocation half reuse
-            # these, so the cursor sits at SAVE's ``start_base_addr_0`` when
-            # graph load begins. fa3 etc. allocate their cuda-graph metadata
-            # once in init_cuda_graph_state and need no pre-pass. For the
-            # hybrid linear-attention backend the pre-pass runs on its
-            # FlashInfer child only; the linear child's metadata live in
-            # init_cuda_graph_state buffers that every replay refreshes.
-            fi_backend = flashinfer_decode_backend(self.attn_backend)
-            if fi_backend is not None:
-                initialize_all_attention_metadata(self, fi_backend)
-            rt.log_alloc_offset("after_pre_init")
-
-            load_all_graphs(self)
+            start_decode_graph_restore()
+            rt.log_alloc_offset("before_decode_restore")
+            # The single substitution point: sglang's own capture loop runs
+            # (kernel warmup, buffer seeding, the capture session's pool and
+            # graph_pool_id, and per shape the dummy batch, TBO / LoRA prep,
+            # the attention metadata incl. FlashInfer's per-bs wrappers and
+            # workspaces, deepep_adapter.capture()), in SAVE's order, and
+            # patched_capture_one restores each graph in place of capturing
+            # it. Every host-side object is thus re-created by sglang's code
+            # and lands at SAVE's address through the deterministic
+            # allocation replay.
+            result = orig_capture(self)
+            finish_decode_graph_restore()
             rt.log_alloc_offset("after_load_all_graphs")
 
             # Surrender torch-cached-but-free segments so later eager
@@ -638,97 +620,11 @@ def _patch_cuda_graph_capture() -> None:
             # pool bookkeeping).
             torch.cuda.empty_cache()
             rt.log_alloc_offset("after_post_load_empty_cache")
+            return result
 
-            # Hand the loaded graphs to the backend under the ShapeKeys the
-            # runner will look up at replay.
-            for bs in self.capture_bs:
-                if bs not in state.loaded_graphs:
-                    raise RuntimeError(
-                        f"Foundry archive has no graph for capture bs={bs}; "
-                        "re-save with the current cuda_graph_bs settings"
-                    )
-                key = self._make_graph_key(
-                    self._capture_graph_size(bs=bs, num_tokens=bs * self.captured_req_width)
-                )
-                graph, output = state.loaded_graphs[bs]
-                backend._graphs[key] = graph
-                backend._outputs[key] = output
-
-            # Non-FlashInfer backends (e.g. fa3) populate per-bs decode
-            # metadata — looked up at replay — inside the capture loop, which
-            # LOAD replaces. Run AFTER load_all_graphs: fa3's metadata are
-            # lightweight views over the fixed init_cuda_graph_state
-            # workspace, not graph memory, so the cursor is unaffected.
-            if fi_backend is None:
-                initialize_all_attention_metadata(self)
-
-            # Upstream sets the DeepEP adapter's captured mode in
-            # deepep_adapter.capture() during the capture loop, which LOAD
-            # replaces — without this, replay asserts on the first decode.
-            self.deepep_adapter.capture(is_extend_in_batch=False)
-            return None
-
-        # SAVE
-        from foundry.integration.sglang.graph_ops import flashinfer_decode_backend
-
-        # The FlashInfer backend itself, or the FlashInfer child of a hybrid
-        # linear-attention backend (same pre-pass as on LOAD).
-        attn_backend = flashinfer_decode_backend(self.attn_backend) or self.attn_backend
-        use_fi_prepass = hasattr(attn_backend, "indices_updater_decode")
-        real_prepare = getattr(attn_backend, "_prepare_cuda_graph_metadata", None)
-
-        def reuse_pre_pass_prepare(bs, num_tokens, forward_mode, spec_info):
-            # The pre-pass already allocated the wrappers for this bs and
-            # stored them in ``decode_cuda_graph_metadata`` /
-            # ``prefill_cuda_graph_metadata`` — reuse them instead of
-            # re-allocating (no second torch.empty for
-            # ``_int_workspace_buffer``), keeping the VMM cursor deterministic
-            # vs LOAD. The planner half (init_forward_metadata_out_graph) then
-            # runs upstream against the reused wrappers.
-            from sglang.srt.layers.attention.flashinfer_backend import (
-                DecodeMetadata,
-                PrefillMetadata,
-            )
-
-            if forward_mode.is_decode_or_idle():
-                wrappers = attn_backend.decode_cuda_graph_metadata.get(bs)
-                if wrappers is not None:
-                    attn_backend.forward_metadata = DecodeMetadata(wrappers)
-                    return
-            elif (
-                forward_mode.is_target_verify()
-                or forward_mode.is_draft_extend()
-                or forward_mode.is_dllm_extend()
-            ):
-                wrappers = attn_backend.prefill_cuda_graph_metadata.get(bs)
-                if wrappers is not None:
-                    attn_backend.forward_metadata = PrefillMetadata(
-                        wrappers, forward_mode.is_dllm_extend(), False
-                    )
-                    return
-            return real_prepare(bs, num_tokens, forward_mode, spec_info)
-
-        if use_fi_prepass:
-            from foundry.integration.sglang.graph_ops import (
-                initialize_all_attention_metadata,
-            )
-
-            # Mirror capture()'s buffer seeding (it happens inside
-            # orig_capture, after this pre-pass would otherwise run).
-            self.buffers.seq_lens.fill_(self.seq_len_fill_value)
-            self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
-            rt.log_alloc_offset("save_before_pre_init")
-            initialize_all_attention_metadata(self, attn_backend)
-            rt.log_alloc_offset("save_after_pre_init")
-            # Drop the pre-pass's last forward_metadata ref so popping the
-            # dict entry doesn't keep the wrapper alive at refcount 1.
-            attn_backend.forward_metadata = None
-            attn_backend._prepare_cuda_graph_metadata = reuse_pre_pass_prepare
-        try:
-            result = orig_capture(self)
-        finally:
-            if use_fi_prepass:
-                attn_backend._prepare_cuda_graph_metadata = real_prepare
+        # SAVE: the same upstream loop; patched_capture_one captures and
+        # saves each graph.
+        result = orig_capture(self)
 
         from foundry.integration.sglang.graph_ops import (
             pack_fatbins,
@@ -766,8 +662,8 @@ def _patch_cuda_graph_capture() -> None:
     runner_cls._resolve_shared_read_ends = patched_resolve_ends
 
     if os.environ.get("FOUNDRY_SGLANG_CAPTURE_TRACE") == "1":
-        # Diagnostic: log every shape the SAVE capture loop asks sglang for,
-        # and which one fails. sglang's per-shape metadata sizing runs inside
+        # Diagnostic: log every shape the capture loop (SAVE and LOAD) asks
+        # sglang for, and which one fails. sglang's per-shape metadata sizing runs inside
         # capture_one_shape before any foundry code for that shape, so a
         # failure there is state carried over from earlier shapes.
         orig_capture_one_shape = runner_cls.capture_one_shape
@@ -782,11 +678,18 @@ def _patch_cuda_graph_capture() -> None:
                 getattr(self, "ragged_verify_mode", None),
                 getattr(self, "max_bs", None),
             )
+            t0 = time.perf_counter()
             try:
-                return orig_capture_one_shape(self, size, forward, *args, **kwargs)
+                result = orig_capture_one_shape(self, size, forward, *args, **kwargs)
             except Exception:
                 logger.error("[Foundry] capture shape size=%d FAILED", size)
                 raise
+            logger.info(
+                "[Foundry] capture shape size=%d done in %.1f ms",
+                size,
+                1000 * (time.perf_counter() - t0),
+            )
+            return result
 
         runner_cls.capture_one_shape = traced_capture_one_shape
 

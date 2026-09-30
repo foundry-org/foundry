@@ -67,6 +67,12 @@ _state: CUDAGraphExtensionState | None = None
 # Per-rank record of the deterministic allocation layout, written at the end
 # of SAVE and consumed by LOAD's preallocation (see record_region_layout).
 _LAYOUT_FILE = "region_layout.json"
+# Version of the allocation sequence between the layout start and the end of
+# the decode capture, recorded in _LAYOUT_FILE on SAVE and required on LOAD.
+# 2: both modes run sglang's own decode capture loop and substitute only the
+# capture (1, unmarked: a FlashInfer metadata pre-pass before the loop, which
+# allocates the per-bs wrappers in another order; LOAD cannot replay it).
+CAPTURE_LOOP_VERSION = 2
 _layout_start_offset: int | None = None
 _final_alloc_offset: int = 0
 
@@ -273,6 +279,7 @@ def record_region_layout() -> int:
             "start_offset": _layout_start_offset,
             "final_alloc_offset": _final_alloc_offset,
             "live_ranges": ranges,
+            "capture_loop_version": CAPTURE_LOOP_VERSION,
         }
         with open(os.path.join(cfg.workspace_dir, _LAYOUT_FILE), "w") as f:
             json.dump(layout, f)
@@ -301,6 +308,26 @@ def record_region_layout() -> int:
             )
         )
     return _final_alloc_offset
+
+
+def check_capture_loop_version() -> None:
+    """LOAD, at setup (before the weights load): refuse an archive whose
+    allocation sequence this code cannot replay (see CAPTURE_LOOP_VERSION)."""
+    cfg = get_config()
+    if cfg is None or cfg.mode != CUDAGraphExtensionMode.LOAD or cfg.workspace_dir is None:
+        return
+    path = os.path.join(cfg.workspace_dir, _LAYOUT_FILE)
+    if not os.path.exists(path):
+        raise RuntimeError(
+            f"Foundry region layout not found: {path} (re-SAVE with the current code)"
+        )
+    with open(path) as f:
+        version = json.load(f).get("capture_loop_version")
+    if version != CAPTURE_LOOP_VERSION:
+        raise RuntimeError(
+            f"Foundry archive {cfg.workspace_dir} has capture_loop_version={version}, this "
+            f"code needs {CAPTURE_LOOP_VERSION}: re-SAVE with the current code"
+        )
 
 
 @nvtx_traced("foundry.memory_restore")

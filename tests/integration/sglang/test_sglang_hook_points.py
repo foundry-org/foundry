@@ -149,6 +149,8 @@ def test_plugin_entry_points_are_called_in_the_processes_foundry_needs():
 
 
 def test_attributes_read_on_the_decode_runner():
+    """LOAD and SAVE both run the upstream capture loop and substitute only
+    FullCudaGraphBackend.capture_one, so the hooks read few runner fields."""
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
@@ -157,14 +159,10 @@ def test_attributes_read_on_the_decode_runner():
     for attr in (
         "self.backend",
         "self.attention_graph_variants",
-        "self.captured_req_width",
-        "self.capture_bs",
-        "self.seq_len_fill_value",
-        "self.deepep_adapter",
         "self.in_graph_metadata_prep_done",
     ):
         assert attr in src, attr
-    for method in ("_make_graph_key", "_capture_graph_size", "warmup", "capture_one_shape"):
+    for method in ("capture_one_shape", "_resolve_shared_read_ends"):
         assert hasattr(DecodeCudaGraphRunner, method), method
 
 

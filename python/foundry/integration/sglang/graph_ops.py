@@ -10,7 +10,6 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -432,37 +431,6 @@ def start_graph_builds() -> None:
     )
 
 
-@nvtx_traced("foundry.graph_restore.preload")
-def preload_all_graphs() -> None:
-    global _pending_graph_builds
-    cfg = get_config()
-    state = get_state()
-    if cfg is None or state is None or cfg.workspace_dir is None:
-        raise RuntimeError("Foundry SGLang graph extension is not initialized")
-
-    if _pending_graph_builds is None:
-        start_graph_builds()
-    assert _pending_graph_builds is not None
-
-    cge.init_nvshmem_for_loaded_modules()
-
-    pending, graph_files = _pending_graph_builds
-    _pending_graph_builds = None
-
-    t0 = time.perf_counter()
-    with nvtx_range("foundry.graph_restore.finish"):
-        results = FoundryCUDAGraph.finish_graph_loads(pending)
-    logger.info(
-        "[Foundry] Finished SGLang graph loads for %d graphs in %.3fs",
-        len(results),
-        time.perf_counter() - t0,
-    )
-
-    for i, (_index, _filename, meta) in enumerate(graph_files):
-        graph, tensors = results[i]
-        state.loaded_graphs[meta["key"]] = (graph, _unpack_output(tensors))
-
-
 def bootstrap_collective_connections() -> None:
     """Connect every NCCL communicator the graphs may use, before capture, on
     SAVE and LOAD alike.
@@ -877,112 +845,45 @@ def _bootstrap_deepep_v2_buffer(cuda_graph_runner) -> bool:
     return False
 
 
-def flashinfer_decode_backend(attn_backend):
-    """The FlashInfer backend whose per-bs decode wrappers the captured graphs
-    read, or None.
-
-    The runner's backend itself for plain FlashInfer; the full-attention child
-    for the hybrid linear-attention wrapper (``HybridLinearAttnBackend``: GDN /
-    Mamba + full attention), which exposes neither ``indices_updater_decode``
-    nor ``decode_cuda_graph_metadata`` itself. Missing the child sends the
-    hybrid down the non-FlashInfer path: SAVE allocates the wrappers (each with
-    its own ``_int_workspace_buffer``) between captures, LOAD re-creates them
-    after ``load_all_graphs`` at other addresses, and the restored graphs read
-    SAVE's never-refreshed plan buffers."""
-    for backend in (attn_backend, getattr(attn_backend, "full_attn_backend", None)):
-        if backend is not None and hasattr(backend, "indices_updater_decode"):
-            return backend
-    return None
+@dataclass
+class _DecodeRestore:
+    pending: Any
+    graph_files: list[tuple[int, str, dict[str, Any]]]
+    t0: float
+    restore_s: float = 0.0
+    next: int = 0
 
 
-def initialize_attention_metadata_for_bs(cuda_graph_runner, bs: int, attn_backend=None) -> None:
-    """Populate the backend's per-bs cuda-graph metadata for runtime replay.
-
-    Drives the public capture-time entry point with a duck-typed batch
-    carrying exactly the fields ``init_forward_metadata_out_graph`` reads.
-    With ``in_capture=True`` FlashInfer's implementation first runs its
-    allocation half (``_prepare_cuda_graph_metadata``: wrappers +
-    ``_int_workspace_buffer``) and then the planner — the graph's runtime
-    kernels reference these buffer addresses, so LOAD must re-run the same
-    call before replay so the wrappers exist at deterministic VMM
-    addresses. fa3-style backends allocate their metadata once in
-    ``init_cuda_graph_state``; for them this only builds lightweight views
-    and does not move the VMM cursor.
-    """
-    buffers = cuda_graph_runner.buffers
-    if attn_backend is None:
-        attn_backend = cuda_graph_runner.attn_backend
-    num_tokens = bs * cuda_graph_runner.captured_req_width
-    encoder_lens = buffers.encoder_lens[:bs] if cuda_graph_runner.is_encoder_decoder else None
-    spec_info = cuda_graph_runner.get_spec_info(num_tokens)
-    forward_mode = cuda_graph_runner.capture_forward_mode
-
-    fb = SimpleNamespace(
-        forward_mode=forward_mode,
-        batch_size=bs,
-        req_pool_indices=buffers.req_pool_indices[:bs],
-        seq_lens=buffers.seq_lens[:bs],
-        seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-        seq_lens_sum=int(buffers.seq_lens[:bs].sum().item()),
-        encoder_lens=encoder_lens,
-        spec_info=spec_info,
-        out_cache_loc=buffers.out_cache_loc[:num_tokens],
-        positions=buffers.positions[:num_tokens],
-    )
-    attn_backend.init_forward_metadata_out_graph(fb, in_capture=True)
+_decode_restore: _DecodeRestore | None = None
 
 
-def initialize_all_attention_metadata(cuda_graph_runner, attn_backend=None) -> None:
-    """Pre-pass: populate ``decode_cuda_graph_metadata`` for all bs at once.
-
-    Called on both SAVE and LOAD before the capture/load loop (FlashInfer,
-    with ``attn_backend`` = ``flashinfer_decode_backend(...)``, which is the
-    full-attention child of a hybrid backend), and on LOAD after it for the
-    other backends (``attn_backend`` None: the runner's backend). Walking
-    ``reversed(self.capture_bs)`` (largest first) matches SAVE's natural
-    capture order; same order on both sides keeps the VMM cursor
-    trajectory identical.
-    """
-    for bs in reversed(cuda_graph_runner.capture_bs):
-        initialize_attention_metadata_for_bs(cuda_graph_runner, bs, attn_backend)
-
-
-@nvtx_traced("foundry.graph_restore.load_all")
-def load_all_graphs(cuda_graph_runner) -> None:
-    """LOAD-time replacement for the upstream capture loop.
-
-    All FlashInfer wrappers are pre-allocated by
-    ``initialize_all_attention_metadata`` (called by the capture hook
-    before this function), so the VMM cursor sits where SAVE recorded
-    ``start_base_addr_0``. Load every graph in one
-    ``start_graph_builds`` call — this is what enables template +
-    on-demand linking in the manifest. ``finish_graph_loads`` then
-    replays each graph's alloc events in sequence, advancing the
-    cursor exactly the way SAVE did inside its capture loop.
-    """
+@nvtx_traced("foundry.graph_restore.decode_start")
+def start_decode_graph_restore() -> None:
+    """LOAD, at the decode runner's capture: start building every decode graph
+    in one ``start_graph_builds`` call (the manifest's template / on-demand
+    linking needs them in one call; the builds run on foundry's background
+    thread), or take over the builds started at setup. The graphs are then
+    finished one at a time by restore_next_decode_graph, from inside the
+    upstream capture loop, so their allocator events replay at the points SAVE
+    captured them, between the same per-shape eager work."""
+    global _decode_restore, _pending_graph_builds
     cfg = get_config()
-    state = get_state()
-    if cfg is None or state is None or cfg.workspace_dir is None:
-        raise RuntimeError("Foundry SGLang graph extension is not initialized")
-
+    if cfg is None or cfg.workspace_dir is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
+        raise RuntimeError("Foundry SGLang graph extension is not initialized for LOAD")
     graph_files = _scan_graph_files(cfg.workspace_dir)
     if not graph_files:
         raise RuntimeError(f"No Foundry SGLang graph files found in {cfg.workspace_dir}")
 
-    # NVSHMEM init runs once before any graph is finished/replayed — graphs may
-    # reference NVSHMEM symbols. Single-GPU dense models have 0 NVSHMEM
-    # modules, so this is a no-op there but kept for EP parity.
+    # Graphs may reference NVSHMEM symbols; the DeepEP bootstrap ran before.
+    # Single-GPU dense models have no NVSHMEM modules (no-op there).
     cge.init_nvshmem_for_loaded_modules()
 
-    global _pending_graph_builds
     t0 = time.perf_counter()
     if _pending_graph_builds is not None:
-        # Builds were started at setup (start_graph_builds, right after the
-        # binaries were loaded) and ran on the background thread during
-        # torch-distributed init, weight loading and the memory-pool setup;
-        # only the remainder is waited for here. finish_graph_loads replays
-        # the allocator events and reconstructs output tensors, so the
-        # cursor-dependent part still happens at this sequence point.
+        # Builds started at setup (start_graph_builds, opt-in) ran on the
+        # background thread during torch-distributed init, weight loading and
+        # the memory-pool setup; allocator replay and output reconstruction
+        # still happen per shape below, at the capture points.
         pending, early_files = _pending_graph_builds
         _pending_graph_builds = None
         if [f for _, f, _ in early_files] != [f for _, f, _ in graph_files]:
@@ -991,14 +892,60 @@ def load_all_graphs(cuda_graph_runner) -> None:
     else:
         paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
         pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
-    with nvtx_range("foundry.graph_restore.finish"):
-        results = FoundryCUDAGraph.finish_graph_loads(pending)
-    logger.info(
-        "[Foundry] Loaded %d SGLang graphs in %.3fs",
-        len(results),
-        time.perf_counter() - t0,
-    )
+    _decode_restore = _DecodeRestore(pending=pending, graph_files=graph_files, t0=t0)
 
-    for i, (_index, _filename, meta) in enumerate(graph_files):
-        graph, tensors = results[i]
-        state.loaded_graphs[meta["key"]] = (graph, _unpack_output(tensors))
+
+def restore_next_decode_graph(key: Any) -> tuple[Any, Any]:
+    """LOAD: stands in for capturing decode graph ``key``. The archive holds
+    the graphs in capture order (``reversed(capture_bs)``); the upstream loop
+    asks for them in the same order, which is checked here."""
+    r = _decode_restore
+    state = get_state()
+    if r is None or state is None:
+        raise RuntimeError("Foundry decode graph restore was not started")
+    bs = _batch_size_from_key(key)
+    if r.next >= len(r.graph_files):
+        raise RuntimeError(
+            f"Foundry archive holds {len(r.graph_files)} decode graphs, but the capture loop "
+            f"asks for more (bs={bs}): the decode capture sizes (--cuda-graph-bs) differ from SAVE"
+        )
+    _index, filename, meta = r.graph_files[r.next]
+    if meta["key"] != bs:
+        raise RuntimeError(
+            f"Foundry decode graph order mismatch: the capture loop asks for bs={bs}, the next "
+            f"archived graph is {filename}. The decode capture sizes (--cuda-graph-bs) differ "
+            "between SAVE and LOAD."
+        )
+    t = time.perf_counter()
+    with nvtx_range("foundry.graph_restore.finish_one"):
+        graph, tensors = FoundryCUDAGraph.finish_one_graph_load(r.pending, r.next)
+    r.restore_s += time.perf_counter() - t
+    r.next += 1
+    output = _unpack_output(tensors)
+    # Strong reference next to the backend's own.
+    state.loaded_graphs[bs] = (graph, output)
+    return graph, output
+
+
+def finish_decode_graph_restore() -> None:
+    """LOAD, after the upstream decode capture loop: check that it restored
+    every archived decode graph."""
+    global _decode_restore
+    r = _decode_restore
+    _decode_restore = None
+    if r is None:
+        raise RuntimeError("Foundry decode graph restore was not started")
+    if r.next != len(r.graph_files):
+        raise RuntimeError(
+            f"Foundry archive holds {len(r.graph_files)} decode graphs, the capture loop "
+            f"restored {r.next}: the decode capture sizes (--cuda-graph-bs) differ from SAVE"
+        )
+    # The first number spans the whole upstream loop (per-shape eager prep +
+    # the restores), the second only the restore calls (build wait + allocator
+    # replay + output reconstruction).
+    logger.info(
+        "[Foundry] Loaded %d SGLang graphs in %.3fs (restore calls %.3fs)",
+        r.next,
+        time.perf_counter() - r.t0,
+        r.restore_s,
+    )
