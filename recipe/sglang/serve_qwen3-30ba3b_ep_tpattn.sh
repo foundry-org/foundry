@@ -19,6 +19,7 @@
 # nvidia-nvshmem wheel (leave nvshmem_host_path unset in the TOMLs — README §EP).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/serve_common.sh"   # foundry_select / foundry_serve (plugin route + preflight)
 
 EP_SIZE=${1:?Usage: $0 <ep_size> [--save|--load]}
 # bf16 is the validated default on the `foundry` branch (sgl-deep-gemm's masked bf16
@@ -30,13 +31,9 @@ MEM_FRACTION_STATIC=0.8
 
 if [[ "$2" == "--save" ]]; then
     FOUNDRY_TOML="${SCRIPT_DIR}/foundry_save.toml"
-    export NCCL_CUMEM_ENABLE=0
-    export NCCL_NVLS_ENABLE=0
     echo "Using foundry SAVE: ${FOUNDRY_TOML}"
 elif [[ "$2" == "--load" ]]; then
     FOUNDRY_TOML="${SCRIPT_DIR}/foundry_load.toml"
-    export NCCL_CUMEM_ENABLE=0
-    export NCCL_NVLS_ENABLE=0
     echo "Using foundry LOAD: ${FOUNDRY_TOML}"
 elif [[ -n "$2" ]]; then
     echo "Usage: $0 <ep_size> [--save|--load]"
@@ -45,17 +42,16 @@ else
     echo "Running without foundry (baseline SGLang)"
 fi
 
-FOUNDRY_ARGS=()
-if [[ -n "${FOUNDRY_TOML:-}" ]]; then
-    FOUNDRY_ARGS+=( --foundry-graph-extension-config-path "${FOUNDRY_TOML}" )
-fi
+# --save/--load: export FOUNDRY_GRAPH_EXTENSION_CONFIG="$FOUNDRY_TOML" after the preflight; baseline: unset it.
+foundry_select "$2" "${FOUNDRY_TOML:-}"
+foundry_baseline_pins   # baseline only: the plugin's collective pins (custom AR off, torch symm-mem on), see serve_common.sh
 
 # LD_PRELOAD of libcuda_hook.so AND DeepEP's libnvshmem_host.so are set by
 # foundry's setup_ld_preload_env at worker spawn time — both paths auto-detected
 # (the hook from the foundry install, NVSHMEM from the nvidia-nvshmem wheel via
 # config._detect_nvshmem_host_path), so nothing is preloaded by the shell. Set
 # nvshmem_host_path in the TOML only to override the NVSHMEM auto-detection.
-# Assumes foundry + the sglang fork are pip-installed (see README).
+# Assumes foundry + sglang are pip-installed (see README).
 
 # DeepEP low-latency caps tokens/rank at SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
 # (default 128; (n+1)*2 must be <= NVSHMEM_QP_DEPTH). Raise to 256 ((256+1)*2=514
@@ -63,22 +59,20 @@ fi
 # fit — applied identically to SAVE and LOAD so the captured graphs match.
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
 
-sglang serve \
+foundry_serve "$2" sglang serve \
     --model-path "$MODEL_NAME" \
     --trust-remote-code \
     --host "$HOST" --port "$PORT" \
     --tp-size "$EP_SIZE" \
     --ep-size "$EP_SIZE" \
-    --enable-torch-symm-mem \
     --cuda-graph-backend-prefill disabled \
     --moe-a2a-backend deepep \
     --deepep-mode low_latency \
     --moe-runner-backend deep_gemm \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --disable-radix-cache \
-    --disable-custom-all-reduce \
     --chunked-prefill-size 256 \
     --attention-backend fa3 \
-    --cuda-graph-max-bs 128 \
-    "${FOUNDRY_ARGS[@]}" \
+    --cuda-graph-max-bs-decode 128 \
+    $FOUNDRY_BASELINE_ARGS \
     ${SGL_EXTRA_ARGS:-}
