@@ -19,7 +19,7 @@ steps (`apply_inkling_prefill_cuda_graph_default`, `handle_cuda_graph_config`, `
 | 3 | `FullCudaGraphBackend.capture_one` | capture into a `foundry.CUDAGraph` (no warmup forwards), `save_graph` | both runners: hand back the next archived graph for this shape (`restore_next_decode_graph` / `restore_next_prefill_graph`, order checked against the archive); its allocator events replay here (`finish_one_graph_load`); `forward_fn` is not run |
 | 3b | `DecodeCudaGraphRunner.capture` | pre-capture bootstraps and layout start, upstream capture loop, manifest, `pack_fatbins`, `record_region_layout` (with `capture_loop_version`) | bootstraps, `preallocate_for_load_mode`, `start_decode_graph_restore` (one `start_graph_builds`), upstream capture loop with 3 swapping each capture for the archived graph, `finish_decode_graph_restore` (count check), `empty_cache()` |
 | 3c | `PrefillCudaGraphRunner.capture` | full backend only; bootstraps if it runs first | same as 3b for the prefill graphs: `start_prefill_graph_restore`, upstream loop with 3 swapping each capture (order and shape checked), `finish_prefill_graph_restore` |
-| 3d | `DecodeCudaGraphRunner._resolve_shared_read_ends` | - | `POST_REPLAY` fence for restored graphs (they carry no in-graph shared-read marker) |
+| 3d | `DecodeCudaGraphRunner._resolve_shared_read_ends` | - | `POST_REPLAY` fence for restored graphs (they carry no in-graph shared-read marker; see [`known-issues.md`](known-issues.md#event-record-nodes-todo-2026-10-02)) |
 | 4 | `Engine._launch_scheduler_processes` (kept a classmethod) | check the resolved graph config, `setup_ld_preload_env(server_args)` (hook lib, NVSHMEM host lib, optional udev shim; re-asserts the plugin's environment pins, see [`overview.md`](overview.md#what-the-plugin-pins-and-why)) before spawning | same |
 | 4b | `DataParallelController.launch_tensor_parallel_group` | `setup_ld_preload_env()` (fork-base layout) | same |
 
@@ -99,7 +99,9 @@ all-reduce through torch symmetric memory (validated attn-TP + EP rows up to att
   (FlashInfer / fa3 / hybrid decode metadata, the `deepep_adapter` captured mode, TBO / LoRA buffers) exactly as on
   SAVE. The earlier FlashInfer pre-pass, reuse shim, post-load fa3 metadata pass and explicit
   `deepep_adapter.capture()` are gone. What remains is the `_resolve_shared_read_ends` `POST_REPLAY` patch (3d):
-  restored graphs never run `run_once`, so they carry no in-graph shared-read marker.
+  restored graphs never run `run_once`, so they carry no in-graph shared-read marker. It costs the scheduler's
+  write/forward overlap on LOAD; see [`known-issues.md`](known-issues.md#event-record-nodes-todo-2026-10-02) for why
+  the marker is lost and the plan to restore it.
 - **C++: bind context on graph-build pool workers** (`CUDAGraphParallel.cpp`). EP graphs
   carry `NODE_EVENT_RECORD/WAIT` nodes → `cuEventCreate` during on-demand prep, which runs
   on `SimpleThreadPool` workers that never `cuCtxSetCurrent(main_ctx)`. Added that call

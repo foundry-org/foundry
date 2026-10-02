@@ -32,6 +32,54 @@ Why it is expected to work: v2's windows are library-owned physical memory at a 
 pre-capture bootstrap on both SAVE and LOAD, the same model as DeepEP v1's NVSHMEM heap; the
 `NCCL_GRAPH_REGISTER=0` / `NCCL_LOCAL_REGISTER=0` / `NCCL_NVLS_ENABLE=0` pins stay in force.
 
+## Event-record nodes (TODO, 2026-10-02)
+
+**Why SGLang has an in-graph event.** The overlap scheduler writes batch N+1's shared buffers (`req_to_token`,
+`seq_lens`, `positions`, ...) on `schedule_stream` while batch N's forward still reads them on `forward_stream`.
+`Scheduler._apply_war_barrier` makes `schedule_stream` wait on an event the runner publishes
+(`runner.shared_read_done_event`); with no event it falls back to a coarse `wait_stream(forward_stream)`. Each
+attention backend declares where its reads of the shared data end (`SharedReadEnds` in `base_attn_backend.py`):
+
+| value | the reads end ... | event published |
+|---|---|---|
+| `PRE_REPLAY` | before replay: graph-external metadata prep (`init_forward_metadata_out_graph`) copied everything | recorded before `replay` |
+| `IN_REPLAY` | inside the graph, up to a marker | the in-graph marker event |
+| `POST_REPLAY` | after the whole replay | recorded after `replay` |
+| `UNKNOWN` | not audited | none (coarse `wait_stream`) |
+
+The base backend declares `IN_REPLAY` for decode and target-verify; DeepSeek-V4 inherits it for decode and declares it
+for DSPARK verify. The `IN_REPLAY` marker is an event-record node inside the captured graph:
+`DecodeCudaGraphRunner._record_in_graph_metadata_prep_done` records an external event (`make_external_event`, i.e.
+`torch.cuda.Event(external=True)`) right after `attn_backend.init_forward_metadata_in_graph` in `run_once`, near the
+start of the graph. The runner keeps it in `self.in_graph_metadata_prep_done` (one event per runner, created at the
+first capture) and `_publish_read_done(in_graph=True)` hands it to the scheduler, which can then overwrite the shared
+buffers while the rest of the forward still runs.
+
+**What LOAD loses.** LOAD never runs `run_once` (patch 3 in [`hooks.md`](hooks.md) swaps the capture for the
+archived graph), so `runner.in_graph_metadata_prep_done` stays `None`. The archive does not help either. SAVE
+serializes event-record / event-wait nodes as `EventRecordNode` / `EventWaitNode` with an `event_id` numbered per
+graph in first-seen order (`event_to_id` in `CUDAGraph.cpp`); LOAD creates a fresh private `CUevent` per id
+(`cuEventCreate`, kept in `loaded_graph_resources_->created_events`) and adds the node with it. A restored graph
+therefore records into an event that only Foundry holds: the link from the node to the host object
+(`in_graph_metadata_prep_done`) is not stored, and the id is local to one graph, while SGLang shares one event across
+all of a runner's graphs. (Not checked against a SGLang archive for this particular node; the statement is
+from the SAVE / LOAD code, which handles every event node this way.)
+
+Upstream's fallback for "`IN_REPLAY` declared, no marker" is `PRE_REPLAY`, which fences too early: the scheduler may
+overwrite buffers the graph is still about to read (upstream's own TODO in `_resolve_shared_read_ends` says
+`POST_REPLAY` is the sound one). Foundry's `shared_read_ends_override` (`integration/sglang/hooks.py`, called from
+`_resolve_shared_read_ends`; patch 3d in [`hooks.md`](hooks.md)) therefore returns `POST_REPLAY` on LOAD in that case.
+That is correct, but the scheduler's writes for batch N+1 now wait for the whole forward of batch N, so the overlap the
+marker buys is lost. The loss was not measurable in our bs 1-128 TPOT runs; it may matter for small-batch, CPU-bound
+serving, where the scheduler's next-batch preparation is a large share of the step (not measured).
+
+**TODO (next phase).** Give events a stable identity across the archive instead of a per-graph index: SAVE records,
+per event node, an id for the host event (shared by every graph that records it) and, where the integration registers
+one, which host object it is. LOAD creates one event per id, adds the nodes with it, and hands the event back to the
+integration (SGLang: set `runner.in_graph_metadata_prep_done`). Then `shared_read_ends_override` and its SGLang call
+site in `_resolve_shared_read_ends` can go, and upstream's own `IN_REPLAY` path runs unchanged. The generic mechanism
+is "graph nodes that reference host objects": events now, conditional handles and child-graph handles later.
+
 ## SAVE spends ~30 s in `Init torch distributed` (and ~20 s more elsewhere) copying over-read fatbins (FIXED, 2026-09-25)
 
 SAVE only (LOAD skips fatbin processing). The hook sized each registered fatbin by walking every following
