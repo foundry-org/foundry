@@ -231,7 +231,7 @@ def after_runner_distributed_init(model_runner) -> None:
 # (get_context().override, e.g. max_mamba_cache_size for hybrid
 # Mamba/GDN/KDA models); the pool factories read them from the bags, so LOAD
 # must replay them when it skips the resolver. Filled by
-# end_memory_pool_resolution, persisted by after_alloc_memory_pool.
+# record_memory_pool_overrides, persisted by after_alloc_memory_pool.
 _resolve_overrides: list = []
 _resolve_log_start: int | None = None
 
@@ -244,7 +244,7 @@ def _json_safe(value) -> bool:
     return False
 
 
-def begin_memory_pool_resolution():
+def replay_saved_memory_pool_config():
     """Head of ``KVCacheConfigurator._resolve_memory_pool_config``.
 
     SAVE: remember where the runtime-context override log stands, and return
@@ -292,9 +292,9 @@ def begin_memory_pool_resolution():
     return config
 
 
-def end_memory_pool_resolution() -> None:
+def record_memory_pool_overrides() -> None:
     """End of ``_resolve_memory_pool_config`` (SAVE): keep the overrides the
-    resolver issued since :func:`begin_memory_pool_resolution`."""
+    resolver issued since :func:`replay_saved_memory_pool_config`."""
     global _resolve_log_start
     if get_graph_extension_mode() != CUDAGraphExtensionMode.SAVE or _resolve_log_start is None:
         return
@@ -691,7 +691,7 @@ def _early_graph_builds_enabled() -> bool:
 
 
 def _patch_alloc_memory_pool() -> None:
-    """Plugin route for begin/end_memory_pool_resolution and
+    """Plugin route for begin/record_memory_pool_overrides and
     before/after_alloc_memory_pool."""
     from sglang.srt.mem_cache import kv_cache_configurator as kvc_mod
     from sglang.srt.model_executor import model_runner as mr
@@ -700,11 +700,11 @@ def _patch_alloc_memory_pool() -> None:
 
     @functools.wraps(orig_resolve)
     def patched_resolve(self, pre_model_load_memory):
-        replayed = begin_memory_pool_resolution()
+        replayed = replay_saved_memory_pool_config()
         if replayed is not None:
             return replayed
         config = orig_resolve(self, pre_model_load_memory)
-        end_memory_pool_resolution()
+        record_memory_pool_overrides()
         return config
 
     kvc_mod.KVCacheConfigurator._resolve_memory_pool_config = patched_resolve

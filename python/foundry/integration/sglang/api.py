@@ -30,8 +30,8 @@ scheduler / DP-controller spawn             :func:`configure_subprocess`
 ``bootstrap.init_parallel_runtime``         :func:`before_parallel_init`,
                                             :func:`after_parallel_init`
 ``ModelRunner.init_torch_distributed``      :func:`after_runner_distributed_init`
-``_resolve_memory_pool_config``             :func:`begin_memory_pool_resolution`,
-                                            :func:`end_memory_pool_resolution`
+``_resolve_memory_pool_config``             :func:`replay_saved_memory_pool_config`,
+                                            :func:`record_memory_pool_overrides`
 ``ModelRunner.alloc_memory_pool``           :func:`before_alloc_memory_pool`,
                                             :func:`after_alloc_memory_pool`
 decode / prefill runner ``capture``         :func:`capture_scope`
@@ -244,23 +244,23 @@ def after_runner_distributed_init(model_runner: Any) -> None:
     hooks.after_runner_distributed_init(model_runner)
 
 
-def begin_memory_pool_resolution():
+def replay_saved_memory_pool_config():
     """Head of ``KVCacheConfigurator._resolve_memory_pool_config``. LOAD returns
     the saved ``MemoryPoolConfig`` (the caller returns it and skips memory
     profiling) after replaying SAVE's context overrides; SAVE returns None."""
     _require_active()
     from foundry.integration.sglang import hooks
 
-    return hooks.begin_memory_pool_resolution()
+    return hooks.replay_saved_memory_pool_config()
 
 
-def end_memory_pool_resolution() -> None:
+def record_memory_pool_overrides() -> None:
     """End of ``_resolve_memory_pool_config`` (SAVE keeps the overrides the
     resolver issued)."""
     _require_active()
     from foundry.integration.sglang import hooks
 
-    hooks.end_memory_pool_resolution()
+    hooks.record_memory_pool_overrides()
 
 
 def before_alloc_memory_pool(model_runner: Any) -> None:
