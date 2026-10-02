@@ -1,11 +1,14 @@
+# foundry.ops is a torch C++/CUDA extension: it must be compiled against the torch
+# that will import it. Install with --no-build-isolation into an environment that
+# already has that torch (and cmake>=4.0, ninja); an isolated build would compile
+# against whatever torch pip resolves here, not the runtime one.
 [build-system]
 requires = [
     "setuptools>=80",
     "wheel",
     "cmake>=4.0",
     "ninja",
-    "pytest",
-    "torch==2.9.0"
+    "torch",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -17,6 +20,14 @@ requires-python = ">=3.10"
 dependencies = [
     "torch",
 ]
+
+# Plugin route: SGLang discovers general plugins through this entry-point group
+# (sglang.srt.plugins.load_plugins). The entry module imports only the
+# standard library; Foundry activates when FOUNDRY_GRAPH_EXTENSION_CONFIG is set.
+# An SGLang that declares Foundry as a dependency (sglang[foundry],
+# --cuda-graph-persistence) calls foundry.integration.sglang.api instead.
+[project.entry-points."sglang.srt.plugins"]
+foundry = "foundry_sglang_plugin:load"
 
 [project.optional-dependencies]
 dev = [
@@ -30,6 +41,7 @@ packages = [
     "foundry.integration.vllm",
     "foundry.integration.sglang",
 ]
+py-modules = ["foundry_sglang_plugin"]
 package-dir = {"" = "python"}
 include-package-data = true
 zip-safe = false
@@ -100,3 +112,7 @@ docstring-code-format = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "xlarge: 4-GPU, 100+ GB model end-to-end cases; deselected by default, run with -m xlarge",
+]
+addopts = "-m 'not xlarge'"

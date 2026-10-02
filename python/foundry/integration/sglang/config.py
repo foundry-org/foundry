@@ -23,6 +23,12 @@ class CUDAGraphExtensionConfig:
     mode: CUDAGraphExtensionMode = CUDAGraphExtensionMode.NONE
     hook_library_path: str | None = None
     nvshmem_host_path: str | None = None
+    # Bare hosts whose verbs devices exist but cannot be opened make rdma-core
+    # wait 5 s per HCA for udev in DeepEP's first NVSHMEM init (~40 s per
+    # engine). Path to the preload shim that removes the wait
+    # (tools/host/no_cdev_wait.c, docs/bare-host-verbs-udev-wait.md); None
+    # leaves LD_PRELOAD as the launcher exported it.
+    verbs_udev_wait_shim_path: str | None = None
     base_addr: int = 0x600000000000
     region_size: str = "64GB"
     workspace_root: str = "foundry_archive"
@@ -37,7 +43,12 @@ class CUDAGraphExtensionConfig:
     def from_toml(cls, path: str | Path) -> CUDAGraphExtensionConfig:
         with open(path, "rb") as f:
             data = tomllib.load(f)
+        return cls.from_mapping(data, source=str(path))
 
+    @classmethod
+    def from_mapping(cls, data: dict, source: str = "<defaults>") -> CUDAGraphExtensionConfig:
+        """Build from parsed TOML keys; a missing key keeps the default and the
+        library paths are detected from the installed wheels."""
         base_addr_value = data.get("base_addr", cls.base_addr)
         base_addr = int(base_addr_value, 0) if isinstance(base_addr_value, str) else base_addr_value
 
@@ -49,10 +60,19 @@ class CUDAGraphExtensionConfig:
         if nvshmem_host_path is None:
             nvshmem_host_path = cls._detect_nvshmem_host_path()
 
+        verbs_udev_wait_shim_path = data.get("verbs_udev_wait_shim_path")
+        if verbs_udev_wait_shim_path is not None and not Path(verbs_udev_wait_shim_path).is_file():
+            raise FileNotFoundError(
+                f"verbs_udev_wait_shim_path={verbs_udev_wait_shim_path!r} in {source} "
+                "does not exist; "
+                "build it with `make -C tools/host` (docs/bare-host-verbs-udev-wait.md)"
+            )
+
         return cls(
             mode=CUDAGraphExtensionMode(data.get("mode", cls.mode.value)),
             hook_library_path=hook_library_path,
             nvshmem_host_path=nvshmem_host_path,
+            verbs_udev_wait_shim_path=verbs_udev_wait_shim_path,
             base_addr=base_addr,
             region_size=data.get("region_size", cls.region_size),
             workspace_root=data.get("workspace_root", cls.workspace_root),
@@ -103,9 +123,17 @@ class CUDAGraphExtensionConfig:
 _config: CUDAGraphExtensionConfig | None = None
 
 
-def load_graph_extension_config(path: str) -> None:
+def load_graph_extension_config(path: str | None, mode: str | None = None) -> None:
+    """Load the TOML at ``path`` (None: all defaults). ``mode``, when given,
+    replaces the TOML's ``mode`` (SGLang's ``--cuda-graph-persistence`` wins)."""
     global _config
-    _config = CUDAGraphExtensionConfig.from_toml(path)
+    if path is None:
+        config = CUDAGraphExtensionConfig.from_mapping({})
+    else:
+        config = CUDAGraphExtensionConfig.from_toml(path)
+    if mode is not None:
+        config.mode = CUDAGraphExtensionMode(mode)
+    _config = config
 
 
 def get_config() -> CUDAGraphExtensionConfig | None:
@@ -134,6 +162,12 @@ def get_nvshmem_host_path() -> str | None:
     if _config is None:
         return None
     return _config.nvshmem_host_path
+
+
+def get_verbs_udev_wait_shim_path() -> str | None:
+    if _config is None:
+        return None
+    return _config.verbs_udev_wait_shim_path
 
 
 def compute_workspace_rank(server_args, tp_rank: int, pp_rank: int, dp_rank: int | None) -> int:
