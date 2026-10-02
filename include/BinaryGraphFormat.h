@@ -61,6 +61,13 @@ enum HeaderFlags : uint32_t {
   FLAG_HAS_ALLOCATOR_EVENTS = 1 << 2,
   FLAG_HAS_OUTPUT_TENSORS = 1 << 3,
   FLAG_HAS_GENERATORS = 1 << 4,
+  // Every kernel-node attribute the JSON records is in this file (per-node
+  // programmatic stream serialization / device-updatable in the ext fields of
+  // BinKernelNode; no access-policy window, which the node table cannot hold,
+  // and none of those three in the common attributes). LOAD builds templates
+  // from the node table only when this is set; older files, and files with
+  // such attributes, build their templates from the JSON.
+  FLAG_COMPLETE_KERNEL_ATTRS = 1 << 5,
 };
 
 #pragma pack(push, 1)
@@ -142,6 +149,17 @@ struct BinKernelNode {
   uint32_t num_params;
   uint32_t arg_buffer_offset;  // byte offset into ARG_BUFFER_DATA (0xFFFFFFFF = none)
   uint32_t arg_buffer_size;
+  // Extension (spare union space, zero in files written before it): per-node
+  // attributes the JSON records beyond the kna_* set above.
+  uint8_t ext_flags;  // KernelNodeExtFlags bitmask
+  uint8_t ext_programmatic_stream_serialization;
+  uint8_t ext_device_updatable;
+  uint8_t _ext_pad;
+};
+
+enum KernelNodeExtFlags : uint8_t {
+  KNX_PROGRAMMATIC_STREAM_SERIALIZATION = 1 << 0,
+  KNX_DEVICE_UPDATABLE = 1 << 1,
 };
 
 struct BinMemsetNode {
@@ -186,6 +204,8 @@ struct BinNodeEntry {
   uint8_t _tail_pad[168 - 8 - sizeof(BinMemcpyNode)];
 };
 static_assert(sizeof(BinNodeEntry) == 168, "BinNodeEntry must be 168 bytes");
+static_assert(sizeof(BinKernelNode) <= sizeof(BinMemcpyNode),
+              "BinKernelNode must fit the node union");
 
 // ---- Param index ----
 

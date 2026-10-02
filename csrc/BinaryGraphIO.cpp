@@ -102,11 +102,24 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
     }
   };
 
+  // Attributes the node table cannot hold: an access-policy window anywhere,
+  // or programmatic stream serialization / device-updatable in the common
+  // attributes. Any of them leaves FLAG_COMPLETE_KERNEL_ATTRS unset, so LOAD
+  // builds this graph's template from the JSON.
+  bool complete_kernel_attrs = true;
+  auto has_unrepresentable = [](const json::object& kna, bool common) {
+    return kna.contains("accessPolicyWindowNumBytes") ||
+           (common &&
+            (kna.contains("programmaticStreamSerialization") || kna.contains("deviceUpdatable")));
+  };
+
   // Common kernel attrs
   bool has_common_attrs = root.contains("common_kernel_node_attrs");
   bf::BinCommonKernelAttrs common_attrs = {};
   if (has_common_attrs) {
     const json::object& ca = root.at("common_kernel_node_attrs").as_object();
+    if (has_unrepresentable(ca, true))
+      complete_kernel_attrs = false;
     // Reuse the kna parser with a temporary BinKernelNode to extract flags
     bf::BinKernelNode tmp = {};
     parse_kna_flags(ca, tmp);
@@ -177,7 +190,18 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
 
       // kernel_node_attrs (per-node overrides)
       if (p.contains("kernel_node_attrs")) {
-        parse_kna_flags(p.at("kernel_node_attrs").as_object(), k);
+        const json::object& kna = p.at("kernel_node_attrs").as_object();
+        parse_kna_flags(kna, k);
+        if (auto* v = kna.if_contains("programmaticStreamSerialization")) {
+          k.ext_flags |= bf::KNX_PROGRAMMATIC_STREAM_SERIALIZATION;
+          k.ext_programmatic_stream_serialization = static_cast<uint8_t>(v->to_number<int>());
+        }
+        if (auto* v = kna.if_contains("deviceUpdatable")) {
+          k.ext_flags |= bf::KNX_DEVICE_UPDATABLE;
+          k.ext_device_updatable = static_cast<uint8_t>(v->to_number<int>());
+        }
+        if (has_unrepresentable(kna, false))
+          complete_kernel_attrs = false;
       }
 
       // Kernel params
@@ -348,6 +372,8 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
     header.flags |= bf::FLAG_HAS_OUTPUT_TENSORS;
   if (!gens.empty())
     header.flags |= bf::FLAG_HAS_GENERATORS;
+  if (complete_kernel_attrs)
+    header.flags |= bf::FLAG_COMPLETE_KERNEL_ATTRS;
   header.num_nodes = static_cast<uint32_t>(node_entries.size());
   header.num_dependencies = static_cast<uint32_t>(deps.size());
   header.num_generators = static_cast<uint32_t>(gens.size());
@@ -490,6 +516,10 @@ boost::json::value read_and_parse_binary_graph(const std::string& bin_path) {
     }
     if (k.kna_flags & bf::KNA_SHARED_MEM_CARVEOUT)
       kna["preferredSharedMemCarveout"] = k.kna_preferredSharedMemCarveout;
+    if (k.ext_flags & bf::KNX_PROGRAMMATIC_STREAM_SERIALIZATION)
+      kna["programmaticStreamSerialization"] = (int)k.ext_programmatic_stream_serialization;
+    if (k.ext_flags & bf::KNX_DEVICE_UPDATABLE)
+      kna["deviceUpdatable"] = (int)k.ext_device_updatable;
     return kna;
   };
 

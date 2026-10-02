@@ -39,6 +39,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Preallocate memory in the allocation region for fast subsequent allocations");
 
   m.def(
+      "get_live_region_ranges", []() { return ::foundry::get_live_region_ranges(); },
+      "Live (offset, size) ranges inside the allocation region, relative to its base");
+  m.def(
+      "preallocate_ranges",
+      [](const std::vector<std::pair<size_t, size_t>>& ranges, size_t end_offset) {
+        return ::foundry::preallocate_ranges(ranges, end_offset);
+      },
+      py::arg("ranges"), py::arg("end_offset"),
+      "Map only the given live ranges and move the cursor to end_offset (sparse LOAD "
+      "preallocation)");
+  m.def(
       "free_preallocated_region", []() { ::foundry::free_preallocated_region(); },
       "Free the preallocated memory region");
 
@@ -113,7 +124,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readonly("offset_and_sizes", &::foundry::KernelNodeMetadata::offset_and_sizes);
 
   py::class_<::foundry::PendingGraphLoads, std::shared_ptr<::foundry::PendingGraphLoads>>(
-      m, "PendingGraphLoads");
+      m, "PendingGraphLoads")
+      // Seconds from start_graph_builds' entry to the end of Phase 2; waits
+      // for the background builds first (0 for an empty or failed build).
+      .def_property_readonly("build_seconds", [](::foundry::PendingGraphLoads& self) {
+        if (self.build_complete_.valid()) {
+          py::gil_scoped_release release;
+          self.build_complete_.wait();
+        }
+        return *self.build_seconds_;
+      });
 
   shared_ptr_class_<::foundry::CUDAGraph>(m, "CUDAGraph")
       .def(py::init<bool>(), py::arg("keep_graph") = false)
@@ -246,6 +266,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             return py::make_tuple(load_result.graph, output_tensors);
           },
           py::arg("json_path"), py::arg("pool") = py::none())
+      .def_static(
+          "start_exec_pool_prewarm",
+          [](const std::vector<std::string>& json_paths) {
+            py::gil_scoped_release release;
+            ::foundry::CUDAGraph::start_exec_pool_prewarm(json_paths);
+          },
+          py::arg("json_paths"))
       .def_static(
           "start_graph_builds",
           [](const std::vector<std::string>& json_paths, std::optional<c10::MempoolId_t> pool_opt,
