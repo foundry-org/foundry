@@ -1,201 +1,105 @@
 # SGLang Hook Surface
 
-Every monkey-patch `install_hooks(server_args)` installs.
+Every runtime patch `foundry.integration.sglang.hooks.install(cfg_path)` installs. It runs in each process that loads
+the plugin (the launcher and every scheduler; `foundry.integration.sglang.plugin.activate`, reached from the entry
+point `foundry_sglang_plugin:load` when `FOUNDRY_GRAPH_EXTENSION_CONFIG` is set). The superseded in-tree route calls
+it through `install_hooks(server_args)`. The server-args pins (decode `full`, prefill `full` / `disabled`, profiling
+and FlashInfer autotune off) are not patches: the plugin registers them as resolution hooks on three whitelisted
+steps (`apply_inkling_prefill_cuda_graph_default`, `handle_cuda_graph_config`, `handle_other_validations`); see
+`plugin.py`.
 
-## Patches installed by `install_hooks`
+## Patches, in install order
 
-In install order:
+| # | patched symbol | SAVE | LOAD |
+|---|---|---|---|
+| 1 | `sglang.srt.distributed.bootstrap.init_parallel_runtime` (main; called from `Scheduler.__init__` before any `ModelRunner`) or `ModelRunner.init_torch_distributed` (fork base) | `set_device(gpu_id)`, then `setup_graph_extension` reserves the rank's VMM region before any process group exists | same, plus the binary restore (`load_cuda_modules_and_libraries`) and the exec-memory prewarm thread |
+| 1b | `ModelRunner.init_torch_distributed` (end; target runner only, main layout) | `skip_to_scratch_boundary()`: weights start at `scratch_space_size` | same |
+| 2 | `KVCacheConfigurator._resolve_memory_pool_config` | run upstream, record the context overrides it issued (e.g. the Mamba/GDN state-pool size) | skip profiling: `gc.collect()` + `empty_cache()` (mirrors SAVE's side effects), return the saved `MemoryPoolConfig`, replay the overrides |
+| 2b | `ModelRunner.alloc_memory_pool` | write `warmup_state.json` (pool config + overrides) | pass-through with offset logging |
+| 3 | `FullCudaGraphBackend.capture_one` | capture into a `foundry.CUDAGraph` (no warmup forwards), `save_graph` | both runners: hand back the next archived graph for this shape (`restore_next_decode_graph` / `restore_next_prefill_graph`, order checked against the archive); its allocator events replay here (`finish_one_graph_load`); `forward_fn` is not run |
+| 3b | `DecodeCudaGraphRunner.capture` | pre-capture bootstraps and layout start, upstream capture loop, manifest, `pack_fatbins`, `record_region_layout` (with `capture_loop_version`) | bootstraps, `preallocate_for_load_mode`, `start_decode_graph_restore` (one `start_graph_builds`), upstream capture loop with 3 swapping each capture for the archived graph, `finish_decode_graph_restore` (count check), `empty_cache()` |
+| 3c | `PrefillCudaGraphRunner.capture` | full backend only; bootstraps if it runs first | same as 3b for the prefill graphs: `start_prefill_graph_restore`, upstream loop with 3 swapping each capture (order and shape checked), `finish_prefill_graph_restore` |
+| 3d | `DecodeCudaGraphRunner._resolve_shared_read_ends` | - | `POST_REPLAY` fence for restored graphs (they carry no in-graph shared-read marker) |
+| 4 | `Engine._launch_scheduler_processes` (kept a classmethod) | check the resolved graph config, `setup_ld_preload_env(server_args)` (hook lib, NVSHMEM host lib, optional udev shim; re-asserts the plugin's environment pins, see [`overview.md`](overview.md#what-the-plugin-pins-and-why)) before spawning | same |
+| 4b | `DataParallelController.launch_tensor_parallel_group` | `setup_ld_preload_env()` (fork-base layout) | same |
 
-1. `_patch_init_torch_distributed`
-2. `_patch_init_memory_pool`
-3. `_patch_load_model`
-4. `_patch_kernel_warmup`
-5. `_patch_cuda_graph_capture`
-6. `_patch_spawn_sites`
+Every patch is wrap-and-call and returns to upstream when the mode is `NONE`; no patch replaces an upstream loop on
+either mode. Kernel warmup needs no patch: `BaseRunner.warmup()` runs no model forward and executes at the same
+sequence point on SAVE and LOAD (inside the upstream `capture()`).
 
-> Removed: an earlier `_patch_model_runner_init` wrapped `ModelRunner.__init__` to stash `dp_rank` on `self` (upstream didn't expose it as an attribute). Upstream sglang now does `self.dp_rank = dp_rank` in the constructor, so our wrapper is no longer needed; `_resolve_dp_rank` reads `self.dp_rank` directly.
+**Single substitution point.** SAVE and LOAD both run sglang's own `capture()` loop unchanged: warmup, `seq_lens`
+fill, `reset_index_buffers`, the `graph_capture` stream, `backend.capture_session` (pool + `set_graph_pool_id`), and
+per shape `capture_prepare`, TBO / LoRA prep, `attn_backend.init_forward_metadata_out_graph(in_capture=True)`
+(FlashInfer's per-bs wrappers and workspaces), `deepep_adapter.capture()`. Only `FullCudaGraphBackend.capture_one`
+(patch 3) differs: SAVE captures and saves, LOAD restores. Each shape's eager allocations therefore happen at the same
+point and in the same order in both modes, and every graph's allocator events replay right where SAVE captured it.
 
-### 1. `ModelRunner.init_torch_distributed`
+**Device binding (DP/TP/EP).** `set_allocation_region` binds the region to the device current at call time. The
+bring-up sets the device itself, but patch 1 runs before it, so rank > 0 would reserve on `cuda:0` and fault later
+with an async illegal memory access. Patch 1 therefore calls `set_device(gpu_id)` first.
 
-**Bind the device first (multi-GPU correctness).** Upstream `init_torch_distributed`
-calls `torch.get_device_module(self.device).set_device(self.gpu_id)` *inside*
-itself. But `setup_graph_extension` reserves the VMM region with
-`set_allocation_region`, which binds to **whatever CUDA device is current at call
-time** — and we call it *before* upstream. For DP/TP/EP rank > 0 the current
-device is still `cuda:0` at that point, so without intervention the region lands
-on the wrong GPU and the rank's later allocations fault with an **async illegal
-memory access** that surfaces at an unrelated op (e.g. the first
-`torch.cuda.Stream()` in `ModelRunner.__init__`). The patch therefore mirrors
-upstream's `set_device(self.gpu_id)` up front (guarded on `self.device == "cuda"`)
-before reserving the region. Single-GPU and rank 0 are unaffected (`gpu_id == 0`),
-which is why this only appeared once DP was exercised.
+**LOAD starts every decode graph build in one call.** `start_decode_graph_restore` calls
+`start_graph_builds(all_paths)` once before the loop (or takes over the builds started at setup); the manifest's
+template / on-demand linking needs all graphs in one build. Per-graph builds leave on-demand graphs without a
+`shared_exec` and replay aborts with `Called CUDAGraph::replay without a preceding successful capture or load`. The
+builds are finished one per shape inside the loop (`finish_one_graph_load`, from patch 3). `finish_decode_graph_restore`
+checks the count and logs `[Foundry] Loaded N SGLang graphs in X s (builds B s, handover H s)`, only Foundry's restore
+work, and `[Foundry] SGLang decode capture loop on LOAD: Y s (N shapes, restore X s, per-shape prep Z s)` for the loop
+wall (the prefill runner logs the same pair; see [`save-load-workflow.md`](save-load-workflow.md)).
 
-Before upstream: `set_device(self.gpu_id)`, then `setup_graph_extension(...)`
-reserves the VMM region, loads cached fatbins (LOAD only via
-`load_cuda_modules_and_libraries`), and eagerly initializes the cuBLAS handle into
-scratch space.
+**Archive compatibility.** SAVE writes `capture_loop_version = 2` (`runtime.CAPTURE_LOOP_VERSION`) into each rank's
+`region_layout.json`. LOAD checks it at setup (`check_capture_loop_version`, right after `setup_graph_extension`,
+before the weight load) and refuses an archive without it or with another value; archives saved by the pre-pass code
+must be re-saved.
 
-After upstream: `skip_to_scratch_boundary()` forces the cursor to `cfg.scratch_space_size`.
+The alloc-offset log lines (`[Foundry] SGLang alloc_offset[<point>]=...`) mark each step: `after_setup_graph_ext`,
+`after_init_parallel_runtime`, `after_init_torch_dist`, `after_scratch_skip`, `before/after_init_memory_pool`, the
+bootstrap points below, `before/after_preallocate`, `before/after_prefill_restore` (prefill graphs on),
+`before_decode_restore`, `after_load_all_graphs` (must equal SAVE's `final_alloc_offset`),
+`after_post_load_empty_cache`.
 
-```
-[Foundry] SGLang alloc_offset[after_setup_graph_ext]=…
-[Foundry] SGLang alloc_offset[after_init_torch_dist]=…
-[Foundry] SGLang alloc_offset[after_scratch_skip]=…
-```
+## Pre-capture bootstraps and EP additions
 
-Validated on DP=2 (Qwen3-1.7B, one full replica per rank): both ranks reach an
-identical `final_alloc_offset` across both SAVE passes and LOAD replays each
-rank's graphs at that offset. Multi-rank runs also export
-`NCCL_CUMEM_ENABLE=0` / `NCCL_NVLS_ENABLE=0` from the serve script — the CUMEM
-P2P and NVLS multicast fast paths `cuMemMap` with driver-capability flags the
-foundry VMM region doesn't carry.
+Pre-capture bootstraps run at the first runner capture on SAVE and LOAD alike (same sequence point, no model
+forward). The DeepEP buffer step is active for the DeepEP-family backends (DeepEP, DeepEP v2, Mooncake). Both
+attention layouts work with EP: DP attention, and TP attention (or attention-TP inside DP groups) with its
+all-reduce through torch symmetric memory (validated attn-TP + EP rows up to attn-TP4 + EP8 in
+`recipe/sglang/README.md`).
 
-### 2. `ModelRunnerKVCacheMixin.init_memory_pool`
-
-- **SAVE**: call upstream `init_memory_pool` unchanged; after it returns, serialize the resolved `MemoryPoolConfig` (via `dataclasses.asdict`) into `warmup_state.json`.
-- **LOAD**: skip upstream profiling. Load `MemoryPoolConfig` from `warmup_state.json`. Call `torch.cuda.empty_cache()` to mirror SAVE's `_resolve_memory_pool_config → get_available_gpu_memory(empty_cache=True)` side effect. Then call `_apply_memory_pool_config(config)` directly.
-
-The `empty_cache()` mirror is load-bearing — see [`memory-consistency.md`](memory-consistency.md) §5.
-
-### 3. `ModelRunner.load_model`
-
-Currently a passthrough wrapper. Kept as a future hook point for a LOAD-time `start_graph_builds(all_paths)` overlap with weight IO; the current LOAD path is fast enough (~80 ms total) that overlap isn't needed.
-
-### 4. `ModelRunner.kernel_warmup`
-
-No-op on SAVE/LOAD:
-
-```
-[Foundry] SGLang kernel_warmup skipped in <mode> mode
-```
-
-The FlashInfer autotune path inside is shut off both by this no-op and by the forced `disable_flashinfer_autotune` flag.
-
-### 5. `CudaGraphRunner` (the largest patch)
-
-Four sub-patches:
-
-#### 5a. `_create_device_graph`
-
-On SAVE returns `foundry.CUDAGraph()` instead of `torch.cuda.CUDAGraph()`.
-
-#### 5b. `_capture_graph`
-
-On SAVE enters `foundry.graph(graph, pool=pool, stream=stream)` instead of `torch.cuda.graph(...)`, captures the `run_once` callable's allocations into foundry's hook event log.
-
-#### 5c. `capture_one_batch_size`
-
-On SAVE wraps the `forward` callable with a 3-call counter:
-
-```python
-counter = [0]; real_forward = forward
-def warmup_skipping_forward(*args, **kwargs):
-    counter[0] += 1
-    if counter[0] <= 2:
-        return None
-    return real_forward(*args, **kwargs)
-forward = warmup_skipping_forward
-```
-
-This suppresses the two pre-capture warmup forwards SGLang does in `for _ in range(2): run_once()`. Only the third invocation — inside `_capture_graph`'s graph capture context — runs the real forward. JIT and autotune allocations that those warmups would normally trigger now happen inside the captured graph and become foundry alloc events that replay verbatim on LOAD. (See `memory-consistency.md` §2.)
-
-After upstream returns, calls `save_graph(graph, output, key)`. The key matches the inline shape upstream uses for `self.graphs[key]` in `_capture_one_stream`:
-
-```python
-key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-```
-
-(Sglang removed the `_make_graph_key` / `get_capture_lora_variant` helpers in commit `ce2506e1c`, the same commit that deprecated `record_nolora_graph` dual MoE graph capture.)
-
-#### 5d. `capture`
-
-The outermost replacement.
-
-**SAVE**:
-
-```python
-initialize_all_attention_metadata(self)             # pre-pass
-attn_backend.forward_metadata = None
-real_init = attn_backend.init_forward_metadata_capture_cuda_graph
-attn_backend.init_forward_metadata_capture_cuda_graph = reuse_pre_pass_init
-try:
-    result = orig_capture(self, *args, **kwargs)    # upstream capture loop
-finally:
-    attn_backend.init_forward_metadata_capture_cuda_graph = real_init
-save_graph_manifest()
-pack_fatbins()
-capture_final_alloc_offset()
-```
-
-`initialize_all_attention_metadata` walks `reversed(self.capture_bs)` and pre-allocates every per-bs FlashInfer wrapper. The wrappers are stored in `attn_backend.decode_cuda_graph_metadata[bs]`.
-
-`reuse_pre_pass_init` is a drop-in replacement for the upstream inner init that runs inside `capture_one_batch_size`. For decode mode it:
-
-1. Looks up the pre-pass wrapper from `decode_cuda_graph_metadata[bs]`.
-2. Re-runs `indices_updater_decode.update(...)` with the same buffer slices (idempotent — writes plan info to the same `_int_workspace_buffer`).
-3. Sets `attn_backend.forward_metadata = DecodeMetadata(wrappers)` so the captured forward sees the right metadata for this iter.
-
-No allocation. The captured graph references the pre-pass wrapper's address; LOAD's pre-pass produces a wrapper at the same address.
-
-**LOAD**:
-
-```python
-if cgr.get_global_graph_memory_pool() is None:
-    cgr.set_global_graph_memory_pool(self.device_module.graph_pool_handle())
-set_graph_pool_id(cgr.get_global_graph_memory_pool())
-preallocate_for_load_mode()                         # cuMemCreate+cuMemMap up to final_alloc_offset
-initialize_all_attention_metadata(self)             # pre-pass (same as SAVE)
-load_all_graphs(self)                               # ONE start_graph_builds + finish_graph_loads
-self.graphs = {k: v[0] for k, v in state.loaded_graphs.items()}
-self.output_buffers = {k: v[1] for k, v in state.loaded_graphs.items()}
-```
-
-`load_all_graphs` calls `start_graph_builds(all_paths)` and `finish_graph_loads(pending)` exactly once each. This is required for the manifest's template + on-demand linking to work; per-graph `start_graph_builds([single_path])` calls would leave on-demand graphs without a `shared_exec`, and runtime replay would abort with `Called CUDAGraph::replay without a preceding successful capture or load`.
-
-### 6. Spawn-site patches
-
-Two parent-side wrappers:
-
-```python
-# Engine._launch_scheduler_processes
-def patched_launch(self, *args, **kwargs):
-    if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-        rt.setup_ld_preload_env()
-    return orig_launch(self, *args, **kwargs)
-
-# DataParallelController.launch_tensor_parallel_group
-def patched_start(self, *args, **kwargs):
-    if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-        rt.setup_ld_preload_env()
-    return orig_start(self, *args, **kwargs)
-```
-
-`setup_ld_preload_env()` prepends `libcuda_hook.so` (and optionally `libnvshmem_host.so`) to `os.environ["LD_PRELOAD"]`, sets `FOUNDRY_MODE`, and records a wall-clock marker (`FOUNDRY_SPAWN_T0_NS`). All children spawned from these methods inherit the env.
-
-## Expert parallel (DeepEP) additions
-
-Active only when `moe_a2a_backend == deepep`. EP runs DP-attention + DeepEP (NCCL-free);
-TP attention is unsupported (its NCCL all-reduce is incompatible with the VMM region).
-
+- **NCCL communicator bootstrap** (`bootstrap_collective_connections`). NCCL connects a communicator on its first
+  collective, which a capturing stream rejects (seen on the attention-TP sub-group's first reduce-scatter of
+  Qwen3.5-35B-A3B attention-TP2 + EP4). Foundry issues small and large all-reduce / all-gather / reduce-scatter on
+  every initialized group through sglang's coordinators before capture.
 - **DeepEP buffer pre-capture bootstrap** (`bootstrap_deepep_buffer`, graph_ops). sglang
   creates the singleton NVSHMEM `Buffer` lazily on the first MoE dispatch — normally
   during the warmup forwards foundry suppresses, which would push creation *inside* the
   captured stream (`deep_ep_cpp.Buffer(...)` → "operation not permitted when stream is
   capturing"). The hook forces it before the capture loop, unwrapping the
   `MaybeTboDeepEPDispatcher._inners` to reach a `DeepEPDispatcher`. Runs on SAVE and LOAD.
-- **SAVE-only warmup pass** (`_run_warmup_pass`, `capture()` patch). Reuses the upstream
-  capture loop with graph capture neutered (run forwards only) to trigger every
-  pre-capture lazy init — DeepGEMM per-shape JIT (`stream.synchronize()` is illegal in
-  capture), buffer creation, etc. — outside the captured stream. LOAD doesn't need it
-  (preallocate + replay place allocations at recorded offsets; bootstrap covers NVSHMEM).
-- **`deepep_adapter` mode on LOAD.** LOAD replaces the capture loop, so the adapter's
-  `_captured_deepep_mode` is never set; replay asserts on it. The hook calls
-  `deepep_adapter.capture(is_extend_in_batch=False)` after load.
-- **FlashInfer pre-pass gated to FlashInfer.** The §5d pre-pass + `reuse_pre_pass_init`
-  shim handle FlashInfer's per-bs wrappers. fa3 (`FlashAttentionBackend`) uses a single
-  fixed `init_cuda_graph_state` workspace, so the shim is skipped (detected via absence of
-  `indices_updater_decode`); but fa3's per-bs `decode_cuda_graph_metadata[bs]` is still
-  populated post-load for the replay lookup.
+- **Logits all-gather bootstrap** (`bootstrap_logits_gatherer`, `capture()` patch, SAVE and LOAD).
+  sglang's `LogitsProcessor` gathers TP-sharded logits through `MultimemAllGatherer`, whose torch
+  symmetric-memory buffer, multicast mapping and signal pads are built lazily on the first *eager*
+  call and skipped under capture (NCCL fallback). Multicast availability is a host property, so on
+  a host with multicast any eager forward before capture activates the gatherer and every graph
+  bakes in pointers to memory the hook never saw (torch symmetric memory is not `cudaMalloc`);
+  LOAD then faults at the first decode, while the same SAVE passes on a host without multicast.
+  The hook builds the state (`_build` with a probe of the per-rank logits shard width) before
+  capture at the same sequence point in both modes, so it lands at the same addresses and the
+  graphs capture the multicast gather like native sglang.
+- **SAVE-side runtime-init bootstrap** (`bootstrap_lazy_runtimes`, `capture()` patch). Two
+  one-time initializations are illegal while a stream is capturing and would otherwise fire
+  inside the first captured forward: inductor's pattern-matcher lazy init (an unpinned
+  host-to-device copy) and DeepGEMM's runtime init (`cudaFree(nullptr)`). SAVE runs them
+  directly, with the allocation region suspended so their transient tensors never move the
+  deterministic cursor. Everything else the model does lazily (torch.compile of its
+  functions, DeepGEMM per-shape JIT compile and `cuLibraryLoadFromFile`) happens inside the
+  captured forward and is recorded like any other capture-time event. No eager forward runs
+  on either mode, and SAVE and LOAD reach the layout start at the same cursor.
+- **No backend-specific code.** LOAD runs the upstream loop, so sglang itself re-creates all per-shape host state
+  (FlashInfer / fa3 / hybrid decode metadata, the `deepep_adapter` captured mode, TBO / LoRA buffers) exactly as on
+  SAVE. The earlier FlashInfer pre-pass, reuse shim, post-load fa3 metadata pass and explicit
+  `deepep_adapter.capture()` are gone. What remains is the `_resolve_shared_read_ends` `POST_REPLAY` patch (3d):
+  restored graphs never run `run_once`, so they carry no in-graph shared-read marker.
 - **C++: bind context on graph-build pool workers** (`CUDAGraphParallel.cpp`). EP graphs
   carry `NODE_EVENT_RECORD/WAIT` nodes → `cuEventCreate` during on-demand prep, which runs
   on `SimpleThreadPool` workers that never `cuCtxSetCurrent(main_ctx)`. Added that call
@@ -203,13 +107,4 @@ TP attention is unsupported (its NCCL all-reduce is incompatible with the VMM re
   surfaced only on sglang EP.
 
 See [`../../recipe/sglang/README.md`](../../recipe/sglang/README.md) for the EP serve
-config and kernel-stack notes (wheel-provided on the `foundry` branch; hand-built
-deep_ep `9af0e0d` / sgl-deep-gemm ≥0.1.2 / fa3 on the older branch).
-
-## Patch idiom
-
-All patches use the `wrap-and-call` idiom — short-circuit on `mode == NONE`, run foundry pre-work, call `orig`, run foundry post-work. The single exception is `capture()` on LOAD, which replaces the upstream method entirely (does not call `orig`).
-
-## Install order
-
-`install_hooks` calls the patch helpers in the listed order. Order doesn't matter for correctness here — every patch attaches to a different attribute — but spawn sites go last so the install-completion log line appears after every other patch has registered.
+config and kernel-stack notes (all wheel-provided by the sglang install).

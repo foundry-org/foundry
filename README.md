@@ -93,7 +93,7 @@ windows). Every SGLang configuration is validated with the full decode-graph set
 (batch sizes 1..256) for restore time, per-token latency and greedy-output
 equality against unmodified SGLang; see [`recipe/sglang/README.md`](recipe/sglang/README.md#validation).
 
-The adapted SGLang fork is published at [`foundry-org/sglang`](https://github.com/foundry-org/sglang), branch `foundry` (v0.0.3 pairs with commit `f1d688e52`; the 0.0.2-era integration stays on `foundry-0.0.2`). The vLLM and TensorRT-LLM forks will follow at `foundry-org/vllm` and `foundry-org/TensorRT-LLM`.
+The adapted SGLang fork is published at [`foundry-org/sglang`](https://github.com/foundry-org/sglang), branch `foundry` (current head `6272eb04c5` = upstream `main` 03ea13a545 + one integration commit; the v0.0.3 pairing `f1d688e52` is kept as `foundry-0.0.3`, the 0.0.2-era integration on `foundry-0.0.2`). The vLLM and TensorRT-LLM forks will follow at `foundry-org/vllm` and `foundry-org/TensorRT-LLM`.
 
 ### Performance
 
@@ -118,10 +118,11 @@ See [ROADMAP.md](ROADMAP.md) for the full development plan and progress.
 
 ## Requirements
 
-- CMake 4.0+
-- PyTorch 2.9.0+
-- CUDA Driver 12.0+
-- Boost 1.83.0+
+- CMake 4.0+ (`pip install "cmake>=4.0"` if the system one is older)
+- PyTorch 2.9.0+ (Foundry is compiled against the installed torch; rebuild after changing torch)
+- CUDA Toolkit with `nvcc` (CUDA 12+; CUDA 13 with torch cu130), CUDA Driver 12.0+
+- Boost 1.83.0+ with the CMake config files, components `filesystem` and `json`
+  (Ubuntu 24.04: `apt-get install libboost-filesystem-dev libboost-json-dev`)
 
 If you are using a conda environment, you can install the requirements with the following command:
 
@@ -139,6 +140,14 @@ conda activate xxx
 # Torch 2.11 with CUDA 13.0
 pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 pip install -e . --no-build-isolation
+```
+
+Into an existing SGLang environment (torch already installed), straight from git:
+
+```bash
+pip install "cmake>=4.0" ninja
+pip install --no-build-isolation --no-deps "git+https://github.com/foundry-org/foundry.git@sglang-registry"
+python -c "import foundry.ops"   # the extension and libcuda_hook.so are in the wheel
 ```
 
 ### Debugging

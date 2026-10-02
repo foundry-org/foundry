@@ -10,11 +10,13 @@ HOST="0.0.0.0"
 PORT=12000
 MEM_FRACTION_STATIC=0.6
 
-# No LD_PRELOAD / PYTHONPATH here: foundry + the sglang fork are pip-installed, and
-# foundry's setup_ld_preload_env auto-detects libcuda_hook.so and LD_PRELOADs it
-# into every worker at spawn time. (Running from a source checkout instead? Export
-# PYTHONPATH=.../foundry/python:.../sglang/python yourself.)
+# No LD_PRELOAD / PYTHONPATH here: foundry + sglang are pip-installed in one venv
+# (installing foundry registers its sglang plugin entry point; a PYTHONPATH checkout
+# does not), and foundry's setup_ld_preload_env auto-detects libcuda_hook.so and
+# LD_PRELOADs it into every worker at spawn time.
 
+# Foundry is an sglang plugin, switched on by this variable (no CLI flag).
+export FOUNDRY_GRAPH_EXTENSION_CONFIG="$FOUNDRY_TOML"
 sglang serve \
     --model-path "$MODEL_NAME" \
     --trust-remote-code \
@@ -23,11 +25,22 @@ sglang serve \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --disable-radix-cache \
     --attention-backend flashinfer \
-    --cuda-graph-max-bs 512 \
-    --foundry-graph-extension-config-path "$FOUNDRY_TOML"
+    --cuda-graph-max-bs-decode 512
 ```
 
-`--cuda-graph-max-bs 512` is the closest analogue to vLLM's `--max-num-seqs 512` — it drives `capture_bs` to span a similar range of decode batch sizes (52 batch sizes from 1 → 512).
+The recipe scripts wrap this: they export the variable for `--save` / `--load` only, run
+`python -m foundry.integration.sglang.preflight` first (sglang plugin surface, the `foundry`
+entry point, `SGLANG_PLUGINS`, the TOML and, on LOAD, the archive), and after `/health` check
+the engine log for `[Foundry] sglang plugin active` (and `[Foundry] Loaded N SGLang graphs` on
+LOAD). SGLang runs natively without an error when the entry point is not registered in the
+serving venv or `SGLANG_PLUGINS` omits `foundry`; see
+[`recipe/sglang/README.md`](../../recipe/sglang/README.md#foundry-plugin-activation-and-checks).
+
+The command carries no collective or graph-memory flags: the plugin pins custom all-reduce off, torch symm-mem
+all-reduce on, the NCCL registration / cuMem / NVLS variables and the other unreplayable features itself, and stops
+the launch if one was set to the contrary ([`overview.md`](overview.md#what-the-plugin-pins-and-why)).
+
+`--cuda-graph-max-bs-decode 512` is the closest analogue to vLLM's `--max-num-seqs 512` — it drives `capture_bs` to span a similar range of decode batch sizes (52 batch sizes from 1 → 512).
 
 ## TOML configs
 
@@ -83,7 +96,7 @@ foundry_archive/
     graph_{0..N-1}_FULL_t{bs}_r{bs}_UX_pcN.json       # one per captured graph
     graph_{0..N-1}_FULL_t{bs}_r{bs}_UX_pcN.cugraph    # binary cuGraph blob
     graph_manifest.json                   # topology groups for template + on-demand linking
-    final_alloc_offset.json               # per-rank VMM watermark
+    region_layout.json                    # per-rank layout: start offset, watermark, live ranges
     fatbin_image_packed.img               # packed kernel fatbins
     fatbin_entrypoint_packed.txt          # fatbin entry-point index
 ```
@@ -95,6 +108,14 @@ graph_{state.capture_index}_FULL_t{bs}_r{bs}_UX_pcN.json
 ```
 
 `state.capture_index` increments per `save_graph` call so files sort in SAVE-time order. `_GRAPH_FILENAME_RE` in `graph_ops.py` parses them on LOAD.
+
+**Archive format note (LOAD template build).** A `.cugraph` written by the current SAVE carries the header flag
+`FLAG_COMPLETE_KERNEL_ATTRS` when it holds every kernel-node attribute the JSON records (per-node programmatic stream
+serialization and device-updatable live in spare node-table space; an access-policy window, or those attributes in the
+common set, leave the flag unset). LOAD then builds each template's graph from the binary node table only. Archives
+saved before this (or without the flag) still load unchanged, but their templates are built from the JSON copy, as
+before, so they do not get that speedup: re-SAVE to get it. The format stays v2, so older foundry builds read new
+archives too.
 
 ## Expected logs
 
@@ -130,17 +151,39 @@ LOAD (success):
 [Foundry] SGLang kernel_warmup skipped in load mode
 [Foundry] SGLang alloc_offset[before_preallocate]=… (… MB)
 [Foundry] SGLang alloc_offset[after_preallocate]=… (… MB)
-[Foundry] SGLang alloc_offset[after_pre_init]=… (… MB)
 [CGE] Using graph_manifest.json (9 topology groups)
 [CGE] Phase 1: 52 graphs parsed in 0.x ms, 9 topologies, 4 threads, 52 binary + 0 json
 [CGE BUILD] Template 0 (...): N nodes, done in X.X ms
 …
 [CGE] Phase 2: 9 templates + 43 on-demand = 52 graphs built in xx.x ms
-[CGE] finish_graph_loads: 52 graphs, xx.x ms
-[Foundry] Loaded 52 SGLang graphs in 0.0x s
+[Foundry] SGLang alloc_offset[before_decode_restore]=… (… MB)
+[Foundry] Loaded 52 SGLang graphs in 0.0xs (builds 0.0xs, handover 0.00xs)
+[Foundry] SGLang decode capture loop on LOAD: 0.xs (52 shapes, restore 0.0xs, per-shape prep 0.xs)
 [Foundry] SGLang alloc_offset[after_load_all_graphs]=22785556480 (… MB)
 …
 INFO:     Application startup complete.
 ```
 
 The `after_load_all_graphs` value **must** equal SAVE's `final_alloc_offset`. If it doesn't, see [`memory-consistency.md`](memory-consistency.md).
+The build lines (`[CGE] Phase 1/2`) come from the background build thread and may interleave with the offset lines.
+The graphs are finished one per shape inside sglang's capture loop. The two timing lines, logged once per runner
+(decode above; the prefill runner logs `Loaded N SGLang prefill graphs in ...` and `SGLang prefill capture loop on
+LOAD: ...` the same way when prefill graphs are on), mean:
+
+- `Loaded N ... in X s`: only Foundry's restore work. `builds` is the time from the start of this runner's restore
+  (the builds being launched, or taken over when they were started at setup) to the last build / instantiate
+  finishing (Phase 1 + Phase 2). `handover` is the part of the per-shape `restore_next_*` calls after the builds
+  finished (allocator replay, output reconstruction). A call's wait for the builds is counted once, in `builds`.
+  X = builds + handover.
+- `capture loop on LOAD: Y s`: the wall time of sglang's own `capture()` on LOAD. `per-shape prep` is Y minus the time
+  spent inside the restore calls: sglang's work around the restores (the run-once kernel `warmup()`, the two
+  `gc.collect()` of `freeze_gc`, and per shape the dummy batch and the attention metadata). The builds run on the
+  background thread while the loop runs, so restore + prep can exceed Y.
+
+On Qwen3-1.7B (FlashInfer, prefill 8-64 + decode 1-8, one H200) Phase 2 took ~11 ms (prefill) and ~19 ms (decode),
+so the restore is tens of milliseconds per runner, while the loops take ~1.1 s (prefill, which also runs the run-once
+`warmup()`) and ~0.7 s (decode).
+
+An archive saved by older code (no `capture_loop_version` in `region_layout.json`) is refused at setup, before the
+weights load: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the current code`.
+Re-run both SAVE passes.
