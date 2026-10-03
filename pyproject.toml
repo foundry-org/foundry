@@ -37,6 +37,7 @@ dev = [
 [tool.setuptools]
 packages = [
     "foundry",
+    "foundry._qmd_research",
     "foundry.integration",
     "foundry.integration.vllm",
     "foundry.integration.sglang",
@@ -48,6 +49,7 @@ zip-safe = false
 
 [tool.setuptools.package-data]
 foundry = ["*.so"]
+"foundry._qmd_research" = ["provenance.json"]
 
 # -----------------------------------------------------------------------------
 # Lint / format
