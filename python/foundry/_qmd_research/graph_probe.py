@@ -771,7 +771,7 @@ def probe(entry, all_entries, torch, output_dir, config=None):
         for candidate in candidates[:int(cfg["cross_candidates"])]:
             source = int(candidate.cudagraph.raw_cuda_graph())
             candidate_report = {"source": _description(candidate), "source_graph": driver.census(source)}
-            from graph_diff import diff_graphs
+            from .graph_diff import diff_graphs
             candidate_report["parameter_diff"] = diff_graphs(driver, source, target)
             difference = candidate_report["parameter_diff"]
             fixed_family = bool(difference.get("aligned")
