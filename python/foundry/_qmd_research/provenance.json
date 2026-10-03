@@ -8,13 +8,13 @@
   "graph_diff.py": {
     "upstream_local_source": "/home/xenshinu/Workarea/gpu-explore/experiments/drafts/foundry-h200-symmem-deepep-20261002/src/graph_diff.py",
     "source_sha256": "62d12c008edfd144700e8711d8492626df5aeab4724a03cbe9a078e23a1b8674",
-    "vendored_sha256": "5ba34c1ec618073017bb9f0340010028b58b14650aa7754046020fcd98b73f92",
-    "edits": "Package-relative imports only; guard predicates unchanged."
+    "vendored_sha256": "4e295519f8b9ba544d9499ca36bb40b120c7fe535431e8905f70f56dcee62e24",
+    "edits": "Package-relative imports; optional actual Foundry LOAD construction-context witness passed through to nonkernel comparison; default has no witness."
   },
   "graph_dag_diff.py": {
     "upstream_local_source": "/home/xenshinu/Workarea/gpu-explore/experiments/drafts/foundry-h200-symmem-deepep-20261002/src/graph_dag_diff.py",
     "source_sha256": "a8d501edd48e1c8748049378c1f580e3c66a1e994ac0ef80a08c32ec2b2bfe8b",
-    "vendored_sha256": "6d84a68ab4bf7cf00b9e7b9c46d00b7511de29aaf06224cd294b9a41da667ee4",
-    "edits": "Package-relative imports; narrow fixed-parameter 1D memset VMM proof for actual LOAD pointers with successful NULL allocation context. Existing memcpy, edge and event predicates unchanged."
+    "vendored_sha256": "878345ecb3a6ca36101cc6851a3714c45ce56b4532143d25a4a976998bd0b61f",
+    "edits": "Package-relative imports; narrow fixed 1D memset VMM proof; optional actual Foundry explicit memcpy construction-context witness for NULL generic getter and two fully proven VMM operands. Default NULL copy context still rejects; edge/event predicates unchanged."
   }
 }

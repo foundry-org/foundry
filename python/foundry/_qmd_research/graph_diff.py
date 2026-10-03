@@ -69,7 +69,7 @@ def _linearize(driver, graph):
     return result, order, kinds
 
 
-def diff_graphs(driver, source, target, allow_dag=False):
+def diff_graphs(driver, source, target, allow_dag=False, memcpy_creation_context=None):
     """Return JSON-serializable field differences, or an alignment rejection.
 
     This reports host-visible node parameters and selected graph attributes.
@@ -109,7 +109,8 @@ def diff_graphs(driver, source, target, allow_dag=False):
     report["aligned"] = True
     if allow_dag:
         from .graph_dag_diff import compare_nonkernels
-        report.update(compare_nonkernels(driver, source_order, target_order, source_kinds))
+        report.update(compare_nonkernels(driver, source_order, target_order, source_kinds,
+                                         memcpy_creation_context=memcpy_creation_context))
     names = {}
 
     def function_name(function):

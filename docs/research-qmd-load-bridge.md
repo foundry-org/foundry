@@ -66,7 +66,7 @@ The `_research_info`, `_research_rewrite`, and `_research_replay_exec` C++ metho
 are diagnostic escape hatches; arbitrary handles are not validated by the
 launcher. The test controller must use its owned valid candidate/fresh handles.
 The pinned standalone guard copies live in `python/foundry/_qmd_research` with
-source and vendored hashes. The original memcpy, topology, edge and event predicates remain unchanged.
+source and vendored hashes. The original topology, edge and event predicates remain unchanged.
 The first actual LOAD attempt exposed a successful NULL allocation context for
 a Foundry VMM memset destination; this branch adds a narrow fixed-parameter 1D
 memset path with complete mapped bounds, VMM allocation handle/properties, device
@@ -114,3 +114,34 @@ g++ -std=c++17 -Wall -Wextra -Werror -Iinclude \
 The normal dedicated-exec mode remains the default. GPU results from the bounded
 integration experiment, including failed attempts, belong in its report; passing
 the CPU tests does not establish GPU correctness or replay parity.
+
+
+## NULL generic memcpy context on archive LOAD
+
+The first symmetric-memory LOAD attempt rejected before candidate registration:
+146 copy nodes per rank returned a successful `cuGraphNodeGetParams` with
+`copyCtx == NULL`; both source and destination had complete device VMM backing,
+mapped-range, READWRITE-access and stable buffer/block identity proofs. The
+legacy and generic copy shapes agreed. The only rejection was missing copy
+context identity.
+
+This implementation does **not** assume NULL means the current context. Both
+Foundry binary and JSON LOAD builders explicitly call
+`cuGraphAddMemcpyNode(..., ctx)`, with the same nonnull `main_ctx` stored in
+`SharedGraphExec.ctx`. The research bridge supplies this known construction
+context, device and actual builder identity alongside the two owned clone
+handles. It records those facts in the diff receipt. The bridge checks cached
+sources remain descendants of the same builder/context/device; all clones were
+created directly from that owned builder. For a NULL generic getter, the guard
+requires this exact provenance, the same current context/device, NULL allocation
+contexts on **both** operands and the existing complete VMM proofs. A missing or
+mismatched witness, ordinary context-owned memory, changed mapping/backing,
+wrong device or failed query still rejects. The default public comparison has no
+witness and continues to reject NULL copy contexts.
+
+The [CUDA Graph API reference](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__GRAPH.html)
+identifies the explicit creation context and cautions that generic returned node
+parameters need not reproduce the creation struct. It does not establish a
+universal NULL-copy-context default rule. The additional witness is specific to
+this actual Foundry construction path, not permission to infer a context for an
+arbitrary externally supplied graph.

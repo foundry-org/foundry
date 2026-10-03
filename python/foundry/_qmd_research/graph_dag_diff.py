@@ -133,7 +133,7 @@ def _vmm_parameters(driver, address, width, device):
     return result
 
 
-def _memcpy_parameters(driver, node):
+def _memcpy_parameters(driver, node, creation_context_witness=None):
     """Inspect public parameters and pointer metadata, without changing state.
 
     RANGE_START_ADDR/SIZE describe reserved VA on VMM; they are diagnostics,
@@ -166,6 +166,7 @@ def _memcpy_parameters(driver, node):
         "generic_params": _struct_values(generic.memcpy.copyParams),
         "node_type": generic.type, "copy_context": generic.memcpy.copyCtx,
         "flags": generic.memcpy.flags, "reserved": generic.memcpy.reserved,
+        "creation_context_witness": creation_context_witness,
         "current_context": {"api_result": int(context_rc), "value": context.value},
         "current_device": {"api_result": int(device_rc), "value": device.value},
         "operands": {},
@@ -330,10 +331,32 @@ def _memcpy_rejections(source, target):
             problems.append(f"{label} memcpy generic type/flags/reserved are unsupported")
         if p != data["generic_params"]:
             problems.append(f"{label} memcpy legacy/generic public parameters disagree")
-        if (not data["copy_context"] or data["current_context"]["api_result"]
-                or data["current_device"]["api_result"]
-                or data["copy_context"] != data["current_context"]["value"]):
-            problems.append(f"{label} memcpy copy context is unavailable or is not the current context")
+        current_context = data["current_context"]
+        if (current_context["api_result"] or not current_context["value"]
+                or data["current_device"]["api_result"]):
+            problems.append(f"{label} memcpy current context/device is unavailable")
+        if data["copy_context"]:
+            if data["copy_context"] != current_context["value"]:
+                problems.append(f"{label} memcpy copy context is not the current context")
+        else:
+            # This is NOT a rule that NULL means current context. Foundry's
+            # actual LOAD builder passed SharedGraphExec.ctx explicitly to
+            # cuGraphAddMemcpyNode, and clones preserve the owned graph. Only
+            # that known construction provenance can supplement a NULL generic
+            # getter, with complete VMM checks for BOTH operands below.
+            witness = data.get("creation_context_witness") or {}
+            if (witness.get("provenance") != "foundry_explicit_cuGraphAddMemcpyNode_ctx"
+                    or not witness.get("builder_graph") or not witness.get("context")
+                    or not witness.get("source_graph") or not witness.get("target_graph")
+                    or witness.get("device") != data["current_device"]["value"]
+                    or witness["context"] != current_context["value"]):
+                problems.append(f"{label} NULL memcpy copy context lacks exact LOAD creation context witness")
+            for side in ("src", "dst"):
+                operand = data["operands"].get(side, {})
+                allocation_context = operand.get("attributes", {}).get("context", {})
+                if (allocation_context.get("api_result") != 0
+                        or allocation_context.get("value") is not None or "vmm" not in operand):
+                    problems.append(f"{label} NULL memcpy copy context requires two proven device VMM operands")
         if p["WidthInBytes"] <= 0 or p["Height"] != 1 or p["Depth"] != 1:
             problems.append(f"{label} memcpy must be nonzero 1D (Height=Depth=1)")
         if p["reserved0"] or p["reserved1"]:
@@ -398,6 +421,11 @@ def _memcpy_rejections(source, target):
         return problems
     if source["copy_context"] != target["copy_context"]:
         problems.append("memcpy copy context changed")
+    if not source["copy_context"] or not target["copy_context"]:
+        if (source["current_context"] != target["current_context"]
+                or source["current_device"] != target["current_device"]
+                or source.get("creation_context_witness") != target.get("creation_context_witness")):
+            problems.append("NULL memcpy LOAD creation context, builder or current context changed")
     for side in ("src", "dst"):
         for name in ("context", "device_ordinal", "memory_type", "is_managed"):
             if source["operands"][side]["attributes"][name] != target["operands"][side]["attributes"][name]:
@@ -526,7 +554,7 @@ def align_dags(driver, source, target):
     return ai, order, [a[n] for n in order], bi, target_order, [b[n] for n in target_order]
 
 
-def compare_nonkernels(driver, source_order, target_order, kinds):
+def compare_nonkernels(driver, source_order, target_order, kinds, memcpy_creation_context=None):
     driver._bind("cuGraphMemsetNodeGetParams", [C.c_void_p, C.POINTER(MemsetParams)])
     driver._bind("cuGraphEventRecordNodeGetEvent", [C.c_void_p, C.POINTER(C.c_void_p)])
     driver._bind("cuGraphEventWaitNodeGetEvent", [C.c_void_p, C.POINTER(C.c_void_p)])
@@ -535,7 +563,7 @@ def compare_nonkernels(driver, source_order, target_order, kinds):
     source_events, target_events = defaultdict(list), defaultdict(list)
     def parameters(node, kind):
         if kind == 1:
-            return _memcpy_parameters(driver, node)
+            return _memcpy_parameters(driver, node, memcpy_creation_context)
         if kind == 2:
             p = MemsetParams()
             driver.check(driver.lib.cuGraphMemsetNodeGetParams(node, C.byref(p)), "nonkernel memset params")
@@ -596,4 +624,4 @@ def compare_nonkernels(driver, source_order, target_order, kinds):
             "nonkernel_rejection_reasons": problems,
             "memcpy_caller_obligations": MEMCPY_CALLER_OBLIGATIONS if 1 in kinds else [],
             "memcpy_lifetime_or_mapping_stability_proven_by_public_getters": False,
-            "nonkernel_policy": "Known node types only; memcpy permits nonzero single-device 1D D2D address/width changes with identical copy contexts/devices and validated mapped bounds. Non-NULL allocation contexts must match copy context. A successful NULL context requires proven same device VMM allocation handle, properties, mapping, buffer/block identity and device READWRITE access; retain/release references are balanced. Exact memset parameters/context/address; successful NULL memset context additionally needs fixed 1D region, mapped bounds, same VMM handle/properties/buffer/block and READWRITE access. Exact event handles with matching mapped usage. No external event ownership or memory lifetime assumption."}
+            "nonkernel_policy": "Known node types only; memcpy permits nonzero single-device 1D D2D address/width changes with identical copy contexts/devices and validated mapped bounds. Non-NULL allocation contexts must match copy context. A NULL generic copy context is accepted only with the actual Foundry explicit construction context/builder witness, identical current context, and two fully proven VMM operands. A successful NULL context requires proven same device VMM allocation handle, properties, mapping, buffer/block identity and device READWRITE access; retain/release references are balanced. Exact memset parameters/context/address; successful NULL memset context additionally needs fixed 1D region, mapped bounds, same VMM handle/properties/buffer/block and READWRITE access. Exact event handles with matching mapped usage. No external event ownership or memory lifetime assumption."}

@@ -62,7 +62,7 @@ class Graph:
     def __init__(self, events, member=2):
         self.events = events
         self.info = {'shared_graph': 10, 'template_exec': 20, 'graph_id': member,
-                     'current_params_id': 1, 'has_rng': False, 'device': 0}
+                     'current_params_id': 1, 'has_rng': False, 'device': 0, 'context': 32}
     def _research_info(self):
         return dict(self.info)
     def _research_rewrite(self):

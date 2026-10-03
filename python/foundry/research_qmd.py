@@ -108,7 +108,19 @@ def _prepare(graph):
     if info["has_rng"]:
         raise ValueError("This deterministic comparison bridge does not yet accept RNG graphs")
     key = info["shared_graph"]
+    # C++ LOAD stores the main_ctx passed explicitly to both binary and JSON
+    # cuGraphAddMemcpyNode creation calls. This witness is not inferred from a
+    # NULL public getter and does not authorize arbitrary external graphs.
+    memcpy_creation_context = {
+        "provenance": "foundry_explicit_cuGraphAddMemcpyNode_ctx",
+        "context": info["context"], "builder_graph": key, "device": info["device"],
+    }
     cached = _states.get(key)
+    if cached is not None and (
+            cached["builder_origin"] != memcpy_creation_context
+            or cached["source_graph"] not in cached["sources"]
+            or cached["initial_source_graph"] not in cached["sources"]):
+        raise RuntimeError("Owned source clone does not descend from this LOAD builder/context/device")
     # Same-member replay has no prepare, update, upload or synchronization.
     if cached is not None and cached["current_member_id"] == info["graph_id"]:
         if info["current_params_id"] != info["graph_id"]:
@@ -124,7 +136,9 @@ def _prepare(graph):
         if cached is None:
             initial = driver.clone(key)
             census = driver.census(initial)
-            eligibility = diff_graphs(driver, initial, initial, allow_dag=True)
+            eligibility = diff_graphs(driver, initial, initial, allow_dag=True,
+                                      memcpy_creation_context={**memcpy_creation_context,
+                                          "source_graph": initial, "target_graph": initial})
             if not _guard(eligibility):
                 _receipt({"event": "registration_guard_rejected", "info": info,
                           "eligibility": eligibility})
@@ -141,7 +155,8 @@ def _prepare(graph):
                       "current_member_id": info["current_params_id"],
                       "template_member_id": info["current_params_id"],
                       "mode": mode, "last_update": None, "census": census,
-                      "initial_flags": flags, "owners": [graph], "sources": [initial]}
+                      "initial_flags": flags, "owners": [graph], "sources": [initial],
+                      "builder_origin": memcpy_creation_context}
             cached["last_receipt"] = _receipt({
                 "event": "registered", "origin": "actual_foundry_archive_load",
                 "separate_candidate_exec": True, "original_template_exec_untouched": True,
@@ -159,7 +174,9 @@ def _prepare(graph):
             target = driver.clone(key)
             cached["sources"].append(target)  # keep all source/target graph handles alive
             cached["owners"].append(graph)
-            diff = diff_graphs(driver, cached["source_graph"], target, allow_dag=True)
+            diff = diff_graphs(driver, cached["source_graph"], target, allow_dag=True,
+                               memcpy_creation_context={**memcpy_creation_context,
+                                   "source_graph": cached["source_graph"], "target_graph": target})
             if not _guard(diff):
                 _receipt({"event": "update_guard_rejected", "info": info,
                           "from_member": previous_id, "to_member": info["graph_id"],
