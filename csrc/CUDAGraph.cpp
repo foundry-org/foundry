@@ -738,6 +738,21 @@ void CUDAGraph::instantiate_member_exec() {
   on_demand_data_->owns_exec = true;
 }
 
+void CUDAGraph::research_replay_exec(uintptr_t executable) {
+  TORCH_CHECK(on_demand_data_ && on_demand_data_->shared_exec && executable,
+              "research replay requires an owned LOAD graph and nonnull executable");
+  c10::OptionalDeviceGuard device_guard{c10::Device(c10::kCUDA, capture_dev_)};
+  for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
+#if FOUNDRY_TORCH_PER_CAPTURE_RNG
+    generator_state->replay_prologue(capture_id_, wholegraph_increments);
+#else
+    generator_state->replay_prologue(wholegraph_increments);
+#endif
+  }
+  AT_CUDA_CHECK(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(executable),
+                                at::cuda::getCurrentCUDAStream()));
+}
+
 void CUDAGraph::replay() {
   // On-demand replay: the template launches the shared exec; a member gets its
   // own exec instantiated on first replay (one-time cost per batch size).

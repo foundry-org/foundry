@@ -2,6 +2,7 @@
 #include <c10/core/CachingDeviceAllocator.h>
 #include <pybind11/stl.h>
 #include <cstring>
+#include <cstdlib>
 #include "CUDAGraph.h"
 #include "CUDAGraphInternal.h"
 #include "metadata.h"
@@ -169,7 +170,44 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             return self.register_generator_state(generator);
           },
           py::arg("generator"))
-      .def("replay", &foundry::CUDAGraph::replay, py::call_guard<py::gil_scoped_release>())
+      .def("replay", [](const std::shared_ptr<::foundry::CUDAGraph>& self) {
+        const char* enabled = std::getenv("FOUNDRY_QMD_REPAIR");
+        if (enabled && std::strcmp(enabled, "1") == 0 && self->on_demand_data_) {
+          // Retain the GIL for the Python transaction controller. Its lock also
+          // serializes ctypes calls (which may release the GIL).
+          py::module_::import("foundry.research_qmd").attr("replay")(self);
+        } else {
+          py::gil_scoped_release release;
+          self->replay();
+        }
+      })
+      .def("_research_info", [](::foundry::CUDAGraph& self) -> py::object {
+        if (!self.on_demand_data_ || !self.on_demand_data_->shared_exec)
+          return py::none();
+        const auto& data = self.on_demand_data_;
+        const auto& shared = data->shared_exec;
+        py::dict result;
+        result["shared_graph"] = reinterpret_cast<uintptr_t>(shared->graph);
+        result["template_exec"] = reinterpret_cast<uintptr_t>(shared->exec);
+        result["graph_id"] = data->graph_id;
+        result["current_params_id"] = shared->current_params_id;
+        result["graph_name"] = data->graph_name;
+        result["node_count"] = shared->ordered_nodes.size();
+        result["context"] = reinterpret_cast<uintptr_t>(shared->ctx);
+        result["device"] = self.research_device();
+        result["has_rng"] = self.research_has_rng();
+        result["own_exec"] = reinterpret_cast<uintptr_t>(data->own_exec);
+        return result;
+      })
+      .def("_research_rewrite", &foundry::CUDAGraph::rewrite_shared_graph_for_member,
+           py::call_guard<py::gil_scoped_release>())
+      .def("_research_replay_exec", &foundry::CUDAGraph::research_replay_exec,
+           py::arg("executable"), py::call_guard<py::gil_scoped_release>())
+      .def("instantiate", &foundry::CUDAGraph::instantiate,
+           py::call_guard<py::gil_scoped_release>())
+      .def("raw_cuda_graph_exec", [](::foundry::CUDAGraph& self) {
+        return reinterpret_cast<uintptr_t>(self.raw_cuda_graph_exec());
+      }, py::call_guard<py::gil_scoped_release>())
       .def("reset", &foundry::CUDAGraph::reset, py::call_guard<py::gil_scoped_release>())
       .def("pool", &foundry::CUDAGraph::pool, py::call_guard<py::gil_scoped_release>())
       .def("debug_dump", &foundry::CUDAGraph::debug_dump, py::call_guard<py::gil_scoped_release>())

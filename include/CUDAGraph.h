@@ -85,6 +85,15 @@ struct CUDAGraph {
   void capture_end();
   void instantiate();
   void replay();
+  // Experimental archive LOAD bridge. Handles remain owned by their original
+  // graphs; the Python controller retains all owners and serializes mutations.
+  void research_replay_exec(uintptr_t executable);
+  int research_device() const { return capture_dev_; }
+  bool research_has_rng() const {
+    for (const auto& item : captured_generator_states_)
+      if (item.second != 0) return true;
+    return false;
+  }
   void reset();
   MempoolId_t pool();
   void enable_debug_mode();

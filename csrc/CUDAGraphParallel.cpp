@@ -2526,7 +2526,12 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         return std::chrono::duration<double, std::milli>(clk::now() - a).count();
       };
       const char* lazy_env = std::getenv("FOUNDRY_LAZY_GRAPH_EXEC");
-      const bool lazy_graph_exec = lazy_env && lazy_env[0] == '1';
+      const char* repair_env = std::getenv("FOUNDRY_QMD_REPAIR");
+      // The research bridge registers a new pristine exec from the LOADed
+      // template before its first rewrite; eager member construction would
+      // overwrite that builder before registration.
+      const bool lazy_graph_exec = (lazy_env && lazy_env[0] == '1') ||
+                                   (repair_env && std::strcmp(repair_env, "1") == 0);
       auto binary_template = [&](size_t idx) {
         return bin_files[idx].valid() &&
                (bin_files[idx].header.flags & binary_format::FLAG_COMPLETE_KERNEL_ATTRS);
