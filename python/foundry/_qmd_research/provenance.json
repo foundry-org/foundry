@@ -1,0 +1,20 @@
+{
+  "graph_probe.py": {
+    "upstream_local_source": "/home/xenshinu/Workarea/gpu-explore/experiments/drafts/foundry-h200-symmem-deepep-20261002/src/graph_probe.py",
+    "source_sha256": "238a2425c589dd56781920d12edd9b82a967515ad03ac2985292f65420f35b37",
+    "vendored_sha256": "238a2425c589dd56781920d12edd9b82a967515ad03ac2985292f65420f35b37",
+    "edits": "Package-relative imports only; guard predicates unchanged."
+  },
+  "graph_diff.py": {
+    "upstream_local_source": "/home/xenshinu/Workarea/gpu-explore/experiments/drafts/foundry-h200-symmem-deepep-20261002/src/graph_diff.py",
+    "source_sha256": "62d12c008edfd144700e8711d8492626df5aeab4724a03cbe9a078e23a1b8674",
+    "vendored_sha256": "5ba34c1ec618073017bb9f0340010028b58b14650aa7754046020fcd98b73f92",
+    "edits": "Package-relative imports only; guard predicates unchanged."
+  },
+  "graph_dag_diff.py": {
+    "upstream_local_source": "/home/xenshinu/Workarea/gpu-explore/experiments/drafts/foundry-h200-symmem-deepep-20261002/src/graph_dag_diff.py",
+    "source_sha256": "a8d501edd48e1c8748049378c1f580e3c66a1e994ac0ef80a08c32ec2b2bfe8b",
+    "vendored_sha256": "9454d6bc1edff6e5e7b8d06f71e0dd57a45a7276bfc1c81ae3f4f86716e4141c",
+    "edits": "Package-relative imports only; guard predicates unchanged."
+  }
+}
