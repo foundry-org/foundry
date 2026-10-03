@@ -14,7 +14,7 @@
   "graph_dag_diff.py": {
     "upstream_local_source": "/home/xenshinu/Workarea/gpu-explore/experiments/drafts/foundry-h200-symmem-deepep-20261002/src/graph_dag_diff.py",
     "source_sha256": "a8d501edd48e1c8748049378c1f580e3c66a1e994ac0ef80a08c32ec2b2bfe8b",
-    "vendored_sha256": "9454d6bc1edff6e5e7b8d06f71e0dd57a45a7276bfc1c81ae3f4f86716e4141c",
-    "edits": "Package-relative imports only; guard predicates unchanged."
+    "vendored_sha256": "6d84a68ab4bf7cf00b9e7b9c46d00b7511de29aaf06224cd294b9a41da667ee4",
+    "edits": "Package-relative imports; narrow fixed-parameter 1D memset VMM proof for actual LOAD pointers with successful NULL allocation context. Existing memcpy, edge and event predicates unchanged."
   }
 }

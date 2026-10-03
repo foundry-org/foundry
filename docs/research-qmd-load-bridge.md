@@ -66,8 +66,12 @@ The `_research_info`, `_research_rewrite`, and `_research_replay_exec` C++ metho
 are diagnostic escape hatches; arbitrary handles are not validated by the
 launcher. The test controller must use its owned valid candidate/fresh handles.
 The pinned standalone guard copies live in `python/foundry/_qmd_research` with
-source and vendored hashes. Only relative imports changed; guard predicates were
-not broadened.
+source and vendored hashes. The original memcpy, topology, edge and event predicates remain unchanged.
+The first actual LOAD attempt exposed a successful NULL allocation context for
+a Foundry VMM memset destination; this branch adds a narrow fixed-parameter 1D
+memset path with complete mapped bounds, VMM allocation handle/properties, device
+READWRITE access, buffer/block identity, and exact before/after metadata proof.
+A NULL context without that proof still rejects.
 
 CPU failure-order checks:
 

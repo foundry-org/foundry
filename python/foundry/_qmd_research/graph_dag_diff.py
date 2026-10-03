@@ -211,6 +211,110 @@ def _memcpy_parameters(driver, node):
     return result
 
 
+def _memset_vmm_parameters(driver, params):
+    """Inspect a fixed 1D memset destination with a successful NULL context.
+
+    CUDA VMM pointers can legitimately have no allocation context. As with the
+    existing memcpy guard, prove actual mapped bounds and physical backing;
+    reserved VA alone is never evidence of mapped storage. This does not change
+    or retain application ownership beyond these read-only handle queries.
+    """
+    try:
+        driver._bind("cuCtxGetCurrent", [C.POINTER(C.c_void_p)])
+        driver._bind("cuCtxGetDevice", [C.POINTER(C.c_int)])
+        driver._bind("cuPointerGetAttribute", [C.c_void_p, C.c_int, C.c_uint64])
+        context, device = C.c_void_p(), C.c_int(-1)
+        context_rc = driver.lib.cuCtxGetCurrent(C.byref(context))
+        device_rc = driver.lib.cuCtxGetDevice(C.byref(device))
+        address, width = params["dst"], params["width"] * params["elementSize"]
+        operand = {"effective_address": address, "attributes": {}}
+        result = {"current_context": {"api_result": int(context_rc), "value": context.value},
+                  "current_device": {"api_result": int(device_rc), "value": device.value},
+                  "byte_width": width, "operand": operand}
+        if not 0 < address < 2**64 or not 0 < width < 2**64:
+            return result
+        for name, attribute, value_type in (
+                ("context", 1, C.c_void_p), ("memory_type", 2, C.c_int),
+                ("buffer_id", 7, C.c_uint64), ("is_managed", 8, C.c_uint),
+                ("device_ordinal", 9, C.c_int), ("mapped", 13, C.c_uint),
+                ("mapping_size", 18, C.c_size_t), ("mapping_base", 19, C.c_uint64),
+                ("memory_block_id", 20, C.c_uint64)):
+            value = value_type()
+            rc = driver.lib.cuPointerGetAttribute(C.byref(value), attribute, address)
+            operand["attributes"][name] = {"api_result": int(rc), "value": value.value}
+        attrs = operand["attributes"]
+        if not attrs["mapping_base"]["api_result"] and not attrs["mapping_size"]["api_result"]:
+            operand["mapped_range"] = {"method": "CU_POINTER_ATTRIBUTE_MAPPING_BASE_ADDR/SIZE",
+                "api_result": 0, "base": attrs["mapping_base"]["value"],
+                "size": attrs["mapping_size"]["value"]}
+        else:
+            base, size = C.c_uint64(), C.c_size_t()
+            driver._bind("cuMemGetAddressRange_v2", [C.POINTER(C.c_uint64), C.POINTER(C.c_size_t), C.c_uint64])
+            rc = driver.lib.cuMemGetAddressRange_v2(C.byref(base), C.byref(size), address)
+            operand["mapped_range"] = {"method": "cuMemGetAddressRange_v2", "api_result": int(rc),
+                                        "base": base.value, "size": size.value}
+        operand["vmm"] = _vmm_parameters(driver, address, width, device.value)
+        return result
+    except Exception as exc:
+        return {"inspection_error": repr(exc)}
+
+
+def _memset_rejections(source, target):
+    """Fixed-parameter memset; NULL context requires an identical VMM proof."""
+    if source != target:
+        return ["Memset parameters, destination, context or VMM backing changed"]
+    context = source.get("allocation_context", {})
+    if context.get("api_result") != 0:
+        return ["Memset allocation context query failed"]
+    if context.get("context"):
+        return []  # Preserve the original non-NULL-context exact-match policy.
+    problems = []
+    proof = source.get("vmm_proof", {})
+    current = proof.get("current_context", {})
+    device = proof.get("current_device", {})
+    address, width = source.get("dst", 0), source.get("width", 0) * source.get("elementSize", 0)
+    if (source.get("height") != 1 or source.get("pitch") != 0
+            or source.get("elementSize") not in (1, 2, 4) or not 0 < width < 2**64
+            or proof.get("byte_width") != width):
+        problems.append("Memset VMM extension only accepts a nonzero 1D unpitched fixed region")
+    if (proof.get("inspection_error") or current.get("api_result") != 0 or not current.get("value")
+            or device.get("api_result") != 0 or not isinstance(device.get("value"), int)
+            or device.get("value", -1) < 0):
+        problems.append("Memset VMM current context/device is unavailable")
+    operand = proof.get("operand", {})
+    attrs = operand.get("attributes", {})
+    if operand.get("effective_address") != address:
+        problems.append("Memset VMM destination inspection differs")
+    for name, expected in {"context": None, "memory_type": 2, "is_managed": 0,
+                           "mapped": 1, "device_ordinal": device.get("value")}.items():
+        actual = attrs.get(name, {})
+        if actual.get("api_result") != 0 or actual.get("value") != expected:
+            problems.append(f"Memset VMM {name} is unavailable or unsupported")
+    for name in ("buffer_id", "memory_block_id"):
+        identity = attrs.get(name, {})
+        if identity.get("api_result") != 0 or not identity.get("value"):
+            problems.append(f"Memset VMM {name} identity is unavailable")
+    bound = operand.get("mapped_range", {})
+    base, size = bound.get("base", 0), bound.get("size", 0)
+    if (bound.get("api_result") != 0 or not 0 < base < 2**64 or not 0 < size < 2**64
+            or base + size > 2**64 or not base <= address < base + size
+            or width > base + size - address or address + width > 2**64):
+        problems.append("Memset full range is not proven mapped within bounds")
+    vmm = operand.get("vmm", {})
+    prop = vmm.get("properties", {})
+    if (vmm.get("inspection_error") or any(vmm.get(name) != 0 for name in
+            ("retain_api_result", "properties_api_result", "release_api_result"))
+            or not vmm.get("allocation_handle") or prop.get("type") != 1
+            or prop.get("location_type") != 1 or prop.get("location_id") != device.get("value")
+            or prop.get("win32_metadata") or prop.get("usage") != 0 or any(prop.get("reserved", [1]))):
+        problems.append("Memset NULL allocation context lacks proven device VMM backing")
+    access = vmm.get("access", [])
+    if (not access or any(item.get("api_result") != 0 or item.get("flags") != 3 for item in access)
+            or {item.get("address") for item in access} != {address, address + width - 1}):
+        problems.append("Memset VMM current-device READWRITE access is unproven")
+    return problems
+
+
 def _memcpy_rejections(source, target):
     """Strict, single-device 1D D2D subset of CUDA graph-update rules."""
     problems = []
@@ -439,6 +543,8 @@ def compare_nonkernels(driver, source_order, target_order, kinds):
             context = C.c_void_p()
             rc = driver.lib.cuPointerGetAttribute(C.byref(context), 1, p.dst)
             values["allocation_context"] = {"api_result": rc, "context": context.value}
+            if rc == 0 and not context.value:
+                values["vmm_proof"] = _memset_vmm_parameters(driver, values)
             return values
         if kind in (6, 7):
             event = C.c_void_p()
@@ -461,8 +567,10 @@ def compare_nonkernels(driver, source_order, target_order, kinds):
             entry["rejection_reasons"] = reasons
             problems.extend(f"Memcpy at position {position}: {reason}" for reason in reasons)
         elif kind == 2:
-            if a != b or a["allocation_context"]["api_result"] or not a["allocation_context"]["context"]:
-                problems.append(f"Memset parameters/address/context differ or are unavailable at position {position}")
+            reasons = _memset_rejections(a, b)
+            entry["memset_compatible"] = not reasons
+            entry["rejection_reasons"] = reasons
+            problems.extend(f"Memset at position {position}: {reason}" for reason in reasons)
         elif kind in (6, 7):
             if not a["event"] or not b["event"]:
                 problems.append(f"Null event at position {position}")
@@ -488,4 +596,4 @@ def compare_nonkernels(driver, source_order, target_order, kinds):
             "nonkernel_rejection_reasons": problems,
             "memcpy_caller_obligations": MEMCPY_CALLER_OBLIGATIONS if 1 in kinds else [],
             "memcpy_lifetime_or_mapping_stability_proven_by_public_getters": False,
-            "nonkernel_policy": "Known node types only; memcpy permits nonzero single-device 1D D2D address/width changes with identical copy contexts/devices and validated mapped bounds. Non-NULL allocation contexts must match copy context. A successful NULL context requires proven same device VMM allocation handle, properties, mapping, buffer/block identity and device READWRITE access; retain/release references are balanced. Exact memset parameters/context/address and exact event handles with matching mapped usage. No external event ownership or memory lifetime assumption."}
+            "nonkernel_policy": "Known node types only; memcpy permits nonzero single-device 1D D2D address/width changes with identical copy contexts/devices and validated mapped bounds. Non-NULL allocation contexts must match copy context. A successful NULL context requires proven same device VMM allocation handle, properties, mapping, buffer/block identity and device READWRITE access; retain/release references are balanced. Exact memset parameters/context/address; successful NULL memset context additionally needs fixed 1D region, mapped bounds, same VMM handle/properties/buffer/block and READWRITE access. Exact event handles with matching mapped usage. No external event ownership or memory lifetime assumption."}
