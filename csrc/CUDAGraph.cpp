@@ -33,6 +33,7 @@
 #include "hook.h"
 #include "BinaryGraphFormat.h"
 #include "GraphDependencies.h"
+#include "ResearchEventAliases.h"
 
 #include <torch/version.h>
 
@@ -689,6 +690,58 @@ CUDAGraph::OnDemandData::~OnDemandData() {
   }
 }
 
+void CUDAGraph::canonicalize_on_demand_private_events() {
+  const char* enabled = std::getenv("FOUNDRY_QMD_REPAIR");
+  if (!(enabled && std::strcmp(enabled, "1") == 0)) return;
+  TORCH_CHECK(on_demand_data_ && on_demand_data_->shared_exec,
+              "research event aliases require linked LOAD data");
+  auto& data = *on_demand_data_;
+  auto& shared = *data.shared_exec;
+  TORCH_CHECK(shared.research_private_event_census_ready,
+              "research template private event ownership is not initialized");
+  TORCH_CHECK(data.updates.size() == shared.ordered_nodes.size(),
+              "research event aliases require complete identical node counts");
+  std::set<uintptr_t> source_owned, target_owned;
+  for (auto event : shared.research_private_events)
+    source_owned.insert(reinterpret_cast<uintptr_t>(event));
+  if (loaded_graph_resources_)
+    for (auto event : loaded_graph_resources_->created_events)
+      target_owned.insert(reinterpret_cast<uintptr_t>(event));
+  ResearchEventUsage source_usage, target_usage;
+  for (size_t i = 0; i < data.updates.size(); ++i) {
+    CUgraphNodeType kind;
+    C10_CUDA_DRIVER_CHECK(cuGraphNodeGetType(shared.ordered_nodes[i], &kind));
+    bool source_record = kind == CU_GRAPH_NODE_TYPE_EVENT_RECORD;
+    bool source_wait = kind == CU_GRAPH_NODE_TYPE_WAIT_EVENT;
+    bool target_record = data.updates[i].type == OnDemandNodeUpdate::EventRecord;
+    bool target_wait = data.updates[i].type == OnDemandNodeUpdate::EventWait;
+    TORCH_CHECK(source_record == target_record && source_wait == target_wait,
+                "research private event node kinds differ at ", i);
+    if (!source_record && !source_wait) continue;
+    CUevent event = nullptr;
+    C10_CUDA_DRIVER_CHECK(source_record
+        ? cuGraphEventRecordNodeGetEvent(shared.ordered_nodes[i], &event)
+        : cuGraphEventWaitNodeGetEvent(shared.ordered_nodes[i], &event));
+    source_usage[reinterpret_cast<uintptr_t>(event)].push_back({i, static_cast<int>(kind)});
+    target_usage[reinterpret_cast<uintptr_t>(data.updates[i].event)].push_back(
+        {i, static_cast<int>(kind)});
+  }
+  const auto aliases = research_private_event_aliases(
+      source_usage, target_usage, source_owned, target_owned);
+  size_t changed = 0;
+  for (auto& update : data.updates) {
+    if (update.type != OnDemandNodeUpdate::EventRecord &&
+        update.type != OnDemandNodeUpdate::EventWait) continue;
+    CUevent canonical = reinterpret_cast<CUevent>(aliases.at(reinterpret_cast<uintptr_t>(update.event)));
+    changed += update.event != canonical;
+    update.event = canonical;
+  }
+  fprintf(stderr,
+          "[foundry QMD BRIDGE] graph %d private event groups=%zu aliased_nodes=%zu "
+          "complete_usage_bijection=1 private_LOAD_ownership=1\n",
+          data.graph_id, aliases.size(), changed);
+}
+
 void CUDAGraph::materialize_on_demand_exec() {
   TORCH_CHECK(on_demand_data_ && on_demand_data_->shared_exec,
               "materialize_on_demand_exec: graph is not linked to a shared exec");
@@ -698,6 +751,13 @@ void CUDAGraph::materialize_on_demand_exec() {
   }
   if (shared->current_params_id == on_demand_data_->graph_id) {
     // Template: the shared exec was instantiated with these params.
+    const char* repair_env = std::getenv("FOUNDRY_QMD_REPAIR");
+    if (repair_env && std::strcmp(repair_env, "1") == 0) {
+      if (loaded_graph_resources_)
+        shared->research_private_events = loaded_graph_resources_->created_events;
+      shared->research_private_event_census_ready = true;
+      canonicalize_on_demand_private_events();
+    }
     on_demand_data_->own_exec = shared->exec;
     on_demand_data_->owns_exec = false;
     return;

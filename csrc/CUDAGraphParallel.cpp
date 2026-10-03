@@ -1866,6 +1866,7 @@ void CUDAGraph::link_on_demand_shared_exec(CUDAGraph& graph,
               " updates but template has ", shared_exec->ordered_nodes.size());
 
   graph.on_demand_data_->shared_exec = shared_exec;
+  graph.canonicalize_on_demand_private_events();
 }
 
 // Reconstruct output tensors from an extracted json::value (may be null).

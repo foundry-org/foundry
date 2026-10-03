@@ -89,10 +89,27 @@ lifetime; this is intentionally unsuitable for an unbounded production service.
 
 The bridge refuses graphs that consume RNG offsets, changed launch attributes,
 ambiguous topology, unsupported operations, unproven memory ownership or changed
-event handles. SAVE grouping alone cannot override these guards. Foundry can
-create per-member private events on LOAD; if their identities differ, an explicit
-ownership-preserving implementation is required before supporting that transition.
-The present bridge does not silently relax event checks.
+event handles. SAVE grouping alone cannot override these guards.
+
+The second actual LOAD attempt reached a legitimate ownership boundary: each
+member creates private archive events, while the strict update guard requires
+identical event handles. In the opt-in shared mode, C++ now canonicalizes these
+private member events to the template's private events at link time. It requires
+both event identities to belong to the respective `LoadedGraphResources` creation
+lists and a unique bijection of **every record/wait node position and kind**.
+An unknown owner, changed usage, changed kind or ambiguous mapping rejects.
+The template is normalized too (the JSON builder and decoded template params
+may have separate privately created event handles). All original resources stay
+owned and alive. The Python guard still requires identical handles; it has not
+been relaxed to accept arbitrary renamed external events.
+
+The pure CPU event policy has 13 positive/negative cases:
+
+```sh
+g++ -std=c++17 -Wall -Wextra -Werror -Iinclude \
+  tests/research_qmd/test_event_aliases.cpp -o /tmp/foundry_event_aliases_cpu
+/tmp/foundry_event_aliases_cpu
+```
 
 The normal dedicated-exec mode remains the default. GPU results from the bounded
 integration experiment, including failed attempts, belong in its report; passing

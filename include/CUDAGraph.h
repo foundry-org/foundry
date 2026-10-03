@@ -173,6 +173,10 @@ struct CUDAGraph {
     std::vector<CUgraphNode> ordered_nodes;
     CUcontext ctx = nullptr;
     int current_params_id = -1;
+    // Private events created by LOAD, never exposed as application events.
+    // Original graph owners keep these resources alive through the experiment.
+    std::vector<CUevent> research_private_events;
+    bool research_private_event_census_ready = false;
 
     ~SharedGraphExec();
   };
@@ -200,6 +204,7 @@ struct CUDAGraph {
   // fresh cuGraphInstantiate of the shared graph carrying this graph's params
   // (called lazily by replay).
   void materialize_on_demand_exec();
+  void canonicalize_on_demand_private_events();
 
   // The two halves of a member's materialize_on_demand_exec, for the LOAD
   // pipeline: the builder thread rewrites the shared graph to this member
