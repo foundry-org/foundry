@@ -32,14 +32,14 @@
 #include <cerrno>
 #include <thread>
 #include <chrono>
+#include <filesystem>
 #include <boost/unordered/concurrent_flat_map.hpp>
-#include <boost/filesystem.hpp>
 #include <boost/crc.hpp>
 #include <boost/format.hpp>
 #include <boost/json.hpp>
 #include "hook.h"
 
-namespace fs = boost::filesystem;
+namespace fs = std::filesystem;
 
 typedef void* (*fp_dlsym)(void*, const char*);
 static fp_dlsym real_dlsym = nullptr;

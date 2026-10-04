@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 import os
-import shutil
+import re
 import subprocess
 from pathlib import Path
 
@@ -11,48 +11,66 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, include_pat
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def get_boost_paths():
-    cmake_query_dir = Path(ROOT_DIR) / "build_boost_query"
-    cmake_query_dir.mkdir(parents=True, exist_ok=True)
+# Boost is used header-only (Boost.JSON through csrc/boost_json_src.cpp); no
+# compiled Boost library is linked. Both shared objects must see the SAME Boost
+# headers, so the directory resolved here is also handed to CMake.
+VENDORED_BOOST_DIR = os.path.join(ROOT_DIR, "third_party", "boost")
+MIN_BOOST_VERSION = 108300  # 1.83: boost::concurrent_flat_map
+# Default compiler search dirs: never pass these as -I (it breaks #include_next).
+_IMPLICIT_INCLUDE_DIRS = {"/usr/include", "/usr/local/include"}
 
-    cmake_script = cmake_query_dir / "CMakeLists.txt"
-    cmake_script.write_text("""
-cmake_minimum_required(VERSION 4.0)
-project(boost_query LANGUAGES CXX)
-find_package(Boost 1.83.0 CONFIG REQUIRED COMPONENTS filesystem json)
 
-get_target_property(BOOST_FS_INCLUDE Boost::filesystem INTERFACE_INCLUDE_DIRECTORIES)
-get_target_property(BOOST_JSON_INCLUDE Boost::json INTERFACE_INCLUDE_DIRECTORIES)
-get_target_property(BOOST_FS_LOCATION Boost::filesystem LOCATION)
-get_target_property(BOOST_JSON_LOCATION Boost::json LOCATION)
+def _boost_version(include_dir):
+    header = Path(include_dir) / "boost" / "version.hpp"
+    if not header.is_file():
+        return None
+    m = re.search(r"^#define\s+BOOST_VERSION\s+(\d+)", header.read_text(), re.MULTILINE)
+    return int(m.group(1)) if m else None
 
-message("BOOST_INCLUDE_DIRS=${BOOST_FS_INCLUDE}")
-get_filename_component(BOOST_LIB_DIR "${BOOST_FS_LOCATION}" DIRECTORY)
-message("BOOST_LIBRARY_DIRS=${BOOST_LIB_DIR}")
-""")
 
-    result = subprocess.run(
-        ["cmake", "-S", str(cmake_query_dir), "-B", str(cmake_query_dir)],
-        capture_output=True,
-        text=True,
+def _fmt_boost(v):
+    return f"{v // 100000}.{v // 100 % 1000}.{v % 100}"
+
+
+def resolve_boost_include_dir():
+    """Pick the Boost header directory: explicit override, vendored copy, system."""
+    explicit = os.getenv("FOUNDRY_BOOST_INCLUDE_DIR")
+    if explicit:
+        candidates = [("FOUNDRY_BOOST_INCLUDE_DIR", explicit)]
+    else:
+        candidates = [("vendored", VENDORED_BOOST_DIR)]
+        if (
+            os.getenv("FOUNDRY_REQUIRE_VENDORED_BOOST")
+            and _boost_version(VENDORED_BOOST_DIR) is None
+        ):
+            raise RuntimeError(
+                "FOUNDRY_REQUIRE_VENDORED_BOOST is set but third_party/boost/boost is missing: "
+                "run tools/release/vendor_boost.sh and commit third_party/boost"
+            )
+        if os.getenv("BOOST_INCLUDEDIR"):
+            candidates.append(("BOOST_INCLUDEDIR", os.environ["BOOST_INCLUDEDIR"]))
+        for env in ("BOOST_ROOT", "CONDA_PREFIX"):
+            if os.getenv(env):
+                candidates.append((env, os.path.join(os.environ[env], "include")))
+        candidates += [("system", "/usr/local/include"), ("system", "/usr/include")]
+
+    rejected = []
+    for origin, d in candidates:
+        v = _boost_version(d)
+        if v is None:
+            continue
+        if v < MIN_BOOST_VERSION:
+            rejected.append(f"{d} ({_fmt_boost(v)})")
+            continue
+        print(f"foundry: Boost {_fmt_boost(v)} headers from {d} ({origin})")
+        return os.path.abspath(d)
+    raise RuntimeError(
+        "Boost >= 1.83 headers not found"
+        + (f"; too old: {', '.join(rejected)}" if rejected else "")
+        + ". Run tools/release/vendor_boost.sh, install Boost headers "
+        "(e.g. apt-get install libboost-dev, conda install -c conda-forge boost-cpp), "
+        "or set FOUNDRY_BOOST_INCLUDE_DIR to the directory containing boost/version.hpp."
     )
-
-    include_dirs = []
-    library_dirs = []
-
-    for line in result.stderr.splitlines():
-        if "BOOST_INCLUDE_DIRS=" in line:
-            dirs = line.split("=", 1)[1].strip()
-            if dirs:
-                include_dirs = [d for d in dirs.split(";") if d]
-        elif "BOOST_LIBRARY_DIRS=" in line:
-            dirs = line.split("=", 1)[1].strip()
-            if dirs:
-                library_dirs = [d for d in dirs.split(";") if d]
-
-    shutil.rmtree(cmake_query_dir, ignore_errors=True)
-
-    return include_dirs, library_dirs
 
 
 def get_compile_flags():
@@ -63,11 +81,11 @@ def get_compile_flags():
     return flags
 
 
-boost_include_dirs, boost_library_dirs = get_boost_paths()
-common_include_dirs = (
-    include_paths(device_type="cuda") + [os.path.join(ROOT_DIR, "include")] + boost_include_dirs
-)
-common_library_dirs = library_paths(device_type="cuda") + boost_library_dirs
+boost_include_dir = resolve_boost_include_dir()
+common_include_dirs = include_paths(device_type="cuda") + [os.path.join(ROOT_DIR, "include")]
+if boost_include_dir not in _IMPLICIT_INCLUDE_DIRS:
+    common_include_dirs.append(boost_include_dir)
+common_library_dirs = library_paths(device_type="cuda")
 
 
 class CustomBuildExt(BuildExtension):
@@ -88,6 +106,7 @@ class CustomBuildExt(BuildExtension):
                 "-B",
                 str(cmake_build_dir),
                 f"-DCMAKE_INSTALL_PREFIX={build_dir}",
+                f"-DFOUNDRY_BOOST_INCLUDE_DIR={boost_include_dir}",
             ]
             + (["-DCMAKE_CXX_FLAGS=-DFOUNDRY_DEBUG"] if os.getenv("FOUNDRY_DEBUG") else [])
         )
@@ -124,6 +143,7 @@ ext_modules = [
             "csrc/CUDAGraph.cpp",
             "csrc/CUDAGraphParallel.cpp",
             "csrc/BinaryGraphIO.cpp",
+            "csrc/boost_json_src.cpp",
         ],
         include_dirs=common_include_dirs,
         library_dirs=common_library_dirs,
@@ -134,8 +154,6 @@ ext_modules = [
         },
         extra_link_args=[
             "-lcuda",
-            "-lboost_filesystem",
-            "-lboost_json",
             "-Wl,-rpath,$ORIGIN",
         ]
         + [f"-Wl,-rpath,{p}" for p in library_paths(device_type="cuda")],
