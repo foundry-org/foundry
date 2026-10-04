@@ -291,14 +291,25 @@ def capture_scope(runner: Any):
     return hooks.capture_scope(runner)
 
 
-def capture_one(backend: Any, shape_key: Any, forward_fn) -> None:
-    """Replaces the body of ``FullCudaGraphBackend.capture_one``: SAVE captures
-    the shape without warm-up forwards and archives it; LOAD restores the
-    archived graph for the shape."""
+def capture_one(
+    shape_key: Any,
+    forward_fn,
+    *,
+    pool: Any,
+    stream: Any,
+    prefill_req_slots: int | None = None,
+):
+    """Replaces the body of ``FullCudaGraphBackend.capture_one`` and returns
+    ``(graph, output)`` for SGLang to store: SAVE captures the shape on
+    ``stream`` into ``pool`` without warm-up forwards and archives it; LOAD
+    restores the archived graph for the shape. ``prefill_req_slots`` is the
+    prefill runner's fixed request-slot count, None for a decode graph."""
     _require_active()
     from foundry.integration.sglang import hooks
 
-    hooks.capture_one(backend, shape_key, forward_fn)
+    return hooks.capture_one(
+        shape_key, forward_fn, pool=pool, stream=stream, prefill_req_slots=prefill_req_slots
+    )
 
 
 def shared_read_ends_override(runner: Any, attn_backend: Any, forward_mode: Any):

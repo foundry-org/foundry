@@ -407,21 +407,27 @@ def _preallocate_once() -> None:
 
 
 def _prefill_req_slots(backend) -> int | None:
-    """The prefill runner's fixed request-slot count when ``backend`` is that
-    runner's, None for the decode runner's."""
+    """Plugin route: the prefill runner's fixed request-slot count when
+    ``backend`` is that runner's, None for the decode runner's (on the
+    dependency route SGLang's backend passes it)."""
     runner = backend._cuda_graph_runner
     if isinstance(runner, _prefill_runner_cls()):
         return runner._capture_req_slots
     return None
 
 
-def capture_one(backend, shape_key, forward_fn) -> None:
+def capture_one(shape_key, forward_fn, *, pool, stream, prefill_req_slots=None):
     """Replaces ``FullCudaGraphBackend.capture_one`` for one shape, SAVE or
-    LOAD; the runner's capture loop around it is SGLang's own."""
+    LOAD; the runner's capture loop around it is SGLang's own. Returns
+    ``(graph, output)``; the caller stores them in the backend.
+
+    ``pool`` / ``stream``: the backend's graph pool and capture stream (SAVE).
+    ``prefill_req_slots``: the prefill runner's fixed request-slot count, None
+    for a decode graph."""
     mode = get_graph_extension_mode()
     if mode == CUDAGraphExtensionMode.NONE:
         raise RuntimeError("[Foundry] capture_one called without SAVE or LOAD")
-    req_slots = _prefill_req_slots(backend)
+    req_slots = prefill_req_slots
     if mode == CUDAGraphExtensionMode.LOAD:
         # LOAD, both runners: the upstream capture loop runs (see
         # capture_scope) and only the capture is replaced, by the archived
@@ -437,13 +443,11 @@ def capture_one(backend, shape_key, forward_fn) -> None:
             graph, out = restore_next_prefill_graph(shape_key, req_slots)
         else:
             graph, out = restore_next_decode_graph(shape_key)
-        # Every graph placed in ``_graphs`` (SAVE's FoundryCUDAGraph, LOAD's
-        # restored graphs) is a foundry ``ops.CUDAGraph``, which binds
-        # ``reset()`` (csrc/binding.cpp): upstream's
-        # FullCudaGraphBackend.cleanup() calls ``graph.reset()`` on each.
-        backend._graphs[shape_key] = graph
-        backend._outputs[shape_key] = out
-        return
+        # Every graph returned (SAVE's FoundryCUDAGraph, LOAD's restored
+        # graphs) is a foundry ``ops.CUDAGraph``, which binds ``reset()``
+        # (csrc/binding.cpp): upstream's FullCudaGraphBackend.cleanup() calls
+        # ``graph.reset()`` on each.
+        return graph, out
 
     # SAVE: suppress upstream's two pre-capture warmup forwards. Their
     # non-deterministic activation allocations would pollute the torch caching
@@ -461,10 +465,9 @@ def capture_one(backend, shape_key, forward_fn) -> None:
 
     graph = create_device_graph()
     with graph_pool_capture_scope():
-        out = capture_graph(graph, backend._pool, backend._capture_stream, forward_fn)
-    backend._graphs[shape_key] = graph
-    backend._outputs[shape_key] = out
+        out = capture_graph(graph, pool, stream, forward_fn)
     save_graph(graph, out, shape_key, prefill_req_slots=req_slots)
+    return graph, out
 
 
 @contextlib.contextmanager
@@ -757,7 +760,15 @@ def _patch_cuda_graph_capture() -> None:
                 capture_inputs=capture_inputs,
                 post_warmup_hook=post_warmup_hook,
             )
-        return capture_one(self, shape_key, forward_fn)
+        graph, out = capture_one(
+            shape_key,
+            forward_fn,
+            pool=self._pool,
+            stream=self._capture_stream,
+            prefill_req_slots=_prefill_req_slots(self),
+        )
+        self._graphs[shape_key] = graph
+        self._outputs[shape_key] = out
 
     @functools.wraps(orig_prefill_capture)
     def patched_prefill_capture(self):
