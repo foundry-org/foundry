@@ -27,7 +27,7 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Environment :: GPU :: NVIDIA CUDA",
 ]
-# setup.py sets install_requires: "torch" for a source build, "torch==X.Y.*"
+# setup.py sets install_requires: "torch" for a source build, "torch==X.Y.Z"
 # (the build torch) for a release wheel, since foundry.ops is bound to it.
 dynamic = ["dependencies"]
 
