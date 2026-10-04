@@ -7,13 +7,19 @@ from pathlib import Path
 
 import torch
 from setuptools import setup
-from torch.utils.cpp_extension import (
-    CUDA_HOME,
-    BuildExtension,
-    CUDAExtension,
-    include_paths,
-    library_paths,
-)
+
+# FOUNDRY_SDIST=1: build only the source distribution. Nothing is compiled, so
+# torch.utils.cpp_extension (which needs a CUDA toolkit via CUDA_HOME) is not
+# imported and no extension module is declared.
+SDIST = os.getenv("FOUNDRY_SDIST") == "1"
+if not SDIST:
+    from torch.utils.cpp_extension import (
+        CUDA_HOME,
+        BuildExtension,
+        CUDAExtension,
+        include_paths,
+        library_paths,
+    )
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -123,93 +129,99 @@ def write_build_info(boost_version):
 
 
 boost_include_dir = resolve_boost_include_dir()
-write_build_info(_fmt_boost(_boost_version(boost_include_dir)))
-common_include_dirs = include_paths(device_type="cuda") + [os.path.join(ROOT_DIR, "include")]
-if boost_include_dir not in _IMPLICIT_INCLUDE_DIRS:
-    common_include_dirs.append(boost_include_dir)
-common_library_dirs = library_paths(device_type="cuda")
-# Link -lcuda against the toolkit stub when present (build containers have no
-# driver); the runtime loads the real libcuda.so.1. Not added to the RPATH.
-if CUDA_HOME and os.path.isfile(os.path.join(CUDA_HOME, "lib64", "stubs", "libcuda.so")):
-    common_library_dirs.append(os.path.join(CUDA_HOME, "lib64", "stubs"))
+if not SDIST:
+    # The sdist ships the placeholder; the real values are written when it is built.
+    write_build_info(_fmt_boost(_boost_version(boost_include_dir)))
+if SDIST:
+    ext_modules = []
+    cmdclass = {}
+else:
+    common_include_dirs = include_paths(device_type="cuda") + [os.path.join(ROOT_DIR, "include")]
+    if boost_include_dir not in _IMPLICIT_INCLUDE_DIRS:
+        common_include_dirs.append(boost_include_dir)
+    common_library_dirs = library_paths(device_type="cuda")
+    # Link -lcuda against the toolkit stub when present (build containers have no
+    # driver); the runtime loads the real libcuda.so.1. Not added to the RPATH.
+    if CUDA_HOME and os.path.isfile(os.path.join(CUDA_HOME, "lib64", "stubs", "libcuda.so")):
+        common_library_dirs.append(os.path.join(CUDA_HOME, "lib64", "stubs"))
 
-# libcuda_hook.so sits next to foundry.ops ($ORIGIN). A source build also bakes
-# the torch/CUDA library dirs; a wheel must not (foundry imports torch first).
-ops_rpaths = ["$ORIGIN"]
-if not WHEEL_BUILD:
-    ops_rpaths += library_paths(device_type="cuda")
+    # libcuda_hook.so sits next to foundry.ops ($ORIGIN). A source build also bakes
+    # the torch/CUDA library dirs; a wheel must not (foundry imports torch first).
+    ops_rpaths = ["$ORIGIN"]
+    if not WHEEL_BUILD:
+        ops_rpaths += library_paths(device_type="cuda")
 
+    class CustomBuildExt(BuildExtension):
+        def build_extensions(self):
+            # Build hook library using CMake
+            build_dir = Path(self.build_lib) / "foundry"
+            build_dir.mkdir(parents=True, exist_ok=True)
 
-class CustomBuildExt(BuildExtension):
-    def build_extensions(self):
-        # Build hook library using CMake
-        build_dir = Path(self.build_lib) / "foundry"
-        build_dir.mkdir(parents=True, exist_ok=True)
+            cmake_build_dir = Path(ROOT_DIR) / "build"
+            cmake_build_dir.mkdir(parents=True, exist_ok=True)
 
-        cmake_build_dir = Path(ROOT_DIR) / "build"
-        cmake_build_dir.mkdir(parents=True, exist_ok=True)
+            # Run CMake
+            subprocess.check_call(
+                [
+                    "cmake",
+                    "-S",
+                    ROOT_DIR,
+                    "-B",
+                    str(cmake_build_dir),
+                    f"-DCMAKE_INSTALL_PREFIX={build_dir}",
+                    f"-DFOUNDRY_BOOST_INCLUDE_DIR={boost_include_dir}",
+                ]
+                + (["-DCMAKE_CXX_FLAGS=-DFOUNDRY_DEBUG"] if os.getenv("FOUNDRY_DEBUG") else [])
+            )
 
-        # Run CMake
-        subprocess.check_call(
-            [
-                "cmake",
-                "-S",
-                ROOT_DIR,
-                "-B",
-                str(cmake_build_dir),
-                f"-DCMAKE_INSTALL_PREFIX={build_dir}",
-                f"-DFOUNDRY_BOOST_INCLUDE_DIR={boost_include_dir}",
-            ]
-            + (["-DCMAKE_CXX_FLAGS=-DFOUNDRY_DEBUG"] if os.getenv("FOUNDRY_DEBUG") else [])
-        )
+            # Build and install
+            subprocess.check_call(["cmake", "--build", str(cmake_build_dir)])
+            subprocess.check_call(["cmake", "--install", str(cmake_build_dir)])
 
-        # Build and install
-        subprocess.check_call(["cmake", "--build", str(cmake_build_dir)])
-        subprocess.check_call(["cmake", "--install", str(cmake_build_dir)])
+            # Update ext_modules to link against the built hook library
+            hook_lib_path = build_dir / "libcuda_hook.so"
+            for ext in self.extensions:
+                if ext.name == "foundry.ops":
+                    ext.extra_link_args.append(str(hook_lib_path))
 
-        # Update ext_modules to link against the built hook library
-        hook_lib_path = build_dir / "libcuda_hook.so"
-        for ext in self.extensions:
-            if ext.name == "foundry.ops":
-                ext.extra_link_args.append(str(hook_lib_path))
+            super().build_extensions()
 
-        super().build_extensions()
+        def copy_extensions_to_source(self):
+            super().copy_extensions_to_source()
+            # Also copy the hook library to the source directory
+            build_dir = Path(self.build_lib) / "foundry"
+            src_dir = Path(ROOT_DIR) / "python" / "foundry"
+            hook_lib = build_dir / "libcuda_hook.so"
+            if hook_lib.exists():
+                import shutil
 
-    def copy_extensions_to_source(self):
-        super().copy_extensions_to_source()
-        # Also copy the hook library to the source directory
-        build_dir = Path(self.build_lib) / "foundry"
-        src_dir = Path(ROOT_DIR) / "python" / "foundry"
-        hook_lib = build_dir / "libcuda_hook.so"
-        if hook_lib.exists():
-            import shutil
+                shutil.copy2(str(hook_lib), str(src_dir))
 
-            shutil.copy2(str(hook_lib), str(src_dir))
+    ext_modules = [
+        CUDAExtension(
+            name="foundry.ops",
+            sources=[
+                "csrc/binding.cpp",
+                "csrc/CUDAGraph.cpp",
+                "csrc/CUDAGraphParallel.cpp",
+                "csrc/BinaryGraphIO.cpp",
+                "csrc/boost_json_src.cpp",
+            ],
+            include_dirs=common_include_dirs,
+            library_dirs=common_library_dirs,
+            language="c++",
+            extra_compile_args={
+                "cxx": ["-O3"] + get_compile_flags(),
+                "nvcc": ["-O3"] + get_compile_flags(),
+            },
+            extra_link_args=["-lcuda"] + [f"-Wl,-rpath,{p}" for p in ops_rpaths],
+        ),
+    ]
 
-
-ext_modules = [
-    CUDAExtension(
-        name="foundry.ops",
-        sources=[
-            "csrc/binding.cpp",
-            "csrc/CUDAGraph.cpp",
-            "csrc/CUDAGraphParallel.cpp",
-            "csrc/BinaryGraphIO.cpp",
-            "csrc/boost_json_src.cpp",
-        ],
-        include_dirs=common_include_dirs,
-        library_dirs=common_library_dirs,
-        language="c++",
-        extra_compile_args={
-            "cxx": ["-O3"] + get_compile_flags(),
-            "nvcc": ["-O3"] + get_compile_flags(),
-        },
-        extra_link_args=["-lcuda"] + [f"-Wl,-rpath,{p}" for p in ops_rpaths],
-    ),
-]
+    cmdclass = {"build_ext": CustomBuildExt}
 
 setup(
     install_requires=[torch_requirement()],
-    cmdclass={"build_ext": CustomBuildExt},
+    cmdclass=cmdclass,
     ext_modules=ext_modules,
 )
