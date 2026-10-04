@@ -57,7 +57,7 @@ cuda_dotted() {
 }
 
 if [[ "$DOCKER" == 1 ]]; then
-    IMAGE="${FOUNDRY_BUILDER_IMAGE:-pytorch/manylinux2_28-builder:cuda$(cuda_dotted "$CUDA_TAG")}"
+    IMAGE="${FOUNDRY_BUILDER_IMAGE:-docker.io/pytorch/manylinux2_28-builder:cuda$(cuda_dotted "$CUDA_TAG")}"
     FWD=()
     for a in "${ARGS[@]}"; do [[ "$a" != --docker ]] && FWD+=("$a"); done
     GPU_ARGS=()
@@ -141,7 +141,8 @@ TORCH_LIB="$("$BPY" -c 'import os, torch; print(os.path.join(os.path.dirname(tor
 # Without a driver, libcuda.so.1 comes from the toolkit stub: enough for the
 # loader, auditwheel and the hook's dlsym table, not for running CUDA.
 HAVE_DRIVER=0
-ldconfig -p 2>/dev/null | grep -q 'libcuda\.so\.1 ' && HAVE_DRIVER=1
+ldconfig -p >"$WORK/ldconfig.txt" 2>/dev/null || true
+grep -q 'libcuda\.so\.1 ' "$WORK/ldconfig.txt" && HAVE_DRIVER=1
 STUB_DIR=""
 if [[ "$HAVE_DRIVER" == 0 && -f "$CUDA_HOME/lib64/stubs/libcuda.so" ]]; then
     STUB_DIR="$WORK/stub"
@@ -164,11 +165,12 @@ WHEEL="$(ls "$WORK"/repaired/foundry_core-*.whl)"
 LD_LIBRARY_PATH="$AW_LD" "$AW" show "$WHEEL" || log "WARNING: auditwheel show exited nonzero"
 
 log "checking wheel layout"
-unzip -l "$WHEEL"
-unzip -l "$WHEEL" | grep -qE ' foundry/libcuda_hook\.so$' || die "foundry/libcuda_hook.so missing from the wheel"
-unzip -l "$WHEEL" | grep -qE ' foundry/ops\..*\.so$' || die "foundry/ops*.so missing from the wheel"
-unzip -l "$WHEEL" | grep -q 'libcuda_hook-' && die "auditwheel grafted a renamed libcuda_hook copy"
-unzip -l "$WHEEL" | grep -qE 'foundry_core\.libs/.*(boost|torch|c10|cudart|libcuda)' \
+# List once into a file: with pipefail, `unzip -l | grep -q` fails when grep exits early (SIGPIPE in unzip).
+unzip -l "$WHEEL" | tee "$WORK/wheel.list"
+grep -qE ' foundry/libcuda_hook\.so$' "$WORK/wheel.list" || die "foundry/libcuda_hook.so missing from the wheel"
+grep -qE ' foundry/ops\..*\.so$' "$WORK/wheel.list" || die "foundry/ops*.so missing from the wheel"
+grep -q 'libcuda_hook-' "$WORK/wheel.list" && die "auditwheel grafted a renamed libcuda_hook copy"
+grep -qE 'foundry_core\.libs/.*(boost|torch|c10|cudart|libcuda)' "$WORK/wheel.list" \
     && die "auditwheel grafted a library that must come from the host/torch"
 mkdir -p "$WORK/x"
 unzip -q -o "$WHEEL" -d "$WORK/x"
@@ -178,7 +180,7 @@ OPS_SO="$(ls "$WORK"/x/foundry/ops.*.so)"
 readelf -d "$OPS_SO" | tee "$WORK/ops.dyn"
 grep -qi boost "$WORK/ops.dyn" && die "foundry.ops has a Boost DT_NEEDED"
 grep -q 'Shared library: \[libcuda_hook.so\]' "$WORK/ops.dyn" || die "foundry.ops does not need libcuda_hook.so by that name"
-grep -E 'R(UN)?PATH' "$WORK/ops.dyn" | grep -q '\$ORIGIN' || die "foundry.ops lost its \$ORIGIN RPATH"
+grep -qE 'R(UN)?PATH.*\$ORIGIN' "$WORK/ops.dyn" || die "foundry.ops lost its \$ORIGIN RPATH"
 cat "$WORK/x"/foundry_core-*.dist-info/METADATA | grep -E '^(Name|Version|Requires-Dist):'
 
 if [[ "$SMOKE" == 1 ]]; then
