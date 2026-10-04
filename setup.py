@@ -99,10 +99,12 @@ def get_compile_flags():
 
 
 def torch_requirement():
+    """Release wheels pin the exact torch they were built against (foundry.ops
+    uses ATen/c10 internals; SGLang pins torch the same way). Source builds
+    accept the installed torch."""
     if not WHEEL_BUILD:
         return "torch"
-    major, minor = torch.__version__.split("+")[0].split(".")[:2]
-    return f"torch=={major}.{minor}.*"
+    return f"torch=={torch.__version__.split('+')[0]}"
 
 
 def write_build_info(boost_version):

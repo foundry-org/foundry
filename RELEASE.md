@@ -10,7 +10,7 @@ release is about packaging; the graph save/restore code is unchanged from
 - **`pip install foundry-core`.** manylinux_2_28 x86_64 wheels for CPython
   3.10-3.13, built against **torch 2.13 (cu130)**. One torch/CUDA pairing per
   release line, the sglang-kernel convention: the PyPI version is plain
-  (`0.1.0`) and the wheel requires `torch==2.13.*`. Wheels for other
+  (`0.1.0`) and the wheel requires `torch==2.13.0`. Wheels for other
   torch/CUDA pairs, when built, go on the GitHub Release only, with a local
   version such as `0.1.0+cu128.torch2.12` (PyPI rejects local versions).
 - **SGLang dependency route.** SGLang can declare
@@ -36,7 +36,7 @@ release is about packaging; the graph save/restore code is unchanged from
 ## Packaging and release
 
 - `pyproject.toml`: name `foundry-core`, version 0.1.0; `install_requires`
-  is set by `setup.py` (`torch` for source builds, `torch==A.B.*` for release
+  is set by `setup.py` (`torch` for source builds, `torch==A.B.C` (the build torch) for release
   wheels). `MANIFEST.in` ships the native sources and `third_party` in the
   sdist.
 - `FOUNDRY_WHEEL_BUILD=1` builds a relocatable wheel: `foundry.ops` keeps

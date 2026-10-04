@@ -14,7 +14,7 @@ major), like sglang-kernel and flashinfer. PyPI rejects local version labels
 
 - **One torch/CUDA pair per release line goes to PyPI** with the plain
   version. It is the first entry of `BUILD_PAIRS` at the top of the workflow.
-  Its wheels declare `Requires-Dist: torch==A.B.*`.
+  Its wheels declare `Requires-Dist: torch==A.B.C`, the exact torch they were built against (SGLang pins torch the same way).
 - **Other pairs go to the GitHub Release only**, built with a local version
   `X.Y.Z+cuNNN.torchA.B` (for example `0.1.0+cu128.torch2.12`) so the file
   names do not collide. Users install them by URL.
