@@ -1,65 +1,123 @@
-# Foundry 0.1.0
+# Foundry 0.1.0rc1
 
-Foundry is now installable as prebuilt wheels from PyPI under the
-distribution name **`foundry-core`** (the import name stays `foundry`). This
-release is about packaging; the graph save/restore code is unchanged from
-0.0.3 apart from the Boost and filesystem changes below.
+Release candidate of 0.1.0, the first release installable from PyPI under the
+distribution name **`foundry-core`** (import name `foundry`) and the first one
+SGLang can declare as an ordinary dependency. The final 0.1.0 is tagged once
+the SGLang side (sgl-project/sglang#42254) is merged against it; until then
+SGLang requires `foundry-core>=0.1.0rc1,<0.2`. Besides packaging, this
+release carries everything since 0.0.3: the SGLang dependency route, prefill
+CUDA graphs, a faster graph restore, and the fixes found while validating
+twenty model / parallelism configurations on H200.
 
 ## Highlights
 
 - **`pip install foundry-core`.** manylinux_2_28 x86_64 wheels for CPython
-  3.10-3.13, built against **torch 2.13 (cu130)**. One torch/CUDA pairing per
-  release line, the sglang-kernel convention: the PyPI version is plain
-  (`0.1.0`) and the wheel requires `torch==2.13.0`. Wheels for other
-  torch/CUDA pairs, when built, go on the GitHub Release only, with a local
-  version such as `0.1.0+cu128.torch2.12` (PyPI rejects local versions).
-- **SGLang dependency route.** SGLang can declare
-  `foundry-core>=0.1.0,<0.2` as an ordinary PyPI requirement; a git-ref
-  dependency would block SGLang's own PyPI upload. The plugin entry point
-  (`sglang.srt.plugins` / `foundry`) and `foundry.integration.sglang.api`
-  ship in the wheel, and `foundry/libcuda_hook.so` keeps its path next to
-  `foundry.ops` so the preload path SGLang derives is unchanged.
-- **No Boost runtime dependency.** Boost is used header-only: Boost.JSON
-  compiles through `csrc/boost_json_src.cpp` (once per shared object, hidden
-  in the preloaded hook), `boost::filesystem` is replaced by
-  `std::filesystem`, and neither `libcuda_hook.so` nor `foundry.ops` links a
-  `libboost_*` library. The headers are vendored under `third_party/boost`
-  (bcp subset of Boost 1.90.0, `tools/release/vendor_boost.sh`); source builds
-  without the vendored copy fall back to a system Boost >= 1.83.
-- **Torch build guard.** `foundry.__version__` comes from the installed
-  distribution. The build records its torch and CUDA versions in
-  `foundry/_build_info.py`; importing `foundry` under a torch with a different
-  major.minor or CUDA major raises an `ImportError` that names both builds and
-  the fix, instead of an undefined-symbol error
-  (`FOUNDRY_SKIP_TORCH_CHECK=1` bypasses it).
+  3.10-3.13, built against **torch 2.13.0 / cu130** (SGLang's pin). One
+  torch/CUDA pairing per release line, the sglang-kernel convention: the PyPI
+  version is plain and the wheel requires `torch==2.13.0`; wheels for other
+  pairs go on the GitHub Release with a local version. Importing `foundry`
+  under another torch major.minor or CUDA major raises a readable
+  `ImportError` (`FOUNDRY_SKIP_TORCH_CHECK=1` bypasses it).
+- **SGLang as a dependency.** `foundry.integration.sglang.api`
+  (`INTEGRATION_API_VERSION = (1, 0)`) is what SGLang's
+  `--cuda-graph-persistence {save,load}` adapter calls from its own call sites
+  (`pip install "sglang[foundry]"`). The plugin route (entry point +
+  `FOUNDRY_GRAPH_EXTENSION_CONFIG`) runs the same code on an SGLang without
+  the adapter; each route refuses to activate on top of the other. Every
+  SGLang setting that selects state a restored graph cannot replay is pinned
+  with a reason (custom all-reduce, NCCL buffer registration / NVLS / cuMem,
+  DeepGEMM precompile, TBO, memory saver, glue graph, graph-pool precarve and
+  borrow); unsupported features are rejected at resolution.
+  `python -m foundry.integration.sglang.preflight` checks a launch before the
+  engine starts.
+- **Prefill CUDA graphs.** FULL-backend prefill graphs are saved and restored
+  next to the decode graphs (request slots, output packing, manifest
+  partitions). With power-of-two buckets every prefill of the Qwen3 family and
+  gpt-oss replays a graph; TTFT and prefill throughput of a LOADed engine
+  match native capture.
+- **LOAD re-runs SGLang's own capture loop** for decode and prefill and
+  substitutes only `capture_one`, so every host-side object is rebuilt by
+  SGLang's code at SAVE's addresses. The log separates the restore
+  (`Loaded N SGLang graphs in Xs`) from the loop around it.
+- **Graph restore in 0.5-1.6 s per rank for 128 decode graphs** (30B-235B
+  models, 4xH200): templates are built from the binary node table, the next
+  template's JSON is parsed while the current one builds, the build and
+  instantiate threads form a pipeline, and an exec-pool prewarm during
+  distributed init removes the driver's pool growth from Phase 2. Restored
+  non-portable cluster kernels (DeepSeek-V4's cluster-16 top-k) are opted into
+  `NON_PORTABLE_CLUSTER_SIZE_ALLOWED`.
+- **No Boost runtime dependency.** Boost is header-only: Boost.JSON compiles
+  through `csrc/boost_json_src.cpp` (once per shared object, hidden in the
+  preloaded hook), `boost::filesystem` is replaced by `std::filesystem`, and
+  neither `libcuda_hook.so` nor `foundry.ops` links a `libboost_*` library.
+  The headers are vendored under `third_party/boost` (bcp subset of Boost
+  1.90.0, `tools/release/vendor_boost.sh`); source builds without it fall back
+  to a system Boost >= 1.83.
+
+## Fixes
+
+- SAVE copied and checksummed every fatbin to the end of its `.nv_fatbin`
+  section (NCCL's 127 MB library as 5.95 GB): 30 s per rank in distributed
+  init and 4-5 GB archives. Fatbins are sized by their own header; the packed
+  image is 30-35 MB per rank and is mmap'd on LOAD.
+- One preallocation mechanism on LOAD (backing segments, fenced release,
+  on-demand holes), replacing the separate paths.
+- Qwen3.5 + FlashInfer LOAD divergence (the hybrid attention backend hid the
+  FlashInfer child from the old pre-pass) is gone with the capture-loop LOAD.
+- Bare hosts with blocked verbs devices: an optional udev-wait shim
+  (`tools/host/no_cdev_wait.c`, TOML `verbs_udev_wait_shim_path`) removes
+  ~40 s from the first DeepEP buffer.
+- The hook preload is scoped to the scheduler spawn and the resource tracker
+  is started before it, so only the schedulers and the DP controller carry
+  `LD_PRELOAD`.
+
+## Validation
+
+- 4xH200, SGLang main + the dependency route: Qwen3-30B-A3B-FP8 (real
+  weights; EP4, TP2, EP2, DP4, attn TP2+EP4, attn TP2+EP2, attn TP4+EP4),
+  Qwen3-235B-A22B-FP8 (attn TP4+EP4, attn TP2xDP2+EP4), Qwen3.5-122B-A10B-FP8
+  (EP4, attn TP2+EP4), Qwen3.5-35B-A3B (EP4, attn TP4+EP4; tp2 / ep2 with
+  real weights), DeepSeek-V4-Flash-FP8 EP4, GLM-5.3-Flash EP4, gpt-oss-120b
+  EP4: every row restores in 0.5-1.6 s per rank, reaches `/health` within a
+  few seconds of the eager engine, and greedy output, TTFT and TPOT match
+  native capture. Tables and figures: `docs/sglang/validated-configs.md`,
+  `docs/sglang/figs/`.
+- The `foundry-core` wheel drives SGLang's unit and e2e tests and Foundry's
+  integration tests installed non-editable, with `LD_PRELOAD` resolved from
+  site-packages.
 
 ## Packaging and release
 
-- `pyproject.toml`: name `foundry-core`, version 0.1.0; `install_requires`
-  is set by `setup.py` (`torch` for source builds, `torch==A.B.C` (the build torch) for release
+- `pyproject.toml`: name `foundry-core`; `install_requires` is set by
+  `setup.py` (`torch` for source builds, the exact build torch for release
   wheels). `MANIFEST.in` ships the native sources and `third_party` in the
-  sdist.
-- `FOUNDRY_WHEEL_BUILD=1` builds a relocatable wheel: `foundry.ops` keeps
-  only the `$ORIGIN` RPATH (it finds `libcuda_hook.so` beside it; torch is
-  imported first) and links `-lcuda` against the toolkit stub.
+  sdist; `FOUNDRY_SDIST=1` builds the sdist without a CUDA toolkit.
+- `FOUNDRY_WHEEL_BUILD=1` builds a relocatable wheel: `foundry.ops` keeps only
+  the `$ORIGIN` RPATH (it finds `libcuda_hook.so` beside it; torch is imported
+  first) and links `-lcuda` against the toolkit stub.
 - `.github/workflows/release.yml`: sdist, a wheel matrix (`PYTHONS` x
   `BUILD_PAIRS`) built in `pytorch/manylinux2_28-builder:cuda13.0`,
   `auditwheel repair` with torch, CUDA runtime, NVRTC, the driver and
   `libcuda_hook.so` excluded, layout and DT_NEEDED checks, an import smoke
   test in a clean venv, PyPI trusted publishing and a GitHub Release.
-  `tools/release/build_wheel.sh` runs the same steps on a local host.
-- How to cut a release: [`docs/release.md`](docs/release.md).
+  `tools/release/build_wheel.sh` runs the same steps on a local host (docker
+  or rootless podman). How to cut a release: [`docs/release.md`](docs/release.md).
 
 ## Upgrading
 
 - `pip uninstall foundry` before installing `foundry-core`: both own the
   `foundry` import package.
+- Archives written before the capture-loop LOAD (`capture_loop_version` < 2
+  in `region_layout.json`) must be re-SAVEd.
 - Source builds no longer need the compiled Boost libraries
   (`libboost-filesystem-dev`, `libboost-json-dev`) or a Boost entry on
   `LD_LIBRARY_PATH`; Boost headers >= 1.83 or the vendored copy suffice.
-- The wheels pair with torch 2.13 / cu130. Environments on another torch
+- The wheels pair with torch 2.13.0 / cu130. Environments on another torch
   (the vLLM recipe uses torch 2.11) keep building from source with
   `pip install -e . --no-build-isolation`.
+- Docs: `docs/sglang/` (overview, hooks, known issues, graph-state checklist,
+  validated configs), `docs/graph-templates.md` (exec modes),
+  `docs/exec-update-penalty.md`, `docs/release.md`.
 
 ## Previous Releases
 
