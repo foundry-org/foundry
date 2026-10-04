@@ -65,6 +65,10 @@ def resolve_boost_include_dir():
         for env in ("BOOST_ROOT", "CONDA_PREFIX"):
             if os.getenv(env):
                 candidates.append((env, os.path.join(os.environ[env], "include")))
+        # The prefixes CMake searches for BoostConfig (the CMake fallback) hold the headers too.
+        for prefix in os.getenv("CMAKE_PREFIX_PATH", "").split(os.pathsep):
+            if prefix:
+                candidates.append(("CMAKE_PREFIX_PATH", os.path.join(prefix, "include")))
         candidates += [("system", "/usr/local/include"), ("system", "/usr/include")]
 
     rejected = []
