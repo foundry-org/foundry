@@ -60,11 +60,25 @@ if [[ "$DOCKER" == 1 ]]; then
     IMAGE="${FOUNDRY_BUILDER_IMAGE:-docker.io/pytorch/manylinux2_28-builder:cuda$(cuda_dotted "$CUDA_TAG")}"
     FWD=()
     for a in "${ARGS[@]}"; do [[ "$a" != --docker ]] && FWD+=("$a"); done
+    PODMAN=0
+    docker --version 2>/dev/null | grep -qi podman && PODMAN=1
     GPU_ARGS=()
-    [[ -n "${FOUNDRY_DOCKER_GPUS:-}" ]] && GPU_ARGS=(--gpus "$FOUNDRY_DOCKER_GPUS")
+    if [[ -n "${FOUNDRY_DOCKER_GPUS:-}" ]]; then
+        if [[ "$PODMAN" == 1 ]]; then
+            # podman accepts --gpus but injects no driver; the NVIDIA CDI spec does.
+            for g in ${FOUNDRY_DOCKER_GPUS//,/ }; do GPU_ARGS+=(--device "nvidia.com/gpu=$g"); done
+        else
+            GPU_ARGS=(--gpus "$FOUNDRY_DOCKER_GPUS")
+        fi
+    fi
+    # Rootful docker: chown the output back to the caller. Rootless podman (also installed as
+    # `docker`) already maps container root to the caller; a chown there would hand the
+    # files to a subordinate uid the caller cannot delete.
+    OWNER_ARGS=(-e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)")
+    [[ "$PODMAN" == 1 ]] && OWNER_ARGS=()
     log "running inside $IMAGE"
     exec docker run --rm "${GPU_ARGS[@]}" -v "$ROOT:/src" -w /src \
-        -e MAX_JOBS -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+        -e MAX_JOBS "${OWNER_ARGS[@]}" \
         "$IMAGE" bash tools/release/build_wheel.sh "${FWD[@]}"
 fi
 
