@@ -47,7 +47,10 @@ VALIDATED_SGLANG_COMMIT = "fa090f7755"
 ENTRY_POINT_GROUP = "sglang.srt.plugins"
 ENTRY_POINT_NAME = "foundry"
 ENTRY_POINT_VALUE = "foundry_sglang_plugin:load"
-INSTALL_HINT = "pip install -e foundry (in the venv that runs sglang serve)"
+INSTALL_HINT = (
+    "pip install foundry-core (or pip install -e foundry --no-build-isolation from a "
+    "checkout), in the venv that runs sglang serve"
+)
 PREFIX = "[Foundry preflight]"
 
 

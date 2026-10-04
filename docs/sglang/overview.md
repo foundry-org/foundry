@@ -2,7 +2,7 @@
 
 Foundry persists SGLang's decode (and optionally prefill) CUDA graphs to disk on SAVE and restores them on LOAD, skipping graph capture, kernel warmup, and the per-batch-size attention metadata setup costs.
 
-Foundry runs as an **SGLang plugin**: `pip install -e foundry` registers the entry point `foundry = "foundry_sglang_plugin:load"` in group `sglang.srt.plugins`, and `FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>` in the launcher's environment switches it on. No SGLang change is needed (validated on upstream main `fa090f7755`, fork branch `foundry-plugin`). The plugin wraps three whitelisted resolution steps to pin the graph settings and installs the runtime patches in [`hooks.md`](hooks.md) in the launcher and in every scheduler process. The earlier in-tree route (fork flag `--foundry-graph-extension-config-path`, [`direct-edits.md`](direct-edits.md)) is superseded.
+Foundry runs as an **SGLang plugin**: installing the `foundry-core` package registers the entry point `foundry = "foundry_sglang_plugin:load"` in group `sglang.srt.plugins`, and `FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>` in the launcher's environment switches it on. No SGLang change is needed (validated on upstream main `fa090f7755`, fork branch `foundry-plugin`). The plugin wraps three whitelisted resolution steps to pin the graph settings and installs the runtime patches in [`hooks.md`](hooks.md) in the launcher and in every scheduler process. The earlier in-tree route (fork flag `--foundry-graph-extension-config-path`, [`direct-edits.md`](direct-edits.md)) is superseded.
 
 **Dependency route.** An SGLang that declares Foundry as an optional dependency (`sglang[foundry]`, fork branch
 `foundry-dep`) calls `foundry.integration.sglang.api` from its own call sites instead of being patched:
@@ -104,10 +104,12 @@ flags and environment on SAVE and LOAD (see `recipe/sglang/README.md`).
 ### 1. Install foundry
 
 ```bash
+pip install foundry-core                                   # prebuilt wheel (see README for the torch/CUDA pairing)
+# or, from a checkout, against the installed torch:
 pushd foundry && pip install -e . --no-build-isolation && popd
 ```
 
-Install it into the venv that runs `sglang serve`. The install registers the plugin entry point; a `PYTHONPATH` source checkout does not, and SGLang then runs natively without an error even with `FOUNDRY_GRAPH_EXTENSION_CONFIG` set (as it does when `SGLANG_PLUGINS` is set without `foundry`). Check with `python -m foundry.integration.sglang.preflight --toml <toml> --save|--load`, which the recipe scripts run before every SAVE / LOAD.
+Install it into the venv that runs `sglang serve`. On the dependency route the same package comes in as `pip install "sglang[foundry]"`. The install registers the plugin entry point; a `PYTHONPATH` source checkout does not, and SGLang then runs natively without an error even with `FOUNDRY_GRAPH_EXTENSION_CONFIG` set (as it does when `SGLANG_PLUGINS` is set without `foundry`). Check with `python -m foundry.integration.sglang.preflight --toml <toml> --save|--load`, which the recipe scripts run before every SAVE / LOAD.
 
 ### 2. Write a TOML config
 
