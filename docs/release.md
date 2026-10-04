@@ -25,7 +25,7 @@ major), like sglang-kernel and flashinfer. PyPI rejects local version labels
 |---|---|---|---|
 | 0.1.x | torch 2.13, cu130 | 3.10-3.13 | manylinux_2_28 x86_64 |
 
-SGLang depends on `foundry-core>=0.1.0,<0.2`. Changing the PyPI pair (for
+SGLang depends on `foundry-core>=0.1.0rc1,<0.2` (the rc lower bound lets pip pick the release candidate; it becomes `>=0.1.0` with the final release). Changing the PyPI pair (for
 example to torch 2.14) therefore needs a new minor line (0.2.0) coordinated
 with SGLang's own torch bump; 0.1.x patch releases keep torch 2.13 / cu130.
 Keep the table above, the README installation table and `RELEASE.md` in sync
@@ -104,8 +104,8 @@ create releases (the default for a repository).
 5. **Tag and push**:
 
    ```bash
-   git tag v0.1.0
-   git push pub v0.1.0      # the remote that holds the trusted-publisher repo
+   git tag v0.1.0rc1        # a pre-release: PEP 440 `0.1.0rc1`, the tag must equal `v` + the pyproject version
+   git push pub v0.1.0rc1   # the remote that holds the trusted-publisher repo
    ```
 
    The plan job checks that the tag equals `v<pyproject version>`. Then:
@@ -118,7 +118,7 @@ create releases (the default for a repository).
 
    ```bash
    pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
-   pip install foundry-core==0.1.0
+   pip install foundry-core==0.1.0rc1
    python -c "import foundry, foundry.integration.sglang.api as a; print(foundry.__version__, a.INTEGRATION_API_VERSION)"
    ```
 

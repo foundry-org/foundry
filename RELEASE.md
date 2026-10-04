@@ -1,65 +1,70 @@
-# Foundry 0.1.0
+# Foundry 0.1.0rc1
 
-Foundry is now installable as prebuilt wheels from PyPI under the
-distribution name **`foundry-core`** (the import name stays `foundry`). This
-release is about packaging; the graph save/restore code is unchanged from
-0.0.3 apart from the Boost and filesystem changes below.
+Release candidate of 0.1.0: the first release on PyPI (`foundry-core`, import
+name `foundry`) and the first one SGLang can depend on. It carries everything
+since 0.0.3.
 
 ## Highlights
 
-- **`pip install foundry-core`.** manylinux_2_28 x86_64 wheels for CPython
-  3.10-3.13, built against **torch 2.13 (cu130)**. One torch/CUDA pairing per
-  release line, the sglang-kernel convention: the PyPI version is plain
-  (`0.1.0`) and the wheel requires `torch==2.13.0`. Wheels for other
-  torch/CUDA pairs, when built, go on the GitHub Release only, with a local
-  version such as `0.1.0+cu128.torch2.12` (PyPI rejects local versions).
-- **SGLang dependency route.** SGLang can declare
-  `foundry-core>=0.1.0,<0.2` as an ordinary PyPI requirement; a git-ref
-  dependency would block SGLang's own PyPI upload. The plugin entry point
-  (`sglang.srt.plugins` / `foundry`) and `foundry.integration.sglang.api`
-  ship in the wheel, and `foundry/libcuda_hook.so` keeps its path next to
-  `foundry.ops` so the preload path SGLang derives is unchanged.
-- **No Boost runtime dependency.** Boost is used header-only: Boost.JSON
-  compiles through `csrc/boost_json_src.cpp` (once per shared object, hidden
-  in the preloaded hook), `boost::filesystem` is replaced by
-  `std::filesystem`, and neither `libcuda_hook.so` nor `foundry.ops` links a
-  `libboost_*` library. The headers are vendored under `third_party/boost`
-  (bcp subset of Boost 1.90.0, `tools/release/vendor_boost.sh`); source builds
-  without the vendored copy fall back to a system Boost >= 1.83.
-- **Torch build guard.** `foundry.__version__` comes from the installed
-  distribution. The build records its torch and CUDA versions in
-  `foundry/_build_info.py`; importing `foundry` under a torch with a different
-  major.minor or CUDA major raises an `ImportError` that names both builds and
-  the fix, instead of an undefined-symbol error
-  (`FOUNDRY_SKIP_TORCH_CHECK=1` bypasses it).
+- **`pip install foundry-core`.** manylinux_2_28 wheels for CPython 3.10-3.13,
+  built against torch 2.13.0 / cu130; the wheel requires `torch==2.13.0`.
+  Importing under another torch or CUDA major raises a readable `ImportError`.
+- **Optional SGLang dependency.** Installing Foundry does not require SGLang;
+  an SGLang started with `--cuda-graph-persistence {save,load}` requires
+  Foundry (`pip install "sglang[foundry]"`) and calls
+  `foundry.integration.sglang.api` from its own call sites. Settings a
+  restored graph cannot replay are pinned with a reason; unsupported features
+  are rejected at resolution. `python -m foundry.integration.sglang.preflight`
+  checks a launch beforehand.
+- **Prefill CUDA graphs** are saved and restored next to the decode graphs.
+  With power-of-two buckets, prefill TTFT and throughput of a LOADed engine
+  match native capture.
+- **LOAD re-runs SGLang's own capture loop** and substitutes only
+  `capture_one`; the restore time is logged apart from the loop.
+- **Faster restore:** 0.5-1.6 s per rank for 128 decode graphs on 30B-235B
+  models (binary templates, build/instantiate pipeline, exec-pool prewarm).
+  Non-portable cluster kernels are opted in on restore.
+- **No Boost runtime dependency.** Boost is header-only (vendored subset under
+  `third_party/boost`, system Boost >= 1.83 as fallback); `std::filesystem`
+  replaces `boost::filesystem`.
 
-## Packaging and release
+## Fixes
 
-- `pyproject.toml`: name `foundry-core`, version 0.1.0; `install_requires`
-  is set by `setup.py` (`torch` for source builds, `torch==A.B.C` (the build torch) for release
-  wheels). `MANIFEST.in` ships the native sources and `third_party` in the
-  sdist.
-- `FOUNDRY_WHEEL_BUILD=1` builds a relocatable wheel: `foundry.ops` keeps
-  only the `$ORIGIN` RPATH (it finds `libcuda_hook.so` beside it; torch is
-  imported first) and links `-lcuda` against the toolkit stub.
-- `.github/workflows/release.yml`: sdist, a wheel matrix (`PYTHONS` x
-  `BUILD_PAIRS`) built in `pytorch/manylinux2_28-builder:cuda13.0`,
-  `auditwheel repair` with torch, CUDA runtime, NVRTC, the driver and
-  `libcuda_hook.so` excluded, layout and DT_NEEDED checks, an import smoke
-  test in a clean venv, PyPI trusted publishing and a GitHub Release.
-  `tools/release/build_wheel.sh` runs the same steps on a local host.
-- How to cut a release: [`docs/release.md`](docs/release.md).
+- SAVE over-read every fatbin (30 s per rank in distributed init, 4-5 GB
+  archives); the packed image is now 30-35 MB and mmap'd on LOAD.
+- One preallocation mechanism on LOAD (backing segments, fenced release,
+  on-demand holes).
+- Qwen3.5 + FlashInfer LOAD divergence.
+- Optional udev-wait shim for bare hosts with blocked verbs devices
+  (`tools/host/no_cdev_wait.c`, TOML `verbs_udev_wait_shim_path`).
+- The hook preload is scoped to the scheduler spawn; only schedulers and the
+  DP controller carry `LD_PRELOAD`.
+
+## Validation
+
+4xH200, SGLang main with `--cuda-graph-persistence`: Qwen3-30B-A3B-FP8 (real
+weights, 7 layouts), Qwen3-235B-A22B-FP8, Qwen3.5-122B-A10B-FP8,
+Qwen3.5-35B-A3B, DeepSeek-V4-Flash-FP8, GLM-5.3-Flash and gpt-oss-120b in EP,
+TP and DP-attention layouts. Every row restores in 0.5-1.6 s per rank, reaches
+`/health` within a few seconds of the eager engine, and greedy output, TTFT
+and TPOT match native capture (`docs/sglang/validated-configs.md`).
+
+## Packaging
+
+- `FOUNDRY_WHEEL_BUILD=1` builds a relocatable wheel; `FOUNDRY_SDIST=1` builds
+  the sdist without a CUDA toolkit.
+- `.github/workflows/release.yml` builds, repairs, smoke-tests and publishes
+  (PyPI trusted publishing + GitHub Release); `tools/release/build_wheel.sh`
+  runs the same steps locally. See `docs/release.md`.
 
 ## Upgrading
 
-- `pip uninstall foundry` before installing `foundry-core`: both own the
-  `foundry` import package.
-- Source builds no longer need the compiled Boost libraries
-  (`libboost-filesystem-dev`, `libboost-json-dev`) or a Boost entry on
-  `LD_LIBRARY_PATH`; Boost headers >= 1.83 or the vendored copy suffice.
-- The wheels pair with torch 2.13 / cu130. Environments on another torch
-  (the vLLM recipe uses torch 2.11) keep building from source with
-  `pip install -e . --no-build-isolation`.
+- `pip uninstall foundry` before installing `foundry-core`.
+- Archives written before this release (`capture_loop_version` < 2) must be
+  re-SAVEd.
+- Source builds need Boost headers only (no `libboost-*` libraries).
+- Other torch versions keep building from source
+  (`pip install -e . --no-build-isolation`).
 
 ## Previous Releases
 
