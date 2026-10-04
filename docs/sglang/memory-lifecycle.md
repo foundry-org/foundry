@@ -37,8 +37,8 @@ flowchart TD
     POOL_LOAD["LOAD: load MemoryPoolConfig<br/>+ empty_cache()<br/>+ _apply_memory_pool_config"]
     KWARM["ModelRunner.kernel_warmup<br/>(no-op on SAVE/LOAD)"]
     GRAPHS["ModelRunner.init_device_graphs<br/>→ CudaGraphRunner(self).capture()"]
-    SAVE_CAP["SAVE: pre-pass init<br/>+ reuse_pre_pass_init shim<br/>+ capture loop<br/>+ save_graph_manifest<br/>+ pack_fatbins<br/>+ capture_final_alloc_offset"]
-    LOAD_CAP["LOAD: preallocate_for_load_mode<br/>+ pre-pass init<br/>+ load_all_graphs"]
+    SAVE_CAP["SAVE: upstream capture loop<br/>(capture_one: foundry capture + save_graph)<br/>+ save_graph_manifest<br/>+ pack_fatbins<br/>+ record_region_layout"]
+    LOAD_CAP["LOAD: preallocate_for_load_mode<br/>+ start_decode_graph_restore<br/>+ upstream capture loop<br/>(capture_one: finish_one_graph_load)<br/>+ finish_decode_graph_restore"]
 
     INIT --> TORCH
     TORCH --> TORCH_PRE --> TORCH_ORIG --> TORCH_POST
@@ -67,7 +67,7 @@ Model weights, KV pools, attention workspace buffers, FlashInfer wrapper `_int_w
 Anything that runs on one path but not the other. The fixes we landed identify and align the three known cases:
 
 1. The two pre-capture warmup forwards in `capture_one_batch_size` — skipped on SAVE so they don't pollute the caching allocator with freed activations LOAD can't reproduce. (See doc 06.)
-2. The per-iter inner `init_forward_metadata_capture_cuda_graph(bs)` call — replaced on SAVE with `reuse_pre_pass_init` so it doesn't re-allocate the wrappers the pre-pass already built. (See doc 03 / doc 05.)
+2. The per-bs attention metadata init (`init_forward_metadata_out_graph(in_capture=True)`: FlashInfer wrappers, `_int_workspace_buffer`) outside the captured graph. Originally aligned with a pre-pass on both sides plus a SAVE-only reuse shim; now both modes run the upstream capture loop and substitute only `capture_one`, so the init runs at the same point and in the same order on SAVE and LOAD, with each graph's allocator events replayed where SAVE captured it. (See [`memory-consistency.md`](memory-consistency.md) Bug 3.)
 3. `_resolve_memory_pool_config` calls `get_available_gpu_memory(empty_cache=True)` on SAVE; LOAD's `_patch_init_memory_pool` mirrors it with an explicit `torch.cuda.empty_cache()` before `_apply_memory_pool_config`. (See below.)
 
 ## The `_resolve_memory_pool_config` mirror
@@ -112,8 +112,11 @@ Persisting the resolved `MemoryPoolConfig` (via `dataclasses.asdict`) and re-app
 
 After upstream `init_torch_distributed` returns, `skip_to_scratch_boundary` forces the cursor to `cfg.scratch_space_size` (default 1 GiB). Allocations below that line are scratch and don't need to be deterministic.
 
-## Final watermark
+## Region layout
 
-`capture_final_alloc_offset` runs after the SAVE-side capture loop completes (after `save_graph_manifest` and `pack_fatbins`). It writes `final_alloc_offset` to both `rank_{N}/final_alloc_offset.json` and the shared `warmup_state.json`.
+Two SAVE-side calls describe the deterministic range for LOAD:
 
-`preallocate_for_load_mode` uses this to call `cge.preallocate_region(final - current)` so the entire deterministic range is mapped to physical memory in one shot. The cursor is **not** advanced — preallocate just pre-maps; the cursor advances naturally as cuMemAllocs land within the preallocated range (fast-path: pointer bump, no driver calls).
+- `mark_layout_start` runs on both modes at the sequence point where LOAD preallocates (after the pre-capture bootstraps: logits gatherer, DeepEP buffer, and SAVE's runtime inits). It returns torch's cached-but-free blocks to the driver on both sides, so the caching allocator is in the same state when the layout begins, and on SAVE records the cursor as `start_offset`. LOAD's cursor equals `start_offset` by construction (no eager forward runs on either mode); a difference is logged as a warning.
+- `record_region_layout` runs after the capture loop completes (after `save_graph_manifest` and `pack_fatbins`). It writes `rank_{N}/region_layout.json` with `start_offset`, the `final_alloc_offset` watermark and `live_ranges` — the `(offset, size)` ranges still mapped at that point (`cge.get_live_region_ranges`). `final_alloc_offset` is also mirrored into the shared `warmup_state.json`.
+
+`preallocate_for_load_mode` reads the layout. It calls `cge.preallocate_ranges(live_ranges, final_alloc_offset)` from LOAD's current cursor, which maps only the live ranges — one physical handle per coalesced segment — so memory SAVE allocated and freed inside the span costs LOAD nothing, then checks the cursor against `start_offset` (equal by construction; a difference is logged, and the cursor is moved up when LOAD is behind). The cursor is **not** advanced by the preallocation itself; allocations that land in the span are pointer bumps (no driver calls). An allocation that lands in an unbacked hole of the span is backed on demand by the hook and logged (`mapped N MB on demand`), which means the SAVE and LOAD sequences diverged there.

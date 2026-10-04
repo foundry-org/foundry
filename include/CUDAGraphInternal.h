@@ -4,9 +4,41 @@
 // Not part of the public API.
 
 #include "CUDAGraph.h"
+#include "ClusterOptIn.h"
+#include <cuda.h>
 #include <future>
+#include <variant>
 
 namespace foundry {
+
+// Kernel function attributes across SAVE and LOAD.
+//
+// SAVE records, per kernel node, the function's MAX_DYNAMIC_SHARED_SIZE_BYTES
+// and PREFERRED_SHARED_MEMORY_CARVEOUT attributes as they stand at capture
+// (CUDAGraph::save). LOAD reapplies them with apply_saved_function_attributes
+// before the node is added. Two driver details shape the LOAD side:
+//   * cuGraphAddKernelNode / cuGraphKernelNodeSetParams validate the node's
+//     sharedMemBytes against the attribute of the per-context CUfunction at
+//     every size, and that function does not inherit a CUkernel attribute, so
+//     a CUkernel handle gets the attribute on both.
+//   * The attribute is process-wide state shared by every graph (template
+//     builds and on-demand workers run concurrently) and is a cap, so it is
+//     only ever raised, under a lock, from a per-handle high-water mark.
+// ensure_dynamic_smem_optin runs right before a node add / params update and
+// raises the cap to the node's own sharedMemBytes; it matters when a node is
+// re-targeted to a member kernel whose recorded attribute was never applied.
+void apply_saved_function_attributes(const std::variant<CUfunction, CUkernel>& handle, CUdevice dev,
+                                     int max_dynamic_shared_size_bytes,
+                                     int preferred_shared_memory_carveout, const char* where);
+void ensure_dynamic_smem_optin(const CUDA_KERNEL_NODE_PARAMS& params, CUdevice dev,
+                               const char* where);
+
+// ensure_dynamic_smem_optin + add_kernel_node_cluster_optin (ClusterOptIn.h): cuGraphAddKernelNode
+// for a restored kernel node with both function-level opt-ins the LOAD process lacks.
+// (cx, cy, cz): the node's cluster dims merged with the function's compiled ones; 0 = none.
+CUresult add_restored_kernel_node(CUgraphNode* node, CUgraph graph,
+                                  const CUDA_KERNEL_NODE_PARAMS& params, CUdevice dev, unsigned cx,
+                                  unsigned cy, unsigned cz, const char* where);
 
 // Holds deferred metadata for the split start/finish graph loading flow.
 // Returned by start_graph_builds_impl, consumed by finish_graph_loads_impl.
@@ -25,6 +57,11 @@ struct PendingGraphLoads {
   // Signaled when background graph building (Phase 2) completes.
   // finish_graph_loads_impl waits on this before allocator replay.
   std::shared_future<void> build_complete_;
+
+  // Seconds from start_graph_builds' entry (Phase 1 start) to the end of
+  // Phase 2 (the last build / instantiate). Written by the build thread
+  // before build_complete_ is signaled; read it only after that wait.
+  std::shared_ptr<double> build_seconds_ = std::make_shared<double>(0.0);
 };
 
 // Split load: JSON parse + template build + on-demand prep (synchronous).

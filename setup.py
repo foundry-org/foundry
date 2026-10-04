@@ -1,58 +1,93 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 import os
-import shutil
+import re
 import subprocess
 from pathlib import Path
 
+import torch
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension, include_paths, library_paths
+from torch.utils.cpp_extension import (
+    CUDA_HOME,
+    BuildExtension,
+    CUDAExtension,
+    include_paths,
+    library_paths,
+)
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# FOUNDRY_WHEEL_BUILD=1 (set by tools/release/build_wheel.sh and the release
+# workflow): build a relocatable wheel. No absolute RPATHs into the build
+# machine's torch/CUDA, and the torch requirement pinned to the build torch's
+# major.minor. Source/editable installs keep the previous behavior.
+WHEEL_BUILD = bool(os.getenv("FOUNDRY_WHEEL_BUILD"))
 
-def get_boost_paths():
-    cmake_query_dir = Path(ROOT_DIR) / "build_boost_query"
-    cmake_query_dir.mkdir(parents=True, exist_ok=True)
 
-    cmake_script = cmake_query_dir / "CMakeLists.txt"
-    cmake_script.write_text("""
-cmake_minimum_required(VERSION 4.0)
-project(boost_query LANGUAGES CXX)
-find_package(Boost 1.83.0 CONFIG REQUIRED COMPONENTS filesystem json)
+# Boost is used header-only (Boost.JSON through csrc/boost_json_src.cpp); no
+# compiled Boost library is linked. Both shared objects must see the SAME Boost
+# headers, so the directory resolved here is also handed to CMake.
+VENDORED_BOOST_DIR = os.path.join(ROOT_DIR, "third_party", "boost")
+MIN_BOOST_VERSION = 108300  # 1.83: boost::concurrent_flat_map
+# Default compiler search dirs: never pass these as -I (it breaks #include_next).
+_IMPLICIT_INCLUDE_DIRS = {"/usr/include", "/usr/local/include"}
 
-get_target_property(BOOST_FS_INCLUDE Boost::filesystem INTERFACE_INCLUDE_DIRECTORIES)
-get_target_property(BOOST_JSON_INCLUDE Boost::json INTERFACE_INCLUDE_DIRECTORIES)
-get_target_property(BOOST_FS_LOCATION Boost::filesystem LOCATION)
-get_target_property(BOOST_JSON_LOCATION Boost::json LOCATION)
 
-message("BOOST_INCLUDE_DIRS=${BOOST_FS_INCLUDE}")
-get_filename_component(BOOST_LIB_DIR "${BOOST_FS_LOCATION}" DIRECTORY)
-message("BOOST_LIBRARY_DIRS=${BOOST_LIB_DIR}")
-""")
+def _boost_version(include_dir):
+    header = Path(include_dir) / "boost" / "version.hpp"
+    if not header.is_file():
+        return None
+    m = re.search(r"^#define\s+BOOST_VERSION\s+(\d+)", header.read_text(), re.MULTILINE)
+    return int(m.group(1)) if m else None
 
-    result = subprocess.run(
-        ["cmake", "-S", str(cmake_query_dir), "-B", str(cmake_query_dir)],
-        capture_output=True,
-        text=True,
+
+def _fmt_boost(v):
+    return f"{v // 100000}.{v // 100 % 1000}.{v % 100}"
+
+
+def resolve_boost_include_dir():
+    """Pick the Boost header directory: explicit override, vendored copy, system."""
+    explicit = os.getenv("FOUNDRY_BOOST_INCLUDE_DIR")
+    if explicit:
+        candidates = [("FOUNDRY_BOOST_INCLUDE_DIR", explicit)]
+    else:
+        candidates = [("vendored", VENDORED_BOOST_DIR)]
+        if (
+            os.getenv("FOUNDRY_REQUIRE_VENDORED_BOOST")
+            and _boost_version(VENDORED_BOOST_DIR) is None
+        ):
+            raise RuntimeError(
+                "FOUNDRY_REQUIRE_VENDORED_BOOST is set but third_party/boost/boost is missing: "
+                "run tools/release/vendor_boost.sh and commit third_party/boost"
+            )
+        if os.getenv("BOOST_INCLUDEDIR"):
+            candidates.append(("BOOST_INCLUDEDIR", os.environ["BOOST_INCLUDEDIR"]))
+        for env in ("BOOST_ROOT", "CONDA_PREFIX"):
+            if os.getenv(env):
+                candidates.append((env, os.path.join(os.environ[env], "include")))
+        # The prefixes CMake searches for BoostConfig (the CMake fallback) hold the headers too.
+        for prefix in os.getenv("CMAKE_PREFIX_PATH", "").split(os.pathsep):
+            if prefix:
+                candidates.append(("CMAKE_PREFIX_PATH", os.path.join(prefix, "include")))
+        candidates += [("system", "/usr/local/include"), ("system", "/usr/include")]
+
+    rejected = []
+    for origin, d in candidates:
+        v = _boost_version(d)
+        if v is None:
+            continue
+        if v < MIN_BOOST_VERSION:
+            rejected.append(f"{d} ({_fmt_boost(v)})")
+            continue
+        print(f"foundry: Boost {_fmt_boost(v)} headers from {d} ({origin})")
+        return os.path.abspath(d)
+    raise RuntimeError(
+        "Boost >= 1.83 headers not found"
+        + (f"; too old: {', '.join(rejected)}" if rejected else "")
+        + ". Run tools/release/vendor_boost.sh, install Boost headers "
+        "(e.g. apt-get install libboost-dev, conda install -c conda-forge boost-cpp), "
+        "or set FOUNDRY_BOOST_INCLUDE_DIR to the directory containing boost/version.hpp."
     )
-
-    include_dirs = []
-    library_dirs = []
-
-    for line in result.stderr.splitlines():
-        if "BOOST_INCLUDE_DIRS=" in line:
-            dirs = line.split("=", 1)[1].strip()
-            if dirs:
-                include_dirs = [d for d in dirs.split(";") if d]
-        elif "BOOST_LIBRARY_DIRS=" in line:
-            dirs = line.split("=", 1)[1].strip()
-            if dirs:
-                library_dirs = [d for d in dirs.split(";") if d]
-
-    shutil.rmtree(cmake_query_dir, ignore_errors=True)
-
-    return include_dirs, library_dirs
 
 
 def get_compile_flags():
@@ -63,11 +98,46 @@ def get_compile_flags():
     return flags
 
 
-boost_include_dirs, boost_library_dirs = get_boost_paths()
-common_include_dirs = (
-    include_paths(device_type="cuda") + [os.path.join(ROOT_DIR, "include")] + boost_include_dirs
-)
-common_library_dirs = library_paths(device_type="cuda") + boost_library_dirs
+def torch_requirement():
+    """Release wheels pin the exact torch they were built against (foundry.ops
+    uses ATen/c10 internals; SGLang pins torch the same way). Source builds
+    accept the installed torch."""
+    if not WHEEL_BUILD:
+        return "torch"
+    return f"torch=={torch.__version__.split('+')[0]}"
+
+
+def write_build_info(boost_version):
+    """Record the build-time torch/CUDA for foundry._loader's runtime check."""
+    pkg = Path(ROOT_DIR) / "python" / "foundry"
+    text = (pkg / "_build_info.py.in").read_text()
+    for key, value in {
+        "@TORCH_VERSION@": torch.__version__,
+        "@TORCH_CUDA_VERSION@": torch.version.cuda or "",
+        "@BOOST_VERSION@": boost_version,
+    }.items():
+        text = text.replace(key, value)
+    out = pkg / "_build_info.py"
+    if not out.exists() or out.read_text() != text:
+        out.write_text(text)
+
+
+boost_include_dir = resolve_boost_include_dir()
+write_build_info(_fmt_boost(_boost_version(boost_include_dir)))
+common_include_dirs = include_paths(device_type="cuda") + [os.path.join(ROOT_DIR, "include")]
+if boost_include_dir not in _IMPLICIT_INCLUDE_DIRS:
+    common_include_dirs.append(boost_include_dir)
+common_library_dirs = library_paths(device_type="cuda")
+# Link -lcuda against the toolkit stub when present (build containers have no
+# driver); the runtime loads the real libcuda.so.1. Not added to the RPATH.
+if CUDA_HOME and os.path.isfile(os.path.join(CUDA_HOME, "lib64", "stubs", "libcuda.so")):
+    common_library_dirs.append(os.path.join(CUDA_HOME, "lib64", "stubs"))
+
+# libcuda_hook.so sits next to foundry.ops ($ORIGIN). A source build also bakes
+# the torch/CUDA library dirs; a wheel must not (foundry imports torch first).
+ops_rpaths = ["$ORIGIN"]
+if not WHEEL_BUILD:
+    ops_rpaths += library_paths(device_type="cuda")
 
 
 class CustomBuildExt(BuildExtension):
@@ -88,6 +158,7 @@ class CustomBuildExt(BuildExtension):
                 "-B",
                 str(cmake_build_dir),
                 f"-DCMAKE_INSTALL_PREFIX={build_dir}",
+                f"-DFOUNDRY_BOOST_INCLUDE_DIR={boost_include_dir}",
             ]
             + (["-DCMAKE_CXX_FLAGS=-DFOUNDRY_DEBUG"] if os.getenv("FOUNDRY_DEBUG") else [])
         )
@@ -124,6 +195,7 @@ ext_modules = [
             "csrc/CUDAGraph.cpp",
             "csrc/CUDAGraphParallel.cpp",
             "csrc/BinaryGraphIO.cpp",
+            "csrc/boost_json_src.cpp",
         ],
         include_dirs=common_include_dirs,
         library_dirs=common_library_dirs,
@@ -132,17 +204,12 @@ ext_modules = [
             "cxx": ["-O3"] + get_compile_flags(),
             "nvcc": ["-O3"] + get_compile_flags(),
         },
-        extra_link_args=[
-            "-lcuda",
-            "-lboost_filesystem",
-            "-lboost_json",
-            "-Wl,-rpath,$ORIGIN",
-        ]
-        + [f"-Wl,-rpath,{p}" for p in library_paths(device_type="cuda")],
+        extra_link_args=["-lcuda"] + [f"-Wl,-rpath,{p}" for p in ops_rpaths],
     ),
 ]
 
 setup(
+    install_requires=[torch_requirement()],
     cmdclass={"build_ext": CustomBuildExt},
     ext_modules=ext_modules,
 )

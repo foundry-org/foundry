@@ -27,6 +27,7 @@ struct CUDAGeneratorState;
 namespace foundry {
 
 struct BinaryGraphFile;  // forward declaration, defined in BinaryGraphFormat.h
+struct BuildTiming;      // LOAD template-build breakdown, defined in CUDAGraphParallel.cpp
 
 using MempoolId_t = c10::MempoolId_t;
 using CaptureId_t = c10::CaptureId_t;
@@ -67,6 +68,11 @@ struct CUDAGeneratorStateRegistry {
 };
 
 struct CUDAGraph {
+  // LOAD instrumentation: totals over all member materializations (microseconds / calls),
+  // printed with the "[foundry] Phase 2" line.
+  static std::atomic<uint64_t> g_member_update_us;
+  static std::atomic<uint64_t> g_member_inst_us;
+  static std::atomic<uint64_t> g_member_attr_calls;
   CUDAGraph(bool keep_graph = false);
   ~CUDAGraph();
 
@@ -186,6 +192,25 @@ struct CUDAGraph {
   // (called lazily by replay).
   void materialize_on_demand_exec();
 
+  // The two halves of a member's materialize_on_demand_exec, for the LOAD
+  // pipeline: the builder thread rewrites the shared graph to this member
+  // (apply_on_demand_updates, timed into g_member_update_us), the instantiate
+  // thread then instantiates the member's dedicated exec from it.
+  void rewrite_shared_graph_for_member();
+  void instantiate_member_exec();
+
+  // Instantiate with the flags instantiate() uses for a captured graph.
+  static cudaGraphExec_t instantiate_graph_exec(cudaGraph_t graph);
+
+  // LOAD Phase 2, binary archives: build the template's CUgraph from its
+  // .cugraph node table, dependency table and prepared on-demand data
+  // (prepare_on_demand_graph_binary with no shared exec must have run). Adds
+  // the nodes, their attributes (same precedence as build_graph_from_parsed)
+  // and the dependencies; does not instantiate. Fills out_template.
+  static void build_template_graph_binary(const struct BinaryGraphFile& bin_file, CUDAGraph& graph,
+                                          CUcontext ctx, GraphTemplate* out_template,
+                                          BuildTiming* timing);
+
   static GraphLoadResult build_graph_from_parsed(ParsedGraphData&& parsed, CUcontext ctx,
                                                  ReconstructTensorFn reconstruct_fn,
                                                  GraphTemplate* out_template = nullptr);
@@ -212,6 +237,20 @@ struct CUDAGraph {
   // Transfer graph/exec ownership to a SharedGraphExec.
   // After this call, the CUDAGraph no longer owns graph_ or graph_exec_.
   void transfer_to_shared_exec(std::shared_ptr<SharedGraphExec> shared, GraphTemplate&& tmpl);
+
+  // LOAD: grow the driver's graph-exec memory ahead of Phase 2. A graph exec
+  // holds device memory (~3 KB per node on H200); while earlier execs stay
+  // alive, each cuGraphInstantiate has to grow the driver's pool for it, which
+  // is ~3/4 of its cost (restore_bench/graph_api_bench2 section G; ~7 vs ~2 ms
+  // for a 1600-node graph). This instantiates a kernel-only copy of every
+  // archive graph (the non-kernel nodes become empty nodes, same
+  // dependencies; nothing is launched), keeps the execs until all exist, then
+  // destroys them, so the pool holds what Phase 2's execs need and their
+  // instantiates reuse it. Runs on a detached thread. Phase 2 never waits for it:
+  // if it has not finished when Phase 2's instantiate thread starts, it is told to
+  // stop after its current graph and Phase 2 goes on without it. Call after the recorded
+  // binaries are loaded (function handles) and before start_graph_builds.
+  static void start_exec_pool_prewarm(const std::vector<std::string>& json_paths);
 
   // Split load API: start builds early to overlap with weight loading.
   static std::shared_ptr<PendingGraphLoads> start_graph_builds(

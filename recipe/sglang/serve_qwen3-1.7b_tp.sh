@@ -12,6 +12,7 @@
 # on hosts where multicast is unavailable (e.g. no IMEX channels).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/serve_common.sh"   # foundry_select / foundry_serve (plugin route + preflight)
 
 TP_SIZE=${1:?Usage: $0 <tp_size> [--save|--load]}
 MODEL_NAME="Qwen/Qwen3-1.7B"
@@ -21,15 +22,9 @@ MEM_FRACTION_STATIC=0.6
 
 if [[ "$2" == "--save" ]]; then
     FOUNDRY_TOML="${SCRIPT_DIR}/foundry_save.toml"
-    # CUMEM P2P / NVLS multicast cuMemMap with driver-capability flags the
-    # foundry VMM region doesn't carry — pin NCCL to IPC/ring. Foundry runs only.
-    export NCCL_CUMEM_ENABLE=0
-    export NCCL_NVLS_ENABLE=0
     echo "Using foundry SAVE: ${FOUNDRY_TOML}"
 elif [[ "$2" == "--load" ]]; then
     FOUNDRY_TOML="${SCRIPT_DIR}/foundry_load.toml"
-    export NCCL_CUMEM_ENABLE=0
-    export NCCL_NVLS_ENABLE=0
     echo "Using foundry LOAD: ${FOUNDRY_TOML}"
 elif [[ -n "$2" ]]; then
     echo "Usage: $0 <tp_size> [--save|--load]"
@@ -38,26 +33,23 @@ else
     echo "Running without foundry (baseline SGLang)"
 fi
 
-FOUNDRY_ARGS=()
-if [[ -n "${FOUNDRY_TOML:-}" ]]; then
-    FOUNDRY_ARGS+=( --foundry-graph-extension-config-path "${FOUNDRY_TOML}" )
-fi
+# --save/--load: export FOUNDRY_GRAPH_EXTENSION_CONFIG="$FOUNDRY_TOML" after the preflight; baseline: unset it.
+foundry_select "$2" "${FOUNDRY_TOML:-}"
+foundry_baseline_pins   # baseline only: the plugin's collective pins (custom AR off, torch symm-mem on), see serve_common.sh
 
 # LD_PRELOAD of libcuda_hook.so is set by foundry's setup_ld_preload_env at
 # worker spawn time (path auto-detected; propagated to every rank's scheduler
-# child). Assumes foundry + the sglang fork are pip-installed (see README)
+# child). Assumes foundry + sglang are pip-installed (see README)
 # so both import without PYTHONPATH.
 
-sglang serve \
+foundry_serve "$2" sglang serve \
     --model-path "$MODEL_NAME" \
     --trust-remote-code \
     --host "$HOST" --port "$PORT" \
     --tp-size "$TP_SIZE" \
-    --disable-custom-all-reduce \
-    --enable-torch-symm-mem \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --disable-radix-cache \
     --attention-backend flashinfer \
-    --cuda-graph-max-bs 128 \
-    "${FOUNDRY_ARGS[@]}" \
+    --cuda-graph-max-bs-decode 128 \
+    $FOUNDRY_BASELINE_ARGS \
     ${SGL_EXTRA_ARGS:-}

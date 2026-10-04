@@ -12,6 +12,7 @@
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/driver_api.h>
+#include <algorithm>
 #include <atomic>
 #include <limits>
 #include <mutex>
@@ -471,20 +472,26 @@ void CUDAGraph::instantiate() {
                 "instantiate() is intended to be called by the user only when keep_graph=true");
     AT_CUDA_CHECK(cudaGraphExecDestroy(graph_exec_));
   }
+  graph_exec_ = instantiate_graph_exec(graph_);
+  has_graph_exec_ = true;
+}
+
+cudaGraphExec_t CUDAGraph::instantiate_graph_exec(cudaGraph_t graph) {
+  cudaGraphExec_t exec = nullptr;
 #if !defined(USE_ROCM) || ROCM_VERSION >= 60200
   int version = 0;
   AT_CUDA_CHECK(cudaDriverGetVersion(&version));
   if (version < 11040) {
 #endif
 #if (defined(CUDA_VERSION) && CUDA_VERSION >= 12000)
-    cudaError_t inst_err = cudaGraphInstantiate(&graph_exec_, graph_, 0);
+    cudaError_t inst_err = cudaGraphInstantiate(&exec, graph, 0);
     if (inst_err != cudaSuccess) {
       fprintf(stderr, "[foundry INSTANTIATE ERROR] cudaGraphInstantiate FAILED with error %d: %s\n",
               inst_err, cudaGetErrorString(inst_err));
       AT_CUDA_CHECK(inst_err);
     }
 #else
-  cudaError_t inst_err = cudaGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0);
+  cudaError_t inst_err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
   if (inst_err != cudaSuccess) {
     fprintf(stderr, "[foundry INSTANTIATE ERROR] cudaGraphInstantiate FAILED with error %d: %s\n",
             inst_err, cudaGetErrorString(inst_err));
@@ -493,8 +500,8 @@ void CUDAGraph::instantiate() {
 #endif
 #if !defined(USE_ROCM) || ROCM_VERSION >= 60200
   } else {
-    cudaError_t inst_err = cudaGraphInstantiateWithFlags(&graph_exec_, graph_,
-                                                         cudaGraphInstantiateFlagAutoFreeOnLaunch);
+    cudaError_t inst_err =
+        cudaGraphInstantiateWithFlags(&exec, graph, cudaGraphInstantiateFlagAutoFreeOnLaunch);
     if (inst_err != cudaSuccess) {
       fprintf(
           stderr,
@@ -504,8 +511,12 @@ void CUDAGraph::instantiate() {
     }
   }
 #endif
-  has_graph_exec_ = true;
+  return exec;
 }
+
+std::atomic<uint64_t> CUDAGraph::g_member_update_us{0};
+std::atomic<uint64_t> CUDAGraph::g_member_inst_us{0};
+std::atomic<uint64_t> CUDAGraph::g_member_attr_calls{0};
 
 void CUDAGraph::apply_on_demand_updates() {
   auto& shared = on_demand_data_->shared_exec;
@@ -515,6 +526,32 @@ void CUDAGraph::apply_on_demand_updates() {
     switch (u.type) {
       case OnDemandNodeUpdate::Kernel: {
         // Update kernel params on the graph node (not exec)
+        // A member may launch a different cluster shape than its template (deep_gemm picks the
+        // cluster size by M; FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0 puts such graphs in one group).
+        // cuGraphKernelNodeSetParams validates the new grid against the node's *current* cluster
+        // dims, so neutralise them to 1x1x1 first when they differ; the member's own dims are
+        // applied right after the params update below.
+        if (u.kernel_attrs.has_cluster_dim) {
+          CUkernelNodeAttrValue cur;
+          memset(&cur, 0, sizeof(cur));
+          const unsigned wx = u.kernel_attrs.clusterDimX > 0 ? u.kernel_attrs.clusterDimX : 1;
+          const unsigned wy = u.kernel_attrs.clusterDimY > 0 ? u.kernel_attrs.clusterDimY : 1;
+          const unsigned wz = u.kernel_attrs.clusterDimZ > 0 ? u.kernel_attrs.clusterDimZ : 1;
+          if (cuGraphKernelNodeGetAttribute(node, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION,
+                                            &cur) == CUDA_SUCCESS &&
+              (cur.clusterDim.x != wx || cur.clusterDim.y != wy || cur.clusterDim.z != wz)) {
+            CUkernelNodeAttrValue one;
+            memset(&one, 0, sizeof(one));
+            one.clusterDim.x = one.clusterDim.y = one.clusterDim.z = 1;
+            g_member_attr_calls++;
+            cuGraphKernelNodeSetAttribute(node, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &one);
+          }
+        }
+        ensure_dynamic_smem_optin(u.kernel_params, capture_dev_, "ON-DEMAND");
+        if (u.kernel_attrs.has_cluster_dim)
+          ensure_cluster_size_optin(u.kernel_params, capture_dev_, u.kernel_attrs.clusterDimX,
+                                    u.kernel_attrs.clusterDimY, u.kernel_attrs.clusterDimZ,
+                                    "ON-DEMAND");
         CUresult sp = cuGraphKernelNodeSetParams(node, &u.kernel_params);
         if (sp != CUDA_SUCCESS && u.kernel_params.kern && !u.kernel_params.func) {
           // Re-targeting a node to another CUkernel can be rejected; retry
@@ -522,8 +559,11 @@ void CUDAGraph::apply_on_demand_updates() {
           CUDA_KERNEL_NODE_PARAMS alt = u.kernel_params;
           alt.kern = nullptr;
           if (cuKernelGetFunction(&alt.func, u.kernel_params.kern) == CUDA_SUCCESS && alt.func) {
-            cuFuncSetAttribute(alt.func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                               alt.sharedMemBytes);
+            ensure_dynamic_smem_optin(alt, capture_dev_, "ON-DEMAND");
+            if (u.kernel_attrs.has_cluster_dim)
+              ensure_cluster_size_optin(alt, capture_dev_, u.kernel_attrs.clusterDimX,
+                                        u.kernel_attrs.clusterDimY, u.kernel_attrs.clusterDimZ,
+                                        "ON-DEMAND");
             CUresult sp2 = cuGraphKernelNodeSetParams(node, &alt);
             fprintf(stderr,
                     "[foundry ON-DEMAND] graph %d node %zu: kern-based SetParams failed (%d), "
@@ -562,6 +602,7 @@ void CUDAGraph::apply_on_demand_updates() {
           attr.clusterDim.x = a.clusterDimX > 0 ? a.clusterDimX : 1;
           attr.clusterDim.y = a.clusterDimY > 0 ? a.clusterDimY : 1;
           attr.clusterDim.z = a.clusterDimZ > 0 ? a.clusterDimZ : 1;
+          g_member_attr_calls++;
           C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
               node, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &attr));
         }
@@ -571,6 +612,7 @@ void CUDAGraph::apply_on_demand_updates() {
           attr.preferredClusterDim.x = a.preferredClusterDimX;
           attr.preferredClusterDim.y = a.preferredClusterDimY;
           attr.preferredClusterDim.z = a.preferredClusterDimZ;
+          g_member_attr_calls++;
           C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
               node, CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION, &attr));
         }
@@ -579,6 +621,7 @@ void CUDAGraph::apply_on_demand_updates() {
           memset(&attr, 0, sizeof(attr));
           attr.clusterSchedulingPolicyPreference =
               static_cast<CUclusterSchedulingPolicy>(a.clusterSchedulingPolicy);
+          g_member_attr_calls++;
           C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
               node, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, &attr));
         }
@@ -608,6 +651,7 @@ void CUDAGraph::apply_on_demand_updates() {
           memset(&attr, 0, sizeof(attr));
           attr.memSyncDomainMap.default_ = a.memSyncDomainMapDefault;
           attr.memSyncDomainMap.remote = a.memSyncDomainMapRemote;
+          g_member_attr_calls++;
           C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
               node, CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN_MAP, &attr));
         }
@@ -615,6 +659,7 @@ void CUDAGraph::apply_on_demand_updates() {
           CUkernelNodeAttrValue attr;
           memset(&attr, 0, sizeof(attr));
           attr.sharedMemCarveout = a.sharedMemCarveout;
+          g_member_attr_calls++;
           C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
               node, CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, &attr));
         }
@@ -660,12 +705,28 @@ void CUDAGraph::materialize_on_demand_exec() {
   // Member: rewrite the shared graph's node params to this graph and
   // instantiate a dedicated exec. Execs are snapshots, so the template's exec
   // and earlier members' execs are untouched; the shared graph is a builder.
-  // Called from the first replay, not at load; ~5 ms for a ~1000-node graph.
+  // ~5 ms for a ~1000-node graph; totals are printed with the Phase 2 line.
+  rewrite_shared_graph_for_member();
+  instantiate_member_exec();
+}
+
+void CUDAGraph::rewrite_shared_graph_for_member() {
+  auto t_upd = std::chrono::steady_clock::now();
   apply_on_demand_updates();
-  shared->current_params_id = on_demand_data_->graph_id;
+  on_demand_data_->shared_exec->current_params_id = on_demand_data_->graph_id;
+  g_member_update_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t_upd)
+                            .count();
+}
+
+void CUDAGraph::instantiate_member_exec() {
+  auto& shared = on_demand_data_->shared_exec;
+  auto t_inst = std::chrono::steady_clock::now();
   cudaGraphExec_t exec = nullptr;
   cudaError_t inst_err =
       cudaGraphInstantiate(&exec, reinterpret_cast<cudaGraph_t>(shared->graph), 0);
+  auto t_end = std::chrono::steady_clock::now();
+  g_member_inst_us += std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_inst).count();
   if (inst_err != cudaSuccess) {
     fprintf(stderr,
             "[foundry ON-DEMAND ERROR] cudaGraphInstantiate FAILED for graph %d (%s): %d (%s)\n",
@@ -1465,14 +1526,21 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
       params["kernel_source_binary_hash"] = binary_hash;
 
       json::object func_attrs;
-      func_attrs["max_dynamic_shared_size_bytes"] = static_cast<int>(metadata.sharedMemBytes);
 
+      // The function's dynamic-smem cap as it stands at capture. It is a
+      // function attribute, not a node property: several kernels launch with
+      // batch-dependent dynamic smem (FlashMLA's metadata kernel, DeepGEMM's
+      // fp8 GEMMs), and recording this node's own sharedMemBytes here made
+      // LOAD lower the shared cap under another graph's node.
+      int max_dynamic_shared = 0;
       int preferred_carveout = 0;
       int cluster_scheduling = 0;
       int cluster_width = 0;
       int cluster_height = 0;
       int cluster_depth = 0;
       if (kern != nullptr) {
+        cuKernelGetAttribute(&max_dynamic_shared, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                             kern, capture_dev_);
         cuKernelGetAttribute(&preferred_carveout,
                              CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, kern,
                              capture_dev_);
@@ -1486,6 +1554,8 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
         cuKernelGetAttribute(&cluster_depth, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH, kern,
                              capture_dev_);
       } else if (func != nullptr) {
+        cuFuncGetAttribute(&max_dynamic_shared, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                           func);
         cuFuncGetAttribute(&preferred_carveout, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
                            func);
         cuFuncGetAttribute(&cluster_scheduling,
@@ -1494,6 +1564,10 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
         cuFuncGetAttribute(&cluster_height, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT, func);
         cuFuncGetAttribute(&cluster_depth, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH, func);
       }
+      // The cap cannot be below what this node launched with; a driver that
+      // reports 0 for a function without an explicit opt-in is floored there.
+      func_attrs["max_dynamic_shared_size_bytes"] =
+          std::max(max_dynamic_shared, static_cast<int>(metadata.sharedMemBytes));
       func_attrs["preferred_shared_memory_carveout"] = preferred_carveout;
       func_attrs["cluster_scheduling_policy_preference"] = cluster_scheduling;
       // Save cluster dimensions - these are required when reconstructing the graph for kernels that
@@ -1626,8 +1700,21 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
             cdz = fa.at("required_cluster_depth").to_number<unsigned int>();
         }
         if (cdx > 0 || cdy > 0 || cdz > 0) {
-          topology_key +=
-              ":C" + std::to_string(cdx) + "_" + std::to_string(cdy) + "_" + std::to_string(cdz);
+          // FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0: key only records *whether* a node launches
+          // clusters, not the dims. Safe now that every member instantiates its own exec after
+          // apply_on_demand_updates() sets its cluster dims per node (no cuGraphExecUpdate on the
+          // path); it merges the groups that differ only by deep_gemm's per-M cluster size
+          // (EP2: 26 -> ~3 templates). Default keeps the exact dims (previous behaviour).
+          static const bool cluster_values_in_key = [] {
+            const char* e = std::getenv("FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES");
+            return !(e && (std::string(e) == "0" || std::string(e) == "false"));
+          }();
+          if (cluster_values_in_key) {
+            topology_key +=
+                ":C" + std::to_string(cdx) + "_" + std::to_string(cdy) + "_" + std::to_string(cdz);
+          } else {
+            topology_key += ":C";
+          }
         } else {
           topology_key += ":0";
         }
@@ -1970,47 +2057,11 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
             cluster_depth = attr_depth;
         }
 
-        if (std::holds_alternative<CUkernel>(func_handle_variant)) {
-          CUkernel kern = std::get<CUkernel>(func_handle_variant);
-          if (max_shared > 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared,
-                                     kern, graph->capture_dev_));
-          }
-          if (preferred_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(
-                cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
-                                     preferred_carveout, kern, graph->capture_dev_));
-          }
-          // NOTE: Skip cluster_scheduling on load - it can cause cudaErrorInvalidClusterSize
-          // if the kernel's compiled cluster requirements don't match the saved preference.
-          // The preference is just a hint and the kernel will still work without it.
-          // if (cluster_scheduling > 0) {
-          //   C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(
-          //       CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, cluster_scheduling, kern,
-          //       graph->capture_dev_));
-          // }
-        } else {
-          CUfunction func = std::get<CUfunction>(func_handle_variant);
-          if (max_shared > 0) {
-            C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_shared));
-          }
-          if (preferred_carveout >= 0) {
-            C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-                func, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, preferred_carveout));
-          }
-          // NOTE: Skip cluster_scheduling on load - see comment above
-          // if (cluster_scheduling > 0) {
-          //   C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(
-          //       func, CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE,
-          //       cluster_scheduling));
-          // }
-        }
-        // NOTE: We do not set CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH,
-        // CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH,
-        // and CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED because these are
-        // kernel properties may not be changed at runtime.
+        apply_saved_function_attributes(func_handle_variant, graph->capture_dev_, max_shared,
+                                        preferred_carveout, "LOAD");
+        // NOTE: CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_{WIDTH,HEIGHT,DEPTH} are not set: a compiled
+        // cluster cannot be changed at runtime. NON_PORTABLE_CLUSTER_SIZE_ALLOWED can, and is set
+        // by add_restored_kernel_node when the cluster exceeds the portable size.
       }
 
       const json::array& kernel_params_array = params.at("kernelParams").as_array();
@@ -2094,7 +2145,9 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
         node_params.extra = extra_config.data();
       }
 
-      CUresult kernel_result = cuGraphAddKernelNode(&cuNode, cuGraph, nullptr, 0, &node_params);
+      CUresult kernel_result =
+          add_restored_kernel_node(&cuNode, cuGraph, node_params, graph->capture_dev_,
+                                   cluster_width, cluster_height, cluster_depth, "LOAD");
       if (kernel_result != CUDA_SUCCESS) {
         std::string function_name = params.at("function_name").as_string().c_str();
         fprintf(stderr,
@@ -2389,6 +2442,112 @@ std::vector<GraphLoadResult> CUDAGraph::finish_graph_loads(
 GraphLoadResult CUDAGraph::finish_one_graph_load(std::shared_ptr<PendingGraphLoads> pending,
                                                  size_t index) {
   return finish_one_graph_load_impl(std::move(pending), index, reconstruct_tensor_from_metadata);
+}
+
+// ---- Kernel function attributes (contract in CUDAGraphInternal.h) ----------
+
+namespace {
+
+std::mutex g_smem_cap_mutex;
+// CUkernel / CUfunction handle -> MAX_DYNAMIC_SHARED_SIZE_BYTES this process set on it.
+std::unordered_map<const void*, int> g_smem_cap_high_water;
+
+// Raise one handle's cap to `need` unless it is already there. Caller holds
+// g_smem_cap_mutex. A failed set is reported and leaves the mark unchanged so
+// the next node with the same need retries.
+template <typename SetFn>
+void raise_smem_cap_locked(const void* key, int need, SetFn&& set, const char* where) {
+  int& cap = g_smem_cap_high_water[key];
+  if (cap >= need) {
+    return;
+  }
+  CUresult r = set();
+  if (r != CUDA_SUCCESS) {
+    fprintf(stderr, "[foundry %s] setting MAX_DYNAMIC_SHARED_SIZE_BYTES=%d failed: %d\n", where,
+            need, (int)r);
+    return;
+  }
+  cap = need;
+}
+
+void raise_dynamic_smem_cap(CUkernel kern, CUfunction func, CUdevice dev, int need,
+                            const char* where) {
+  if (need <= 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_smem_cap_mutex);
+  if (kern != nullptr) {
+    raise_smem_cap_locked(
+        kern, need,
+        [&] {
+          return cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, need, kern,
+                                      dev);
+        },
+        where);
+    CUfunction ctx_func = nullptr;
+    CUresult r = cuKernelGetFunction(&ctx_func, kern);
+    if (r != CUDA_SUCCESS || ctx_func == nullptr) {
+      fprintf(stderr,
+              "[foundry %s] cuKernelGetFunction failed (%d): dynamic smem cap %d not applied to "
+              "the per-context function\n",
+              where, (int)r, need);
+    } else {
+      raise_smem_cap_locked(
+          ctx_func, need,
+          [&] {
+            return cuFuncSetAttribute(ctx_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                      need);
+          },
+          where);
+    }
+  }
+  if (func != nullptr) {
+    raise_smem_cap_locked(
+        func, need,
+        [&] {
+          return cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, need);
+        },
+        where);
+  }
+}
+
+}  // namespace
+
+void apply_saved_function_attributes(const std::variant<CUfunction, CUkernel>& handle, CUdevice dev,
+                                     int max_dynamic_shared_size_bytes,
+                                     int preferred_shared_memory_carveout, const char* where) {
+  // CLUSTER_SCHEDULING_POLICY_PREFERENCE is recorded but not reapplied: it is
+  // only a hint and fails with cudaErrorInvalidClusterSize when the kernel's
+  // compiled cluster requirements differ from the saved preference.
+  if (std::holds_alternative<CUkernel>(handle)) {
+    CUkernel kern = std::get<CUkernel>(handle);
+    raise_dynamic_smem_cap(kern, nullptr, dev, max_dynamic_shared_size_bytes, where);
+    if (preferred_shared_memory_carveout >= 0) {
+      C10_CUDA_DRIVER_CHECK(cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                                                 preferred_shared_memory_carveout, kern, dev));
+    }
+  } else {
+    CUfunction func = std::get<CUfunction>(handle);
+    raise_dynamic_smem_cap(nullptr, func, dev, max_dynamic_shared_size_bytes, where);
+    if (preferred_shared_memory_carveout >= 0) {
+      C10_CUDA_DRIVER_CHECK(cuFuncSetAttribute(func,
+                                               CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                                               preferred_shared_memory_carveout));
+    }
+  }
+}
+
+void ensure_dynamic_smem_optin(const CUDA_KERNEL_NODE_PARAMS& params, CUdevice dev,
+                               const char* where) {
+  raise_dynamic_smem_cap(params.kern, params.func, dev, static_cast<int>(params.sharedMemBytes),
+                         where);
+}
+
+CUresult add_restored_kernel_node(CUgraphNode* node, CUgraph graph,
+                                  const CUDA_KERNEL_NODE_PARAMS& params, CUdevice dev, unsigned cx,
+                                  unsigned cy, unsigned cz, const char* where) {
+  ensure_dynamic_smem_optin(params, dev, where);
+  return add_kernel_node_cluster_optin(node, graph, params, dev, cx, cy, cz, where);
 }
 
 }  // namespace foundry

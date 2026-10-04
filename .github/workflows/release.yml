@@ -1,0 +1,237 @@
+# Build foundry-core wheels and the sdist; on a v* tag (or a manual run with
+# publish=yes) upload the PyPI-pair wheels + sdist to PyPI through trusted
+# publishing and attach every wheel to a GitHub Release. See docs/release.md.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      torch:
+        description: "torch version to build against, e.g. 2.13.0 (empty: every pair in BUILD_PAIRS)"
+        required: false
+        default: ""
+      cuda:
+        description: "torch CUDA tag, e.g. cu130 (required with torch)"
+        required: false
+        default: ""
+      publish:
+        description: "Publish to PyPI and create the GitHub Release"
+        type: choice
+        options: ["no", "yes"]
+        default: "no"
+
+permissions:
+  contents: read
+
+env:
+  # Release matrix: PYTHONS x BUILD_PAIRS. The FIRST pair is the PyPI pair:
+  # its wheels carry the plain version (foundry-core X.Y.Z, Requires-Dist
+  # torch==A.B.*) and are uploaded to PyPI. Every other pair is built with a
+  # local version (X.Y.Z+cuNNN.torchA.B) and attached to the GitHub Release
+  # only, since PyPI rejects local versions. "image" is optional; the default
+  # is pytorch/manylinux2_28-builder:cuda<major.minor of the cuda tag>.
+  PYTHONS: '["3.10", "3.11", "3.12", "3.13"]'
+  BUILD_PAIRS: '[{"torch": "2.13.0", "cuda": "cu130"}]'
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      publish: ${{ steps.plan.outputs.publish }}
+      pypi_publish: ${{ steps.plan.outputs.pypi_publish }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the vendored Boost headers
+        run: |
+          if [ ! -f third_party/boost/boost/version.hpp ]; then
+            echo "::error::third_party/boost is not populated. Run tools/release/vendor_boost.sh and commit third_party/boost before releasing (see docs/release.md)."
+            exit 1
+          fi
+          grep -m1 'define BOOST_VERSION ' third_party/boost/boost/version.hpp
+      - name: Compute the build matrix
+        id: plan
+        env:
+          IN_TORCH: ${{ inputs.torch }}
+          IN_CUDA: ${{ inputs.cuda }}
+          IN_PUBLISH: ${{ inputs.publish }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, tomllib
+
+          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          is_tag = os.environ["EVENT"] == "push" and os.environ["REF"].startswith("refs/tags/v")
+          if is_tag and os.environ["REF_NAME"] != f"v{version}":
+              print(f"::error::tag {os.environ['REF_NAME']} does not match pyproject version {version}")
+              sys.exit(1)
+
+          pythons = json.loads(os.environ["PYTHONS"])
+          pairs = json.loads(os.environ["BUILD_PAIRS"])
+          pypi_pair = (pairs[0]["torch"], pairs[0]["cuda"])
+          torch, cuda = os.environ.get("IN_TORCH", ""), os.environ.get("IN_CUDA", "")
+          if torch or cuda:
+              if not (torch and cuda):
+                  print("::error::give both torch and cuda, or neither")
+                  sys.exit(1)
+              pairs = [{"torch": torch, "cuda": cuda}]
+
+          include = []
+          for pair in pairs:
+              digits = pair["cuda"].removeprefix("cu")
+              image = pair.get("image") or f"pytorch/manylinux2_28-builder:cuda{digits[:-1]}.{digits[-1]}"
+              pypi = (pair["torch"], pair["cuda"]) == pypi_pair
+              major_minor = ".".join(pair["torch"].split(".")[:2])
+              local = "" if pypi else f"{pair['cuda']}.torch{major_minor}"
+              for py in pythons:
+                  include.append(dict(python=py, torch=pair["torch"], cuda=pair["cuda"],
+                                      image=image, pypi=pypi, local_version=local))
+
+          publish = is_tag or os.environ.get("IN_PUBLISH") == "yes"
+          # PyPI gets the plain-version pair only; a manual build of another
+          # pair publishes to the GitHub Release alone.
+          pypi_publish = publish and any(e["pypi"] for e in include)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"matrix={json.dumps({'include': include})}\n")
+              out.write(f"publish={'true' if publish else 'false'}\n")
+              out.write(f"pypi_publish={'true' if pypi_publish else 'false'}\n")
+              out.write(f"version={version}\n")
+          print(json.dumps(include, indent=1), "publish:", publish, "pypi:", pypi_publish)
+          PY
+
+  sdist:
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the sdist
+        # setup.py imports torch and constructs the CUDAExtension; an sdist
+        # compiles nothing, so a CPU torch and a placeholder CUDA_HOME suffice.
+        run: |
+          python -m pip install -U pip build "setuptools>=80" wheel "cmake>=4.0" ninja
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          CUDA_HOME=/nonexistent-cuda python -m build --sdist --no-isolation
+      - name: Check the sdist contents
+        run: |
+          tar tzf dist/foundry_core-*.tar.gz > sdist.txt
+          for f in CMakeLists.txt csrc/hook.cpp csrc/boost_json_src.cpp include/hook.h \
+                   third_party/boost/boost/version.hpp third_party/boost/LICENSE_1_0.txt \
+                   python/foundry/_build_info.py.in python/foundry_sglang_plugin.py; do
+            grep -q "/$f\$" sdist.txt || { echo "::error::sdist is missing $f"; exit 1; }
+          done
+          if grep -E '\.so$|/_build_info\.py$' sdist.txt; then
+            echo "::error::sdist contains build outputs"; exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  wheels:
+    needs: plan
+    name: wheel py${{ matrix.python }} torch${{ matrix.torch }} ${{ matrix.cuda }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space for the builder image
+        # The pytorch manylinux builder image is ~8 GB compressed; torch is
+        # downloaded into it as well. It runs through `docker run` in the
+        # next step (not `container:`) so this cleanup happens before the pull.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+      - name: Build, repair, check and smoke-test the wheel
+        env:
+          FOUNDRY_BUILDER_IMAGE: ${{ matrix.image }}
+          MAX_JOBS: "4"
+          LOCAL_VERSION: ${{ matrix.local_version }}
+        run: |
+          extra=()
+          if [ -n "$LOCAL_VERSION" ]; then extra=(--local-version "$LOCAL_VERSION"); fi
+          tools/release/build_wheel.sh --docker \
+            --python "${{ matrix.python }}" --torch "${{ matrix.torch }}" --cuda "${{ matrix.cuda }}" \
+            --out wheelhouse "${extra[@]}"
+          ls -l wheelhouse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.pypi && 'pypi' || 'ghrelease' }}-py${{ matrix.python }}-torch${{ matrix.torch }}-${{ matrix.cuda }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, sdist, wheels]
+    if: needs.plan.outputs.pypi_publish == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/foundry-core/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-pypi-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - name: List the PyPI upload
+        run: |
+          ls -l dist
+          if ls dist/*.whl | grep -F '+'; then
+            echo "::error::a local-version wheel reached the PyPI upload"; exit 1
+          fi
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  release:
+    needs: [plan, sdist, wheels, publish]
+    # Runs after the PyPI upload, or without it when only a non-PyPI pair was built.
+    if: >-
+      always() && needs.plan.outputs.publish == 'true'
+      && needs.sdist.result == 'success' && needs.wheels.result == 'success'
+      && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          ls -l dist
+          cat > notes.md <<NOTES
+          foundry-core $VERSION. Release notes: RELEASE.md in this tag.
+
+          PyPI wheels (\`pip install foundry-core==$VERSION\`) are built for the first pair of
+          \`$BUILD_PAIRS\` (CPython 3.10-3.13, manylinux_2_28 x86_64). Wheels with a local version
+          (\`+cuNNN.torchA.B\`) target other torch/CUDA pairs: install them by URL from this page.
+          foundry.ops only loads with the torch major.minor and CUDA major it was built for.
+          NOTES
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --title "foundry-core $VERSION" \
+              --notes-file notes.md --target "$GITHUB_SHA"
+          fi

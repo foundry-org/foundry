@@ -65,7 +65,7 @@ flowchart LR
 - **Modules / libraries.** As device code is loaded, the fatbin bytes and the `entry_name → CUfunction` table are recorded.
 - **Captured graphs.** Each captured `CUgraph` is serialized and then grouped with other graphs that share the same topology (same kernels, dependency DAG and cluster dimensions; they differ only in kernel parameters). One graph per group is kept as the **template**; the rest are stored as **on-demand members** that carry only their per-node kernel parameters.
 
-**SAVE** writes all three pieces to an archive. **LOAD** pre-maps the same VMM range, re-loads the same modules from the packed fatbins, builds each template's `CUgraph` node by node once, and then produces every member by rewriting the template's node parameters and instantiating a **dedicated** `CUgraphExec` (eager by default). No graph is ever mutated after instantiation, so restored graphs replay at native speed; kernel handles embedded in the captured graphs resolve to the same device addresses they had at SAVE time. See [`docs/graph-templates.md`](docs/graph-templates.md) for the design and measurements.
+**SAVE** writes all three pieces to an archive. **LOAD** pre-maps the same VMM range, re-loads the same modules from the packed fatbins, builds each template's `CUgraph` node by node once, and then produces every member by rewriting the template's node parameters, either into a **dedicated** `CUgraphExec` per member (default, eager or lazy) or into one shared exec per template switched with `cuGraphExecUpdate`. Either way restored graphs replay at native speed; kernel handles embedded in the captured graphs resolve to the same device addresses they had at SAVE time. See [`docs/graph-templates.md`](docs/graph-templates.md) for the design and measurements.
 
 ## Inference-Engine Integrations
 
@@ -93,7 +93,7 @@ windows). Every SGLang configuration is validated with the full decode-graph set
 (batch sizes 1..256) for restore time, per-token latency and greedy-output
 equality against unmodified SGLang; see [`recipe/sglang/README.md`](recipe/sglang/README.md#validation).
 
-The adapted SGLang fork is published at [`foundry-org/sglang`](https://github.com/foundry-org/sglang), branch `foundry` (v0.0.3 pairs with commit `f1d688e52`; the 0.0.2-era integration stays on `foundry-0.0.2`). The vLLM and TensorRT-LLM forks will follow at `foundry-org/vllm` and `foundry-org/TensorRT-LLM`.
+The adapted SGLang fork is published at [`foundry-org/sglang`](https://github.com/foundry-org/sglang), branch `foundry` (current head `6272eb04c5` = upstream `main` 03ea13a545 + one integration commit; the v0.0.3 pairing `f1d688e52` is kept as `foundry-0.0.3`, the 0.0.2-era integration on `foundry-0.0.2`). The vLLM and TensorRT-LLM forks will follow at `foundry-org/vllm` and `foundry-org/TensorRT-LLM`.
 
 ### Performance
 
@@ -118,28 +118,57 @@ See [ROADMAP.md](ROADMAP.md) for the full development plan and progress.
 
 ## Requirements
 
-- CMake 4.0+
-- PyTorch 2.9.0+
-- CUDA Driver 12.0+
-- Boost 1.83.0+
-
-If you are using a conda environment, you can install the requirements with the following command:
-
-```bash
-conda install -c conda-forge boost-cpp boost
-```
+- Linux x86_64, NVIDIA driver with CUDA 12.0+ (the driver's `libcuda.so.1` is loaded at runtime)
+- PyTorch: `foundry.ops` is a torch C++ extension bound to the torch it was built
+  with (major.minor and CUDA major), like sglang-kernel or flashinfer. Importing
+  it under another torch raises a readable error.
 
 ## Installation
 
+Prebuilt wheels are published to PyPI as **`foundry-core`** (the import name
+is `foundry`). One torch/CUDA pairing per release line:
+
+| foundry-core | torch | CUDA | CPython | Platform |
+|---|---|---|---|---|
+| 0.1.x | 2.13 (`torch==2.13.*`, cu130 build) | 13.0 | 3.10-3.13 | manylinux_2_28 x86_64 |
+
 ```bash
-pip install cmake # make sure cmake 4.0.0 +
-# re-enter env
-conda deactivate 
-conda activate xxx
-# Torch 2.11 with CUDA 13.0
-pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
+pip install "foundry-core>=0.1.0,<0.2"
+python -c "import foundry; print(foundry.__version__)"
+```
+
+The wheel ships `foundry/ops.*.so` and `foundry/libcuda_hook.so` (the hook
+SGLang/vLLM preload) and registers the SGLang plugin entry point. No Boost or
+other C++ runtime dependency is needed. Wheels for other torch/CUDA pairs, when
+built, are attached to the [GitHub Release](https://github.com/foundry-org/foundry/releases)
+with a local version (`0.1.0+cu128.torch2.12`) and install by URL.
+
+### From source
+
+Needed for any other torch, or for development. Requirements:
+
+- CMake 4.0+ and ninja (`pip install "cmake>=4.0" ninja` if the system ones are older)
+- the torch you will run with, already installed (Foundry compiles against it; rebuild after changing torch)
+- CUDA Toolkit with `nvcc` (CUDA 12+; CUDA 13 with torch cu130)
+- Boost headers, header-only (nothing is linked): the vendored copy in
+  `third_party/boost` (populated by `tools/release/vendor_boost.sh`), or a
+  system Boost >= 1.83 (Ubuntu 24.04: `apt-get install libboost-dev`; conda:
+  `conda install -c conda-forge boost-cpp`; or point `FOUNDRY_BOOST_INCLUDE_DIR`
+  at the directory that contains `boost/version.hpp`)
+
+```bash
+pip install "cmake>=4.0" ninja
+# Torch 2.13 with CUDA 13.0
+pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
 pip install -e . --no-build-isolation
 ```
+
+`--no-build-isolation` matters: an isolated build compiles against whatever
+torch pip resolves, not the one in your environment. From PyPI's sdist into
+an existing environment: `pip install --no-build-isolation --no-binary foundry-core foundry-core`.
+
+Release process (vendoring Boost, tagging, trusted publishing): [`docs/release.md`](docs/release.md).
 
 ### Debugging
 

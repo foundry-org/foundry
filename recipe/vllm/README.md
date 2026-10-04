@@ -46,7 +46,7 @@ The recipes assume the standard workspace layout — `vllm/` (the foundry-org vL
 ```bash
 conda create -p venv/ python=3.12
 conda activate venv/
-conda install -c conda-forge boost-cpp boost     # foundry C++ deps
+conda install -c conda-forge boost-cpp          # Boost headers for the foundry source build (skip if third_party/boost is vendored)
 pip install cmake                                 # must be cmake 4.0.0+; re-enter the venv to verify
 pip install uv
 ```
@@ -83,16 +83,9 @@ pytest tests/
 cd ..
 ```
 
-If `pytest` fails with `ImportError: libboost_json.so.1.85.0: cannot open shared object file`, the conda boost path is missing from `LD_LIBRARY_PATH`:
-
-```bash
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-
-# Or make it a venv hook so every activate picks it up:
-mkdir -p $CONDA_PREFIX/etc/conda/activate.d
-echo 'export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH' \
-  > $CONDA_PREFIX/etc/conda/activate.d/ld_path.sh
-```
+Foundry uses Boost header-only (since 0.1.0), so no Boost shared library has to be on
+`LD_LIBRARY_PATH`. This torch 2.11 env needs the source build: the `foundry-core` PyPI wheels
+are built for torch 2.13 / cu130 and refuse to import under another torch.
 
 ### 4. (EP scripts only) Build NVSHMEM for DeepEP
 

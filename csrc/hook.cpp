@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <cassert>
 #include <atomic>
 #include <mutex>
@@ -23,19 +24,22 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <cstddef>
 #include <cerrno>
 #include <thread>
+#include <chrono>
+#include <filesystem>
 #include <boost/unordered/concurrent_flat_map.hpp>
-#include <boost/filesystem.hpp>
 #include <boost/crc.hpp>
 #include <boost/format.hpp>
 #include <boost/json.hpp>
 #include "hook.h"
 
-namespace fs = boost::filesystem;
+namespace fs = std::filesystem;
 
 typedef void* (*fp_dlsym)(void*, const char*);
 static fp_dlsym real_dlsym = nullptr;
@@ -90,6 +94,7 @@ enum CudaDriverAPIIndex {
   CUDA_ENTRY_cuModuleGetGlobal,
   CUDA_ENTRY_cuLibraryGetGlobal,
   CUDA_ENTRY_cuPointerSetAttribute,
+  CUDA_ENTRY_cuCtxSynchronize,
   CUDA_ENTRY_END
 };
 
@@ -137,6 +142,7 @@ static cuda_driver_entry_t cuda_driver_entry_table[] = {{nullptr, "cuModuleLoadD
                                                         {nullptr, "cuModuleGetGlobal_v2"},
                                                         {nullptr, "cuLibraryGetGlobal"},
                                                         {nullptr, "cuPointerSetAttribute"},
+                                                        {nullptr, "cuCtxSynchronize"},
                                                         {nullptr, nullptr}};
 
 #define CUDA_DRIVER_CALL(table, idx) (table[idx].fn_ptr)
@@ -232,8 +238,7 @@ struct ThreadLocalStorage {
   bool enabled;
   bool region_initialized;
 
-  // Preallocation state for fast allocation path
-  CUmemGenericAllocationHandle preallocated_handle;
+  // Preallocation span for the fast allocation path (backing: g_prealloc_segs)
   size_t preallocated_start_addr;
   size_t preallocated_end_addr;
   bool has_preallocation;
@@ -249,7 +254,6 @@ struct ThreadLocalStorage {
         current_vmm_reserve_addr(0),
         enabled(false),
         region_initialized(false),
-        preallocated_handle(0),
         preallocated_start_addr(0),
         preallocated_end_addr(0),
         has_preallocation(false),
@@ -271,15 +275,22 @@ extern "C" {
 static void vmm_ipc_invalidate_export(CUdeviceptr dptr);
 }
 
-// Process-global mirror of the LOAD-mode preallocated chunk (the authoritative
-// copy lives in tls_storage, which the VMM-IPC export path cannot rely on:
-// cuIpcGetMemHandle may be called from a different thread than the one that
-// preallocated). Set by preallocate_region, cleared by
-// free_preallocated_region. Chunk carves have metadata.handle == 0, so
-// exporting them means exporting THIS handle plus an offset.
-static std::atomic<unsigned long long> g_prealloc_handle{0};
-static std::atomic<uint64_t> g_prealloc_base{0};
-static std::atomic<uint64_t> g_prealloc_size{0};
+// LOAD-mode preallocation. Physical memory is mapped ahead of time over the
+// span [tls_storage.preallocated_start_addr, preallocated_end_addr) so that
+// allocations replayed into it are pointer bumps (metadata.handle == 0,
+// from_preallocation == true). The span is backed by segments, each with its
+// own allocation handle: one for preallocate_region, one per live range for
+// preallocate_ranges, plus any hole prealloc_ensure_mapped fills on demand.
+// The list is process-global because the VMM-IPC export path runs on other
+// threads and exports a carve through its segment's handle; it is kept sorted
+// by base and non-overlapping.
+struct PreallocSegment {
+  CUdeviceptr base;
+  size_t size;
+  CUmemGenericAllocationHandle handle;
+};
+static std::mutex g_prealloc_mutex;
+static std::vector<PreallocSegment> g_prealloc_segs;
 
 struct HookAllocationEvent {
   enum class Type { Alloc, Free, Reserve };
@@ -340,6 +351,161 @@ static size_t get_allocation_granularity(CUdevice device) {
   return granularity;
 }
 
+// ---------------------------------------------------------------------------
+// Physical backing of region memory
+// ---------------------------------------------------------------------------
+
+// Allocation properties of every physical mapping inside the region: IPC
+// exportable through a POSIX fd (VMM-IPC), and GPUDirect-RDMA capable because
+// NCCL/DeepEP register cudaMalloc'd buffers (ncclCommWindowRegister fails
+// with DOCA error 21 otherwise).
+static CUmemAllocationProp region_alloc_prop(CUdevice device) {
+  CUmemAllocationProp prop = {};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.location.id = device;
+  prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  prop.allocFlags.gpuDirectRDMACapable = 1;
+  return prop;
+}
+
+// cuMemCreate + cuMemMap + cuMemSetAccess for [base, base + size). On failure
+// nothing stays mapped and the driver error is returned.
+static CUresult vmm_map_physical(CUdeviceptr base, size_t size, CUdevice device,
+                                 CUmemGenericAllocationHandle* out_handle) {
+  typedef CUresult (*cuMemCreate_t)(CUmemGenericAllocationHandle*, size_t,
+                                    const CUmemAllocationProp*, unsigned long long);
+  typedef CUresult (*cuMemMap_t)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle,
+                                 unsigned long long);
+  typedef CUresult (*cuMemSetAccess_t)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t);
+  typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
+  typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
+  auto mem_create =
+      (cuMemCreate_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemCreate);
+  auto mem_map = (cuMemMap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemMap);
+  auto mem_set_access =
+      (cuMemSetAccess_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemSetAccess);
+  auto mem_unmap = (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
+  auto mem_release =
+      (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
+
+  CUmemAllocationProp prop = region_alloc_prop(device);
+  CUmemGenericAllocationHandle handle = 0;
+  CUresult r = mem_create(&handle, size, &prop, 0);
+  if (r != CUDA_SUCCESS) {
+    return r;
+  }
+  r = mem_map(base, size, 0, handle, 0);
+  if (r != CUDA_SUCCESS) {
+    mem_release(handle);
+    return r;
+  }
+  CUmemAccessDesc access = {};
+  access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  access.location.id = device;
+  access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  r = mem_set_access(base, size, &access, 1);
+  if (r != CUDA_SUCCESS) {
+    mem_unmap(base, size);
+    mem_release(handle);
+    return r;
+  }
+  *out_handle = handle;
+  return CUDA_SUCCESS;
+}
+
+// Unmap and release physical memory that was handed out to the application.
+// The stock cuMemFree synchronizes the device before it releases memory and
+// torch's caching allocator relies on that: empty_cache() returns blocks whose
+// kernels can still be in flight (gpt-oss' mxfp4 postprocess frees each
+// layer's raw weights right after launching the swizzle kernels that read
+// them). Unmapping without the fence leaves those kernels on an unmapped
+// range, so every release of memory that may still be in use goes through
+// here.
+static void vmm_release_mapping(CUdeviceptr base, size_t size,
+                                CUmemGenericAllocationHandle handle) {
+  typedef CUresult (*cuCtxSynchronize_t)(void);
+  typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
+  typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
+  auto ctx_sync =
+      (cuCtxSynchronize_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuCtxSynchronize);
+  auto mem_unmap = (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
+  auto mem_release =
+      (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
+  if (ctx_sync != nullptr) {
+    ctx_sync();
+  }
+  mem_unmap(base, size);
+  mem_release(handle);
+}
+
+// The preallocation segment backing dptr, if any.
+static bool prealloc_find_segment(CUdeviceptr dptr, PreallocSegment* out) {
+  std::lock_guard<std::mutex> lock(g_prealloc_mutex);
+  for (const auto& seg : g_prealloc_segs) {
+    if (dptr >= seg.base && dptr < seg.base + seg.size) {
+      *out = seg;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Make sure [addr, addr + size) inside the preallocation span is backed. The
+// span is mapped from the ranges that were still live at the end of SAVE, so
+// a LOAD allocation lands in an unbacked hole only when the LOAD sequence
+// diverges from SAVE (an allocation SAVE freed before its end, or a cursor
+// ahead of SAVE's). The hole is mapped here and joins the span; the message
+// makes the divergence visible instead of faulting the first kernel that
+// touches the memory. Bounds are granularity-aligned: carves start at
+// kAllocAlignment with granularity-rounded sizes, and segments are built
+// from such carves. Returns false when a hole could not be mapped; the
+// caller then falls back to the ordinary mapping path.
+static bool prealloc_ensure_mapped(CUdeviceptr addr, size_t size, CUdevice device) {
+  std::lock_guard<std::mutex> lock(g_prealloc_mutex);
+  const CUdeviceptr end = addr + size;
+  std::vector<std::pair<CUdeviceptr, size_t>> holes;
+  CUdeviceptr cursor = addr;
+  for (const auto& seg : g_prealloc_segs) {
+    const CUdeviceptr seg_end = seg.base + seg.size;
+    if (seg_end <= cursor) {
+      continue;
+    }
+    if (seg.base >= end) {
+      break;
+    }
+    if (seg.base > cursor) {
+      holes.emplace_back(cursor, (size_t)(seg.base - cursor));
+    }
+    cursor = std::max(cursor, seg_end);
+  }
+  if (cursor < end) {
+    holes.emplace_back(cursor, (size_t)(end - cursor));
+  }
+  for (const auto& hole : holes) {
+    CUmemGenericAllocationHandle handle = 0;
+    CUresult r = vmm_map_physical(hole.first, hole.second, device, &handle);
+    if (r != CUDA_SUCCESS) {
+      fprintf(stderr,
+              "[HOOK] ERROR: could not back 0x%llx size=%zu inside the preallocated span "
+              "(error %d)\n",
+              (unsigned long long)hole.first, hole.second, (int)r);
+      return false;
+    }
+    PreallocSegment seg{hole.first, hole.second, handle};
+    g_prealloc_segs.insert(std::upper_bound(g_prealloc_segs.begin(), g_prealloc_segs.end(), seg,
+                                            [](const PreallocSegment& a, const PreallocSegment& b) {
+                                              return a.base < b.base;
+                                            }),
+                           seg);
+    fprintf(stderr,
+            "[HOOK] INFO: mapped %zu MB on demand at 0x%llx: the allocation sequence entered a "
+            "range that was not live at the end of SAVE\n",
+            hole.second >> 20, (unsigned long long)hole.first);
+  }
+  return true;
+}
+
 static uint64_t compute_hash(const std::vector<uint8_t>& data) {
   boost::crc_optimal<64, 0x42F0E1EBA9EA3693ULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, true,
                      true>
@@ -371,26 +537,17 @@ static BinaryFormat detect_binary_format(const void* data_ptr) {
   return BinaryFormat::PTX;
 }
 
+// Size of the fatbin container that starts at `fatbin_data`: its header plus `size` bytes of
+// payload, which already covers every arch entry of the image (fatbinary_section.h: fatSize is the
+// size of the whole fat binary after the header). Do not walk on to the next header: the containers
+// that follow in memory are other translation units of the same library's .nv_fatbin section, not
+// part of this image (a FATBINC_LINK_VERSION wrapper lists each of its segments separately). The
+// previous walk sized every image as "from here to the end of the section", so SAVE copied and
+// CRC-hashed 50-1000x the real bytes (NCCL: 5.95 GB for a 127 MB linked library, cuBLASLt: 140 MB
+// for a 6200-byte image).
 static size_t compute_fatbin_size(const uint8_t* fatbin_data) {
-  size_t size = 0;
-  size_t offset = 0;
-
-  while (true) {
-    const auto* header = reinterpret_cast<const fat_elf_header*>(fatbin_data + offset);
-
-    if (offset > 0 && header->magic != FATBIN_MAGIC) {
-      break;
-    }
-
-    const size_t fatbin_size = header->header_size + header->size;
-    size = offset + fatbin_size;
-    offset += fatbin_size;
-
-    if (header->magic != FATBIN_MAGIC) {
-      break;
-    }
-  }
-
+  const auto* header = reinterpret_cast<const fat_elf_header*>(fatbin_data);
+  const size_t size = header->header_size + header->size;
   return size == 0 ? sizeof(fat_elf_header) : size;
 }
 
@@ -2307,7 +2464,8 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
 
   // Fast path: check if we can serve from preallocated memory
   if (tls_storage.has_preallocation &&
-      (target_addr + aligned_size) <= tls_storage.preallocated_end_addr) {
+      (target_addr + aligned_size) <= tls_storage.preallocated_end_addr &&
+      prealloc_ensure_mapped(target_addr, aligned_size, device)) {
     *dptr = target_addr;
 
     AllocMetadata metadata;
@@ -2377,16 +2535,7 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
       (cuMemSetAccess_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemSetAccess);
 
   CUmemGenericAllocationHandle allocHandle;
-  CUmemAllocationProp prop = {};
-  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  prop.location.id = device;
-  // Enable IPC via VMM shareable handles (POSIX file descriptor on Linux)
-  prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-  // Region memory backs cudaMalloc'd buffers that NCCL/DeepEP may register
-  // for GPUDirect RDMA (ncclCommWindowRegister); without this flag the
-  // registration fails (DOCA error 21).
-  prop.allocFlags.gpuDirectRDMACapable = 1;
+  CUmemAllocationProp prop = region_alloc_prop(device);
 
   CUresult result = mem_create_func(&allocHandle, aligned_size, &prop, 0);
   if (result != CUDA_SUCCESS) {
@@ -2526,7 +2675,8 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
 
   // Fast path: check if we can serve from preallocated memory
   if (tls_storage.has_preallocation &&
-      (target_addr + aligned_size) <= tls_storage.preallocated_end_addr) {
+      (target_addr + aligned_size) <= tls_storage.preallocated_end_addr &&
+      prealloc_ensure_mapped(target_addr, aligned_size, device)) {
     *dptr = target_addr;
     *pPitch = pitch;
 
@@ -2573,11 +2723,7 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
       (cuMemSetAccess_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemSetAccess);
 
   CUmemGenericAllocationHandle allocHandle;
-  CUmemAllocationProp prop = {};
-  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  prop.location.id = device;
-  prop.allocFlags.gpuDirectRDMACapable = 1;  // see cuMemAlloc path
+  CUmemAllocationProp prop = region_alloc_prop(device);
 
   result = mem_create_func(&allocHandle, aligned_size, &prop, 0);
   if (result != CUDA_SUCCESS) {
@@ -2675,20 +2821,10 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
     // For preallocated memory, we just remove tracking but don't actually free
     // The memory will be freed when free_preallocated_region() is called
     if (!metadata.from_preallocation) {
-      typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
-      auto mem_unmap_func =
-          (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
-
-      typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
-      auto mem_release_func =
-          (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
-
       typedef CUresult (*cuMemAddressFree_t)(CUdeviceptr, size_t);
       auto mem_addr_free_func = (cuMemAddressFree_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
                                                                      CUDA_ENTRY_cuMemAddressFree);
-
-      mem_unmap_func(metadata.ptr, metadata.size);
-      mem_release_func(metadata.handle);
+      vmm_release_mapping(metadata.ptr, metadata.size, metadata.handle);
       mem_addr_free_func(metadata.ptr, metadata.size);
     }
 
@@ -2869,10 +3005,51 @@ CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
   return real_func(ptr, size);
 }
 
+// glibc resolves dlsym(RTLD_DEFAULT) / dlsym(RTLD_NEXT) relative to the object
+// that *called* dlsym (its link-map scope). Once dlsym is interposed, the caller
+// of the real dlsym is always this library, so a lookup issued from inside an
+// RTLD_LOCAL dlopen'd tree - every Python extension module together with its
+// DT_NEEDED libraries, e.g. mooncake -> libibverbs - stops seeing that tree:
+// dlsym(RTLD_DEFAULT, "ibv_reg_mr_iova2") fails with "libcuda_hook.so:
+// undefined symbol" and the caller silently degrades (mooncake then registers
+// RDMA memory without IBV_ACCESS_RELAXED_ORDERING, which made post-recovery
+// expert relocation ~6x slower under the hook). Recover the original semantics
+// by re-issuing a failed lookup against the calling module's own handle, whose
+// dependency closure is exactly the scope glibc would have searched.
+static void* dlsym_in_caller_scope(void* handle, const char* symbol, void* caller_addr) {
+  Dl_info caller_info;
+  if (caller_addr == nullptr || dladdr(caller_addr, &caller_info) == 0 ||
+      caller_info.dli_fname == nullptr || caller_info.dli_fname[0] == '\0') {
+    return nullptr;
+  }
+  void* caller_handle = dlopen(caller_info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+  if (caller_handle == nullptr) {
+    return nullptr;
+  }
+  void* result = real_dlsym(caller_handle, symbol);
+  dlclose(caller_handle);  // only drops the RTLD_NOLOAD reference; the object stays loaded
+  if (result != nullptr && handle == RTLD_NEXT) {
+    // RTLD_NEXT must skip the caller's own definition.
+    Dl_info result_info;
+    if (dladdr(result, &result_info) != 0 && result_info.dli_fbase == caller_info.dli_fbase) {
+      return nullptr;
+    }
+  }
+  if (result != nullptr) {
+    dlerror();  // clear the error left behind by the failed scope-less lookup
+#ifdef FOUNDRY_DEBUG
+    fprintf(stderr, "[HOOK] dlsym(%s, \"%s\") resolved via caller scope of %s\n",
+            handle == RTLD_NEXT ? "RTLD_NEXT" : "RTLD_DEFAULT", symbol, caller_info.dli_fname);
+#endif
+  }
+  return result;
+}
+
 void* dlsym(void* handle, const char* symbol) {
   if (!real_dlsym) {
     get_real_dlsym();
   }
+  void* caller_addr = __builtin_return_address(0);
   if (symbol && strncmp(symbol, "cu", 2) == 0) {
     if (strcmp(symbol, "cuModuleLoadData") == 0) {
       return (void*)cuModuleLoadData;
@@ -2920,7 +3097,16 @@ void* dlsym(void* handle, const char* symbol) {
     }
   }
 
-  return real_dlsym(handle, symbol);
+  void* result = real_dlsym(handle, symbol);
+  if (result == nullptr && symbol != nullptr && (handle == RTLD_DEFAULT || handle == RTLD_NEXT)) {
+    result = dlsym_in_caller_scope(handle, symbol, caller_addr);
+    if (result == nullptr) {
+      // The fallback's own dlopen/dlclose reset the thread's dlerror state;
+      // fail the original lookup again so the caller still sees its message.
+      result = real_dlsym(handle, symbol);
+    }
+  }
+  return result;
 }
 
 // =============================================================================
@@ -3181,12 +3367,12 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
     metadata = kv.second;
   });
 
-  // Decide what to export: the allocation's own handle (SAVE-mode slow-path
-  // allocs), or the whole preallocated chunk plus an offset (LOAD-mode fast
-  // path carves, which have no individual handle). cuMemMap cannot map a
-  // sub-range of an imported handle, so chunk carves are shared by exporting
-  // the chunk handle; the importer maps the entire chunk and returns an
-  // interior pointer.
+  // Decide what to export: the allocation's own handle (slow-path allocs), or
+  // the preallocation segment that backs it plus an offset (LOAD-mode fast
+  // path carves have no handle of their own). cuMemMap cannot map a sub-range
+  // of an imported handle, so a carve is shared by exporting its segment's
+  // handle; the importer maps the whole segment and returns an interior
+  // pointer.
   CUmemGenericAllocationHandle export_handle = 0;
   CUdeviceptr export_key = dptr;  // fd-registry key == blob lookup key
   uint64_t chunk_base = 0;
@@ -3194,9 +3380,12 @@ CUresult cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr) {
   if (found) {
     export_handle = metadata.handle;
     if (export_handle == 0 && metadata.from_preallocation) {
-      chunk_base = g_prealloc_base.load();
-      chunk_size = g_prealloc_size.load();
-      export_handle = (CUmemGenericAllocationHandle)g_prealloc_handle.load();
+      PreallocSegment seg;
+      if (prealloc_find_segment(dptr, &seg)) {
+        chunk_base = seg.base;
+        chunk_size = seg.size;
+        export_handle = seg.handle;
+      }
       export_key = (CUdeviceptr)chunk_base;
       if (export_handle == 0 || dptr < chunk_base || dptr >= chunk_base + chunk_size) {
         fprintf(stderr,
@@ -3798,157 +3987,173 @@ bool allocation_region_enabled() {
   return tls_storage.enabled;
 }
 
-bool preallocate_region(size_t size) {
+// Common prologue of the preallocation entry points: the region must exist, a
+// previous span is released, and the device/granularity are cached for the
+// fast path.
+static bool prealloc_prepare(const char* who, CUdevice* device, size_t* granularity) {
   if (!tls_storage.region_initialized) {
-    fprintf(stderr, "[HOOK] ERROR: Cannot preallocate before allocation region is set\n");
+    fprintf(stderr, "[HOOK] ERROR: %s: cannot preallocate before the allocation region is set\n",
+            who);
     return false;
   }
-
   if (tls_storage.has_preallocation) {
-    fprintf(stderr, "[HOOK] WARNING: Preallocation already exists, freeing previous allocation\n");
+    fprintf(stderr, "[HOOK] WARNING: %s: a preallocation already exists, releasing it\n", who);
     free_preallocated_region();
   }
-
-  // Get and cache device and granularity for subsequent allocations
   typedef CUresult (*cuCtxGetDevice_t)(CUdevice*);
   auto get_device_func =
       (cuCtxGetDevice_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuCtxGetDevice);
-  CUdevice device = 0;
-  get_device_func(&device);
-
-  size_t granularity = get_allocation_granularity(device);
-
-  // Cache for fast path allocations
-  tls_storage.cached_device = device;
-  tls_storage.cached_granularity = granularity;
+  *device = 0;
+  get_device_func(device);
+  *granularity = get_allocation_granularity(*device);
+  tls_storage.cached_device = *device;
+  tls_storage.cached_granularity = *granularity;
   tls_storage.device_cached = true;
-
-  size_t aligned_size = align_to(size, granularity);
-
-  typedef CUresult (*cuMemCreate_t)(CUmemGenericAllocationHandle*, size_t,
-                                    const CUmemAllocationProp*, unsigned long long);
-  auto mem_create_func =
-      (cuMemCreate_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemCreate);
-
-  typedef CUresult (*cuMemMap_t)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle,
-                                 unsigned long long);
-  auto mem_map_func = (cuMemMap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemMap);
-
-  typedef CUresult (*cuMemSetAccess_t)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t);
-  auto mem_set_access_func =
-      (cuMemSetAccess_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemSetAccess);
-
-  CUmemGenericAllocationHandle allocHandle;
-  CUmemAllocationProp prop = {};
-  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  prop.location.id = device;
-  // Enable IPC via VMM shareable handles (POSIX file descriptor on Linux)
-  prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-  // Region memory backs cudaMalloc'd buffers that NCCL/DeepEP may register
-  // for GPUDirect RDMA (ncclCommWindowRegister); without this flag the
-  // registration fails (DOCA error 21).
-  prop.allocFlags.gpuDirectRDMACapable = 1;
-
-  CUresult result = mem_create_func(&allocHandle, aligned_size, &prop, 0);
-  if (result != CUDA_SUCCESS) {
-    fprintf(stderr,
-            "[HOOK] ERROR: preallocate_region: cuMemCreate failed with error %d for size=%zu\n",
-            result, aligned_size);
-    return false;
-  }
-
-  CUdeviceptr target_addr = align_to(tls_storage.current_alloc_base_addr, kAllocAlignment);
-
-  // Check if we have enough space in the reserved region
-  CUdeviceptr region_end = (CUdeviceptr)tls_storage.region.base + tls_storage.region.size;
-  if (target_addr + aligned_size > region_end) {
-    fprintf(
-        stderr,
-        "[HOOK] ERROR: preallocate_region: Not enough space in region (need=%zu, available=%llu)\n",
-        aligned_size, (unsigned long long)(region_end - target_addr));
-    typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
-    auto mem_release_func =
-        (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
-    mem_release_func(allocHandle);
-    return false;
-  }
-
-  result = mem_map_func(target_addr, aligned_size, 0, allocHandle, 0);
-  if (result != CUDA_SUCCESS) {
-    fprintf(
-        stderr,
-        "[HOOK] ERROR: preallocate_region: cuMemMap failed with error %d at addr=0x%llx size=%zu\n",
-        result, (unsigned long long)target_addr, aligned_size);
-    typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
-    auto mem_release_func =
-        (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
-    mem_release_func(allocHandle);
-    return false;
-  }
-
-  CUmemAccessDesc accessDesc = {};
-  accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  accessDesc.location.id = device;
-  accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-
-  result = mem_set_access_func(target_addr, aligned_size, &accessDesc, 1);
-  if (result != CUDA_SUCCESS) {
-    fprintf(stderr, "[HOOK] ERROR: preallocate_region: cuMemSetAccess failed with error %d\n",
-            result);
-    typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
-    auto mem_unmap_func =
-        (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
-    typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
-    auto mem_release_func =
-        (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
-    mem_unmap_func(target_addr, aligned_size);
-    mem_release_func(allocHandle);
-    return false;
-  }
-
-  // Store preallocation state
-  tls_storage.preallocated_handle = allocHandle;
-  tls_storage.preallocated_start_addr = target_addr;
-  tls_storage.preallocated_end_addr = target_addr + aligned_size;
-  tls_storage.has_preallocation = true;
-  g_prealloc_handle.store((unsigned long long)allocHandle);
-  g_prealloc_base.store((uint64_t)target_addr);
-  g_prealloc_size.store((uint64_t)aligned_size);
-
-  // Note: we do NOT advance current_alloc_base_addr here.
-  // The alloc calls will advance it as they consume the preallocated memory.
   return true;
+}
+
+// Map `segs` (sorted, disjoint, granularity-aligned) and publish the span
+// [start, end). All-or-nothing: a failed segment rolls back the ones mapped
+// before it (nothing has been handed out yet, so no fence is needed). The
+// cursor is not advanced; allocations consume the span as they land in it.
+static bool prealloc_install(const char* who,
+                             const std::vector<std::pair<CUdeviceptr, size_t>>& segs,
+                             CUdeviceptr start, CUdeviceptr end, CUdevice device) {
+  typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
+  typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
+  auto mem_unmap = (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
+  auto mem_release =
+      (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
+
+  std::vector<PreallocSegment> mapped;
+  size_t mapped_bytes = 0;
+  for (const auto& sg : segs) {
+    CUmemGenericAllocationHandle handle = 0;
+    CUresult r = vmm_map_physical(sg.first, sg.second, device, &handle);
+    if (r != CUDA_SUCCESS) {
+      fprintf(stderr,
+              "[HOOK] ERROR: %s: mapping 0x%llx size=%zu failed with error %d after %zu MB were "
+              "mapped\n",
+              who, (unsigned long long)sg.first, sg.second, (int)r, mapped_bytes >> 20);
+      for (const auto& m : mapped) {
+        mem_unmap(m.base, m.size);
+        mem_release(m.handle);
+      }
+      return false;
+    }
+    mapped.push_back({sg.first, sg.second, handle});
+    mapped_bytes += sg.second;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_prealloc_mutex);
+    g_prealloc_segs = std::move(mapped);
+  }
+  tls_storage.preallocated_start_addr = start;
+  tls_storage.preallocated_end_addr = end;
+  tls_storage.has_preallocation = true;
+  fprintf(stderr,
+          "[HOOK] INFO: %s: mapped %zu MB in %zu segments of the %llu MB span [0x%llx, 0x%llx)\n",
+          who, mapped_bytes >> 20, segs.size(), (unsigned long long)((end - start) >> 20),
+          (unsigned long long)start, (unsigned long long)end);
+  return true;
+}
+
+bool preallocate_region(size_t size) {
+  CUdevice device;
+  size_t granularity;
+  if (!prealloc_prepare("preallocate_region", &device, &granularity)) {
+    return false;
+  }
+  const size_t aligned_size = align_to(size, granularity);
+  const CUdeviceptr start = align_to(tls_storage.current_alloc_base_addr, kAllocAlignment);
+  const CUdeviceptr region_end = (CUdeviceptr)tls_storage.region.base + tls_storage.region.size;
+  if (start + aligned_size > region_end) {
+    fprintf(stderr,
+            "[HOOK] ERROR: preallocate_region: not enough space in the region (need=%zu, "
+            "available=%llu)\n",
+            aligned_size, (unsigned long long)(region_end - start));
+    return false;
+  }
+  return prealloc_install("preallocate_region", {{start, aligned_size}}, start,
+                          start + aligned_size, device);
+}
+
+bool preallocate_ranges(const std::vector<std::pair<size_t, size_t>>& ranges, size_t end_offset) {
+  CUdevice device;
+  size_t granularity;
+  if (!prealloc_prepare("preallocate_ranges", &device, &granularity)) {
+    return false;
+  }
+  const CUdeviceptr region_base = (CUdeviceptr)tls_storage.region.base;
+  const CUdeviceptr region_end = region_base + tls_storage.region.size;
+  const CUdeviceptr start = align_to(tls_storage.current_alloc_base_addr, kAllocAlignment);
+  const CUdeviceptr end = region_base + end_offset;
+  if (end > region_end || end < start) {
+    fprintf(stderr,
+            "[HOOK] ERROR: preallocate_ranges: end offset %zu is outside [cursor, region end)\n",
+            end_offset);
+    return false;
+  }
+
+  // Clip the ranges to [start, end), round them out to the granularity and
+  // merge the ones that touch.
+  std::vector<std::pair<size_t, size_t>> sorted(ranges);
+  std::sort(sorted.begin(), sorted.end());
+  std::vector<std::pair<CUdeviceptr, size_t>> segs;
+  for (const auto& r : sorted) {
+    CUdeviceptr a = region_base + (r.first / granularity) * granularity;
+    CUdeviceptr b = region_base + align_to(r.first + r.second, granularity);
+    a = std::max(a, start);
+    b = std::min(b, end);
+    if (a >= b) {
+      continue;
+    }
+    if (!segs.empty() && a <= segs.back().first + segs.back().second) {
+      CUdeviceptr merged_end = std::max(segs.back().first + segs.back().second, b);
+      segs.back().second = (size_t)(merged_end - segs.back().first);
+    } else {
+      segs.emplace_back(a, (size_t)(b - a));
+    }
+  }
+  return prealloc_install("preallocate_ranges", segs, start, end, device);
 }
 
 void free_preallocated_region() {
   if (!tls_storage.has_preallocation) {
     return;
   }
-
-  typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
-  auto mem_unmap_func =
-      (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
-
-  typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
-  auto mem_release_func =
-      (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
-
-  size_t preallocated_size =
-      tls_storage.preallocated_end_addr - tls_storage.preallocated_start_addr;
-
-  mem_unmap_func(tls_storage.preallocated_start_addr, preallocated_size);
-  mem_release_func(tls_storage.preallocated_handle);
-
-  vmm_ipc_invalidate_export((CUdeviceptr)tls_storage.preallocated_start_addr);
-  g_prealloc_handle.store(0);
-  g_prealloc_base.store(0);
-  g_prealloc_size.store(0);
-
-  tls_storage.preallocated_handle = 0;
+  std::vector<PreallocSegment> segs;
+  {
+    std::lock_guard<std::mutex> lock(g_prealloc_mutex);
+    segs.swap(g_prealloc_segs);
+  }
+  for (const auto& seg : segs) {
+    vmm_release_mapping(seg.base, seg.size, seg.handle);
+    vmm_ipc_invalidate_export(seg.base);
+  }
   tls_storage.preallocated_start_addr = 0;
   tls_storage.preallocated_end_addr = 0;
   tls_storage.has_preallocation = false;
+}
+
+std::vector<std::pair<size_t, size_t>> get_live_region_ranges() {
+  // (offset, size) of every allocation still mapped inside this thread's
+  // region, relative to the region base. SAVE records this at its end so
+  // LOAD can back only these ranges instead of the whole recorded span.
+  std::vector<std::pair<size_t, size_t>> ranges;
+  if (!tls_storage.region_initialized) {
+    return ranges;
+  }
+  const CUdeviceptr base = (CUdeviceptr)tls_storage.region.base;
+  const CUdeviceptr end = base + tls_storage.region.size;
+  global_alloc_metadata.cvisit_all([&](const std::pair<const CUdeviceptr, AllocMetadata>& kv) {
+    const AllocMetadata& m = kv.second;
+    if (m.ptr >= base && m.ptr < end) {
+      ranges.emplace_back((size_t)(m.ptr - base), m.size);
+    }
+  });
+  std::sort(ranges.begin(), ranges.end());
+  return ranges;
 }
 
 size_t get_current_alloc_offset() {
@@ -4466,11 +4671,93 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
       std::vector<std::string> entry_names;
       // For device-linked binaries
       std::vector<std::vector<uint8_t>> linked_segments;
+      const uint8_t* view =
+          nullptr;  // zero-copy view into the mmapped packed image (default; see below)
+      size_t view_size = 0;
     };
-
     std::vector<BinaryEntry> binaries;
-
-    while (img_file) {
+    auto bin_ptr = [](const BinaryEntry& b) -> const uint8_t* {
+      return b.view ? b.view : b.data.data();
+    };
+    auto bin_size = [](const BinaryEntry& b) -> size_t {
+      return b.view ? b.view_size : b.data.size();
+    };
+    // Map fatbin_image_packed.img instead of reading it into memory (default; set
+    // FOUNDRY_MMAP_ARCHIVE=0/false to read it eagerly with ifstream). Measured on an H200 EP8
+    // archive: the eager read of 4.7-5.5 GB costs 1.6-1.8 s per rank; mmap takes binary restore
+    // from 1.67 s to 0.10 s with identical output.
+    // The recorded images are loaded with CU_LIBRARY_BINARY_IS_PRESERVED, so the driver keeps
+    // referring to the mapping (never unmapped); it only faults in the pages it actually parses,
+    // so a 5 GB EP archive (four ~1 GB FlashAttention-3 fatbins with three architectures each)
+    // no longer costs a 5 GB read before the first cuLibraryLoadData.
+    const uint8_t* map_base = nullptr;
+    size_t map_len = 0;
+    {
+      const char* e = std::getenv("FOUNDRY_MMAP_ARCHIVE");
+      if (!e || (std::string(e) != "0" && std::string(e) != "false")) {
+        int fd = open(packed_img_path.string().c_str(), O_RDONLY);
+        struct stat st;
+        if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0) {
+          void* m = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+          if (m != MAP_FAILED) {
+            map_base = static_cast<const uint8_t*>(m);
+            map_len = st.st_size;
+          } else {
+            fprintf(stderr, "[HOOK] WARNING: mmap of %s failed (%s); reading it instead\n",
+                    packed_img_path.string().c_str(), strerror(errno));
+          }
+        }
+        if (fd >= 0)
+          close(fd);
+      }
+    }
+    if (map_base) {
+      size_t cur = 0;
+      auto take = [&](void* dst, size_t k) {
+        if (cur + k > map_len) {
+          fprintf(stderr, "[HOOK] ERROR: packed image truncated at %zu (+%zu of %zu)\n", cur, k,
+                  map_len);
+          abort();
+        }
+        memcpy(dst, map_base + cur, k);
+        cur += k;
+      };
+      while (cur + sizeof(uint64_t) + sizeof(size_t) <= map_len) {
+        BinaryEntry entry;
+        size_t size = 0;
+        take(&entry.hash, sizeof(uint64_t));
+        take(&size, sizeof(size_t));
+        if (size == 0) {
+          size_t num_segments = 0;
+          take(&num_segments, sizeof(size_t));
+          if (num_segments == 0) {
+            fprintf(stderr, "[HOOK] ERROR: Invalid segment count for device-linked binary\n");
+            abort();
+          }
+          for (size_t i = 0; i < num_segments; i++) {
+            size_t seg_size = 0;
+            take(&seg_size, sizeof(size_t));
+            if (seg_size == 0 || cur + seg_size > map_len) {
+              fprintf(stderr, "[HOOK] ERROR: Invalid segment size\n");
+              abort();
+            }
+            entry.linked_segments.emplace_back(map_base + cur, map_base + cur + seg_size);
+            cur += seg_size;
+          }
+        } else {
+          if (cur + size > map_len) {
+            fprintf(stderr, "[HOOK] ERROR: packed image truncated inside binary %016llx\n",
+                    (unsigned long long)entry.hash);
+            abort();
+          }
+          entry.view = map_base + cur;
+          entry.view_size = size;
+          cur += size;
+        }
+        binaries.push_back(std::move(entry));
+      }
+    }
+    while (!map_base && img_file) {
       uint64_t hash = 0;
       size_t size = 0;
 
@@ -4614,7 +4901,10 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
     auto link_destroy =
         (cuLinkDestroy_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuLinkDestroy);
 
+    const auto t_load0 = std::chrono::steady_clock::now();
+    size_t total_bytes = 0;
     for (auto& binary : binaries) {
+      total_bytes += bin_size(binary);
       if (binary.options.base_func_name == "cuLibraryLoadData") {
         CUlibrary library = nullptr;
         CUjit_option* jit_opts =
@@ -4696,11 +4986,11 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
 #ifdef FOUNDRY_DEBUG
           fprintf(stderr,
                   "[HOOK] DEBUG: Loading library hash %016llx, size: %zu bytes, %zu kernels\n",
-                  (unsigned long long)binary.hash, binary.data.size(), binary.entry_names.size());
+                  (unsigned long long)binary.hash, bin_size(binary), binary.entry_names.size());
 #endif
 
-          res = library_load_data(&library, binary.data.data(), jit_opts, jit_vals, num_jit,
-                                  lib_opts, lib_vals, num_lib);
+          res = library_load_data(&library, bin_ptr(binary), jit_opts, jit_vals, num_jit, lib_opts,
+                                  lib_vals, num_lib);
           if (res != CUDA_SUCCESS || !library) {
             fprintf(stderr, "[HOOK] ERROR: Failed to load library for hash %016llx, error=%d\n",
                     (unsigned long long)binary.hash, res);
@@ -4718,8 +5008,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
                               : binary.options.jit_option_values.data();
         unsigned int num_jit = binary.options.jit_options.size();
 
-        CUresult res =
-            module_load_data_ex(&module, binary.data.data(), num_jit, jit_opts, jit_vals);
+        CUresult res = module_load_data_ex(&module, bin_ptr(binary), num_jit, jit_opts, jit_vals);
         if (res != CUDA_SUCCESS || !module) {
           fprintf(stderr, "[HOOK] ERROR: Failed to load module (Ex) for hash %016llx, error=%d\n",
                   (unsigned long long)binary.hash, res);
@@ -4729,7 +5018,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
                                  binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
       } else if (binary.options.base_func_name == "cuModuleLoadData") {
         CUmodule module = nullptr;
-        CUresult res = module_load_data(&module, binary.data.data());
+        CUresult res = module_load_data(&module, bin_ptr(binary));
         if (res != CUDA_SUCCESS || !module) {
           fprintf(stderr, "[HOOK] ERROR: Failed to load module for hash %016llx, error=%d\n",
                   (unsigned long long)binary.hash, res);
@@ -4739,7 +5028,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
                                  binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
       } else if (binary.options.base_func_name == "cuModuleLoadFatBinary") {
         CUmodule module = nullptr;
-        CUresult res = module_load_fatbinary(&module, binary.data.data());
+        CUresult res = module_load_fatbinary(&module, bin_ptr(binary));
         if (res != CUDA_SUCCESS || !module) {
           fprintf(stderr, "[HOOK] ERROR: Failed to load fatbinary for hash %016llx, error=%d\n",
                   (unsigned long long)binary.hash, res);
@@ -4760,7 +5049,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
           fprintf(stderr, "[HOOK] ERROR: Failed to create temporary file for module loading\n");
           abort();
         }
-        temp_file.write(reinterpret_cast<const char*>(binary.data.data()), binary.data.size());
+        temp_file.write(reinterpret_cast<const char*>(bin_ptr(binary)), bin_size(binary));
         temp_file.close();
 
         CUmodule module = nullptr;
@@ -4789,7 +5078,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
           fprintf(stderr, "[HOOK] ERROR: Failed to create temporary file for library loading\n");
           abort();
         }
-        temp_file.write(reinterpret_cast<const char*>(binary.data.data()), binary.data.size());
+        temp_file.write(reinterpret_cast<const char*>(bin_ptr(binary)), bin_size(binary));
         temp_file.close();
 
         CUlibrary library = nullptr;
@@ -4827,6 +5116,13 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
       }
     }
 
+    {
+      const double ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_load0)
+              .count();
+      fprintf(stderr, "[HOOK] loaded %zu recorded binaries (%.0f MB%s) in %.0f ms\n",
+              binaries.size(), total_bytes / 1e6, map_base ? ", mmapped" : "", ms);
+    }
     bool expected = false;
     if (!binary_loaded.compare_exchange_strong(expected, true)) {
       fprintf(stderr, "[HOOK] ERROR: Binary already loaded by another thread\n");

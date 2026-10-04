@@ -1,0 +1,10 @@
+# sdist contents beyond the Python packages: native sources, build files and
+# the vendored Boost headers (third_party/boost).
+include CMakeLists.txt LICENSE README.md RELEASE.md
+recursive-include csrc *.cpp *.h *.cu
+recursive-include include *.h *.hpp
+graft third_party
+include python/foundry/_build_info.py.in
+include python/foundry/ops.pyi
+exclude python/foundry/_build_info.py
+global-exclude *.so *.o __pycache__ *.py[cod]
