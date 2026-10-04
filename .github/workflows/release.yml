@@ -118,7 +118,11 @@ jobs:
         run: |
           python -m pip install -U pip build "setuptools>=80" wheel "cmake>=4.0" ninja
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          CUDA_HOME=/nonexistent-cuda python -m build --sdist --no-isolation
+          # setup.py imports torch.utils.cpp_extension, which needs CUDA_HOME to
+          # point at an EXISTING directory (a missing path is treated as unset).
+          # The sdist compiles nothing, so an empty tree is enough.
+          mkdir -p "$RUNNER_TEMP/cuda-stub/include" "$RUNNER_TEMP/cuda-stub/lib64"
+          CUDA_HOME="$RUNNER_TEMP/cuda-stub" python -m build --sdist --no-isolation
       - name: Check the sdist contents
         run: |
           tar tzf dist/foundry_core-*.tar.gz > sdist.txt
