@@ -134,7 +134,7 @@ is `foundry`). One torch/CUDA pairing per release line:
 
 ```bash
 pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
-pip install "foundry-core>=0.1.0,<0.2"
+pip install "foundry-core>=0.1.0rc1,<0.2"
 python -c "import foundry; print(foundry.__version__)"
 ```
 
