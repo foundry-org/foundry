@@ -8,7 +8,7 @@ integration.
 | Component | Commit | Notes |
 |---|---|---|
 | SGLang, upstream `main` **`fa090f7755`** (2026-09-29) | fork branch **`foundry-plugin`** | = upstream `main` `fa090f7755` plus the `FOUNDRY_GRAPH_EXTENSION_CONFIG` declaration, a loader check that fails fast when the variable is set without the foundry plugin, and a CPU contract test pinning the functions Foundry wraps (2 commits, head `bd8da5c720`, no new call sites); the plugin route itself was validated on plain `fa090f7755`. Foundry runs as an SGLang plugin (entry point `foundry` in group `sglang.srt.plugins`), switched on by `FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>`; there is no CLI flag. Optional: `symm-mem-no-multicast-fallback` (`50b4f5302d`, one commit on `fa090f7755`) for TP LOAD on hosts without multicast (see TP notes). |
-| Foundry, branch **`sglang-registry`** | this commit or later | The SGLang integration in `python/foundry/integration/sglang/` plus the plugin entry module `python/foundry_sglang_plugin.py`; `pip install -e .` registers the entry point. Archives written by foundry before `coldstart` `b4c2a84` (`final_alloc_offset.json` + `live_ranges.json` layout) do not load: re-run `--save`. |
+| Foundry, branch **`sglang-registry`** | this commit or later | The SGLang integration in `python/foundry/integration/sglang/` plus the plugin entry module `python/foundry_sglang_plugin.py`; installing foundry (`pip install foundry-core`, or `pip install -e .` from source) registers the entry point. Archives written by foundry before `coldstart` `b4c2a84` (`final_alloc_offset.json` + `live_ranges.json` layout) do not load: re-run `--save`. |
 
 The older in-tree route (fork branches `foundry` `6272eb04c5`, `foundry-prefill` `4f018fd052`, flag
 `--foundry-graph-extension-config-path`) is superseded; most rows under **Validation** were measured on it. The
@@ -179,7 +179,7 @@ What the plugin cannot pin, and the scripts keep doing:
 - Check the entry point in the serving venv:
 
   ```bash
-  python -c "from importlib.metadata import entry_points; eps=[e for e in entry_points(group='sglang.srt.plugins') if e.name=='foundry']; assert eps, 'foundry plugin entry point not registered: pip install -e foundry'; print(eps)"
+  python -c "from importlib.metadata import entry_points; eps=[e for e in entry_points(group='sglang.srt.plugins') if e.name=='foundry']; assert eps, 'foundry plugin entry point not registered: pip install foundry-core'; print(eps)"
   ```
 
 - Or run the whole preflight by hand, from the directory you serve in:
@@ -222,13 +222,18 @@ pip install -e sglang/python
 pip install "flashinfer-cubin==0.6.18" --index-url https://flashinfer.ai/whl
 pip install "flashinfer-jit-cache==0.6.18" --index-url https://flashinfer.ai/whl/cu130
 
-# foundry build deps (boost from conda/system; cmake+ninja can come from pip)
+# foundry: prebuilt wheel for this torch 2.13 / cu130 line (also registers the sglang plugin entry point)
+pip install "foundry-core>=0.1.0,<0.2"
+
+# ...or foundry from source, editable (cmake+ninja from pip; Boost headers vendored in
+# third_party/boost or a system Boost >= 1.83, header-only)
 pip install "cmake>=4.0" ninja wheel pytest
-pushd foundry && pip install -e . --no-build-isolation && popd   # also registers the sglang plugin entry point
+pushd foundry && pip install -e . --no-build-isolation && popd
 ```
 
-`libcuda_hook.so` finds boost via a baked rpath; if it can't, add the conda lib dir to
-`LD_LIBRARY_PATH` (`export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH`).
+Foundry uses Boost header-only, so neither install needs a Boost runtime library or an
+`LD_LIBRARY_PATH` entry. `foundry.ops` refuses to import under a torch whose major.minor or
+CUDA major differs from the one it was built with.
 
 ## Run (single GPU / DP)
 

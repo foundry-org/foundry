@@ -118,37 +118,57 @@ See [ROADMAP.md](ROADMAP.md) for the full development plan and progress.
 
 ## Requirements
 
-- CMake 4.0+ (`pip install "cmake>=4.0"` if the system one is older)
-- PyTorch 2.9.0+ (Foundry is compiled against the installed torch; rebuild after changing torch)
-- CUDA Toolkit with `nvcc` (CUDA 12+; CUDA 13 with torch cu130), CUDA Driver 12.0+
-- Boost 1.83.0+ with the CMake config files, components `filesystem` and `json`
-  (Ubuntu 24.04: `apt-get install libboost-filesystem-dev libboost-json-dev`)
-
-If you are using a conda environment, you can install the requirements with the following command:
-
-```bash
-conda install -c conda-forge boost-cpp boost
-```
+- Linux x86_64, NVIDIA driver with CUDA 12.0+ (the driver's `libcuda.so.1` is loaded at runtime)
+- PyTorch: `foundry.ops` is a torch C++ extension bound to the torch it was built
+  with (major.minor and CUDA major), like sglang-kernel or flashinfer. Importing
+  it under another torch raises a readable error.
 
 ## Installation
 
+Prebuilt wheels are published to PyPI as **`foundry-core`** (the import name
+is `foundry`). One torch/CUDA pairing per release line:
+
+| foundry-core | torch | CUDA | CPython | Platform |
+|---|---|---|---|---|
+| 0.1.x | 2.13 (`torch==2.13.*`, cu130 build) | 13.0 | 3.10-3.13 | manylinux_2_28 x86_64 |
+
 ```bash
-pip install cmake # make sure cmake 4.0.0 +
-# re-enter env
-conda deactivate 
-conda activate xxx
-# Torch 2.11 with CUDA 13.0
-pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
-pip install -e . --no-build-isolation
+pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
+pip install "foundry-core>=0.1.0,<0.2"
+python -c "import foundry; print(foundry.__version__)"
 ```
 
-Into an existing SGLang environment (torch already installed), straight from git:
+The wheel ships `foundry/ops.*.so` and `foundry/libcuda_hook.so` (the hook
+SGLang/vLLM preload) and registers the SGLang plugin entry point. No Boost or
+other C++ runtime dependency is needed. Wheels for other torch/CUDA pairs, when
+built, are attached to the [GitHub Release](https://github.com/foundry-org/foundry/releases)
+with a local version (`0.1.0+cu128.torch2.12`) and install by URL.
+
+### From source
+
+Needed for any other torch, or for development. Requirements:
+
+- CMake 4.0+ and ninja (`pip install "cmake>=4.0" ninja` if the system ones are older)
+- the torch you will run with, already installed (Foundry compiles against it; rebuild after changing torch)
+- CUDA Toolkit with `nvcc` (CUDA 12+; CUDA 13 with torch cu130)
+- Boost headers, header-only (nothing is linked): the vendored copy in
+  `third_party/boost` (populated by `tools/release/vendor_boost.sh`), or a
+  system Boost >= 1.83 (Ubuntu 24.04: `apt-get install libboost-dev`; conda:
+  `conda install -c conda-forge boost-cpp`; or point `FOUNDRY_BOOST_INCLUDE_DIR`
+  at the directory that contains `boost/version.hpp`)
 
 ```bash
 pip install "cmake>=4.0" ninja
-pip install --no-build-isolation --no-deps "git+https://github.com/foundry-org/foundry.git@sglang-registry"
-python -c "import foundry.ops"   # the extension and libcuda_hook.so are in the wheel
+# Torch 2.13 with CUDA 13.0
+pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+pip install -e . --no-build-isolation
 ```
+
+`--no-build-isolation` matters: an isolated build compiles against whatever
+torch pip resolves, not the one in your environment. From PyPI's sdist into
+an existing environment: `pip install --no-build-isolation --no-binary foundry-core foundry-core`.
+
+Release process (vendoring Boost, tagging, trusted publishing): [`docs/release.md`](docs/release.md).
 
 ### Debugging
 

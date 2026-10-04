@@ -57,7 +57,7 @@ foundry_preflight() {
   # the neutral cwd covers older interpreters, and --cwd keeps relative TOML paths resolving against this directory.
   local here=$PWD
   if ! (cd / && PYTHONSAFEPATH=1 "$py" -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("foundry") is None)') 2>/dev/null; then
-    echo "[Foundry preflight] FAILED: foundry is not importable by $py: pip install -e foundry (in this venv)" >&2
+    echo "[Foundry preflight] FAILED: foundry is not importable by $py: pip install foundry-core (or pip install -e foundry) in this venv" >&2
     exit 1
   fi
   (cd / && PYTHONSAFEPATH=1 "$py" -m foundry.integration.sglang.preflight --toml "$toml" --cwd "$here" "$mode") || exit 1

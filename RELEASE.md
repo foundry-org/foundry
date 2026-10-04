@@ -1,11 +1,76 @@
-# Foundry 0.0.3
+# Foundry 0.1.0
+
+Foundry is now installable as prebuilt wheels from PyPI under the
+distribution name **`foundry-core`** (the import name stays `foundry`). This
+release is about packaging; the graph save/restore code is unchanged from
+0.0.3 apart from the Boost and filesystem changes below.
+
+## Highlights
+
+- **`pip install foundry-core`.** manylinux_2_28 x86_64 wheels for CPython
+  3.10-3.13, built against **torch 2.13 (cu130)**. One torch/CUDA pairing per
+  release line, the sglang-kernel convention: the PyPI version is plain
+  (`0.1.0`) and the wheel requires `torch==2.13.*`. Wheels for other
+  torch/CUDA pairs, when built, go on the GitHub Release only, with a local
+  version such as `0.1.0+cu128.torch2.12` (PyPI rejects local versions).
+- **SGLang dependency route.** SGLang can declare
+  `foundry-core>=0.1.0,<0.2` as an ordinary PyPI requirement; a git-ref
+  dependency would block SGLang's own PyPI upload. The plugin entry point
+  (`sglang.srt.plugins` / `foundry`) and `foundry.integration.sglang.api`
+  ship in the wheel, and `foundry/libcuda_hook.so` keeps its path next to
+  `foundry.ops` so the preload path SGLang derives is unchanged.
+- **No Boost runtime dependency.** Boost is used header-only: Boost.JSON
+  compiles through `csrc/boost_json_src.cpp` (once per shared object, hidden
+  in the preloaded hook), `boost::filesystem` is replaced by
+  `std::filesystem`, and neither `libcuda_hook.so` nor `foundry.ops` links a
+  `libboost_*` library. The headers are vendored under `third_party/boost`
+  (bcp subset of Boost 1.90.0, `tools/release/vendor_boost.sh`); source builds
+  without the vendored copy fall back to a system Boost >= 1.83.
+- **Torch build guard.** `foundry.__version__` comes from the installed
+  distribution. The build records its torch and CUDA versions in
+  `foundry/_build_info.py`; importing `foundry` under a torch with a different
+  major.minor or CUDA major raises an `ImportError` that names both builds and
+  the fix, instead of an undefined-symbol error
+  (`FOUNDRY_SKIP_TORCH_CHECK=1` bypasses it).
+
+## Packaging and release
+
+- `pyproject.toml`: name `foundry-core`, version 0.1.0; `install_requires`
+  is set by `setup.py` (`torch` for source builds, `torch==A.B.*` for release
+  wheels). `MANIFEST.in` ships the native sources and `third_party` in the
+  sdist.
+- `FOUNDRY_WHEEL_BUILD=1` builds a relocatable wheel: `foundry.ops` keeps
+  only the `$ORIGIN` RPATH (it finds `libcuda_hook.so` beside it; torch is
+  imported first) and links `-lcuda` against the toolkit stub.
+- `.github/workflows/release.yml`: sdist, a wheel matrix (`PYTHONS` x
+  `BUILD_PAIRS`) built in `pytorch/manylinux2_28-builder:cuda13.0`,
+  `auditwheel repair` with torch, CUDA runtime, NVRTC, the driver and
+  `libcuda_hook.so` excluded, layout and DT_NEEDED checks, an import smoke
+  test in a clean venv, PyPI trusted publishing and a GitHub Release.
+  `tools/release/build_wheel.sh` runs the same steps on a local host.
+- How to cut a release: [`docs/release.md`](docs/release.md).
+
+## Upgrading
+
+- `pip uninstall foundry` before installing `foundry-core`: both own the
+  `foundry` import package.
+- Source builds no longer need the compiled Boost libraries
+  (`libboost-filesystem-dev`, `libboost-json-dev`) or a Boost entry on
+  `LD_LIBRARY_PATH`; Boost headers >= 1.83 or the vendored copy suffice.
+- The wheels pair with torch 2.13 / cu130. Environments on another torch
+  (the vLLM recipe uses torch 2.11) keep building from source with
+  `pip install -e . --no-build-isolation`.
+
+## Previous Releases
+
+## Foundry 0.0.3
 
 Restored graphs now run exactly like captured ones. This release closes the
 last per-token latency gap between foundry-restored and natively captured CUDA
 graphs, validates SGLang tensor parallelism, and adds DeepEP v2 (NCCL symmetric
 windows) support.
 
-## Highlights
+### Highlights
 
 - **Restored-graph TPOT at parity with native capture.** Two root causes fixed:
   `cuGraphExecUpdate` on a shared template exec left it permanently slower
@@ -30,7 +95,7 @@ windows) support.
   match one of the two baseline runs in every cell (baseline itself is not
   run-to-run deterministic at bs ≥ 8).
 
-## Engine integrations
+### Engine integrations
 
 - **SGLang** — pairs with `foundry-org/sglang` branch `foundry` at `f1d688e52`
   (upstream main of 2026-09-01, post-0.5.18, plus the integration; the 0.0.2-era
@@ -42,7 +107,7 @@ windows) support.
 - **vLLM** — unchanged; the legacy CUDA-IPC DeepEP recipe moved to
   `recipe/vllm/experimental/`.
 
-## Fixes
+### Fixes
 
 - Member kernels whose smem variant differs from the template's re-target
   through the per-context `CUfunction` with `MAX_DYNAMIC_SHARED` set
@@ -53,12 +118,10 @@ windows) support.
   CUDA library is older than the toolkit NCCL was built with (NCCL 2.30.7
   needs a 13.3-capable driver or `cuda-compat-13-3` for every recipe).
 
-## Docs
+### Docs
 
 - `docs/pdl-edge-batching.md` (root cause, fix, driver reproducer), updated
   `docs/exec-update-penalty.md`, README status and performance tables.
-
-## Previous Releases
 
 ## Foundry 0.0.2
 

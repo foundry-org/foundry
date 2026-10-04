@@ -34,7 +34,7 @@ captured graphs. Three engine flavours run the same scripted fault on the same f
 
 - 8 GPUs (H100/H200 class) with RDMA devices for mooncake (`IB_DEVICES`, default `mlx5_ib0,mlx5_ib1`).
 - The SGLang fork with the elastic-EP work (branch `foundry-elastic-ep`), foundry installed
-  (`pip install -e foundry --no-build-isolation`), mooncake + DeepGEMM + FA3 kernels importable.
+  (`pip install foundry-core`, or `pip install -e foundry --no-build-isolation` from source), mooncake + DeepGEMM + FA3 kernels importable.
 - `Qwen/Qwen3-30B-A3B-FP8` and (for `PROBE_SRC=sharegpt`) `ShareGPT_V3_unfiltered_cleaned_split.json`
   in the local Hugging Face cache; the scripts run with `HF_HUB_OFFLINE=1`. `PROBE_SRC=random`
   needs no dataset.
