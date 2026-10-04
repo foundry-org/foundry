@@ -7,6 +7,9 @@
 # CUDAGraph with the raw pybind class and breaks `foundry.graph(...)`
 # (raw capture_begin requires a positional `pool`; the wrapper defaults it).
 # isort: off
+# _loader sets __version__, checks the installed torch against the one
+# foundry.ops was built with, and loads foundry.ops; it must stay first.
+from ._loader import __version__
 from .allocation_region import (
     allocation_region,
     free_preallocated_region,

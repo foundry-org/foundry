@@ -13,13 +13,28 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "foundry"
-version = "0.0.3"
-description = "Foundry - CUDA Graph Extension"
+# Distribution name on PyPI; the import name stays `foundry`.
+name = "foundry-core"
+version = "0.1.0"
+description = "Foundry: CUDA graph persistence for LLM serving engines (save captured CUDA graphs, restore them at startup)"
+readme = "README.md"
+# Apache-2.0 (LICENSE, picked up by setuptools' default license-files globs);
+# no `license` key so older setuptools in --no-build-isolation envs still parse this.
 requires-python = ">=3.10"
-dependencies = [
-    "torch",
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: GPU :: NVIDIA CUDA",
 ]
+# setup.py sets install_requires: "torch" for a source build, "torch==X.Y.*"
+# (the build torch) for a release wheel, since foundry.ops is bound to it.
+dynamic = ["dependencies"]
+
+[project.urls]
+Homepage = "https://github.com/foundry-org/foundry"
+Source = "https://github.com/foundry-org/foundry"
+Changelog = "https://github.com/foundry-org/foundry/blob/main/RELEASE.md"
 
 # Plugin route: SGLang discovers general plugins through this entry-point group
 # (sglang.srt.plugins.load_plugins). The entry module imports only the
@@ -47,7 +62,7 @@ include-package-data = true
 zip-safe = false
 
 [tool.setuptools.package-data]
-foundry = ["*.so"]
+foundry = ["*.so", "*.pyi"]
 
 # -----------------------------------------------------------------------------
 # Lint / format
@@ -61,6 +76,8 @@ extend-exclude = [
     "dist",
     "*.egg-info",
     "python/foundry/_version.py",
+    "python/foundry/_build_info.py",
+    "third_party",
 ]
 
 [tool.ruff.lint]

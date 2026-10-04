@@ -5,10 +5,23 @@ import re
 import subprocess
 from pathlib import Path
 
+import torch
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension, include_paths, library_paths
+from torch.utils.cpp_extension import (
+    CUDA_HOME,
+    BuildExtension,
+    CUDAExtension,
+    include_paths,
+    library_paths,
+)
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# FOUNDRY_WHEEL_BUILD=1 (set by tools/release/build_wheel.sh and the release
+# workflow): build a relocatable wheel. No absolute RPATHs into the build
+# machine's torch/CUDA, and the torch requirement pinned to the build torch's
+# major.minor. Source/editable installs keep the previous behavior.
+WHEEL_BUILD = bool(os.getenv("FOUNDRY_WHEEL_BUILD"))
 
 
 # Boost is used header-only (Boost.JSON through csrc/boost_json_src.cpp); no
@@ -81,11 +94,44 @@ def get_compile_flags():
     return flags
 
 
+def torch_requirement():
+    if not WHEEL_BUILD:
+        return "torch"
+    major, minor = torch.__version__.split("+")[0].split(".")[:2]
+    return f"torch=={major}.{minor}.*"
+
+
+def write_build_info(boost_version):
+    """Record the build-time torch/CUDA for foundry._loader's runtime check."""
+    pkg = Path(ROOT_DIR) / "python" / "foundry"
+    text = (pkg / "_build_info.py.in").read_text()
+    for key, value in {
+        "@TORCH_VERSION@": torch.__version__,
+        "@TORCH_CUDA_VERSION@": torch.version.cuda or "",
+        "@BOOST_VERSION@": boost_version,
+    }.items():
+        text = text.replace(key, value)
+    out = pkg / "_build_info.py"
+    if not out.exists() or out.read_text() != text:
+        out.write_text(text)
+
+
 boost_include_dir = resolve_boost_include_dir()
+write_build_info(_fmt_boost(_boost_version(boost_include_dir)))
 common_include_dirs = include_paths(device_type="cuda") + [os.path.join(ROOT_DIR, "include")]
 if boost_include_dir not in _IMPLICIT_INCLUDE_DIRS:
     common_include_dirs.append(boost_include_dir)
 common_library_dirs = library_paths(device_type="cuda")
+# Link -lcuda against the toolkit stub when present (build containers have no
+# driver); the runtime loads the real libcuda.so.1. Not added to the RPATH.
+if CUDA_HOME and os.path.isfile(os.path.join(CUDA_HOME, "lib64", "stubs", "libcuda.so")):
+    common_library_dirs.append(os.path.join(CUDA_HOME, "lib64", "stubs"))
+
+# libcuda_hook.so sits next to foundry.ops ($ORIGIN). A source build also bakes
+# the torch/CUDA library dirs; a wheel must not (foundry imports torch first).
+ops_rpaths = ["$ORIGIN"]
+if not WHEEL_BUILD:
+    ops_rpaths += library_paths(device_type="cuda")
 
 
 class CustomBuildExt(BuildExtension):
@@ -152,15 +198,12 @@ ext_modules = [
             "cxx": ["-O3"] + get_compile_flags(),
             "nvcc": ["-O3"] + get_compile_flags(),
         },
-        extra_link_args=[
-            "-lcuda",
-            "-Wl,-rpath,$ORIGIN",
-        ]
-        + [f"-Wl,-rpath,{p}" for p in library_paths(device_type="cuda")],
+        extra_link_args=["-lcuda"] + [f"-Wl,-rpath,{p}" for p in ops_rpaths],
     ),
 ]
 
 setup(
+    install_requires=[torch_requirement()],
     cmdclass={"build_ext": CustomBuildExt},
     ext_modules=ext_modules,
 )
