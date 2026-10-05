@@ -101,7 +101,7 @@ Persisting the resolved `MemoryPoolConfig` (via `dataclasses.asdict`) and re-app
 
 `setup_graph_extension` (in `runtime.py`):
 
-- Computes the per-rank workspace path (`{workspace_root}/rank_{compute_workspace_rank(...)}`)
+- Computes the per-rank workspace path (`{workspace_root}/rank_{compute_workspace_rank(...)}`). N is `dp_rank * tp_size * pp_size + pp_rank * tp_size + tp_rank` from the spawn ranks; attention-DP groups sit inside the TP world, so `tp_rank` already tells them apart. On an sglang before #41818 (no `attn_dp_enabled`), `--enable-dp-attention` made `dp_rank` index those groups, and N is `pp_rank * tp_size + tp_rank`; both layouts number EP4 with DP attention as rank_0..3
 - On SAVE: removes the rank workspace if it exists, then creates it fresh
 - On LOAD:
     - `cge.set_skip_fatbin_processing(True)`

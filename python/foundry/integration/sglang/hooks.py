@@ -58,16 +58,23 @@ def _ep_lazy_init_needed() -> bool:
         return False
 
 
-def _workspace_ranks(parallel, enable_dp_attention: bool) -> tuple[int, int, int | None]:
+def _workspace_ranks(parallel) -> tuple[int, int, int | None]:
     """(tp_rank, pp_rank, dp_rank) for the Foundry workspace rank.
 
     ``parallel`` is whatever carries this process's placement: the fork's
     per-runner ``ModelRunner.ps`` record, or upstream's ``get_parallel()``
     context (stamped by ``publish(ranks=...)`` before any process group
-    exists; ``ModelRunner.ps`` was removed upstream, sglang #40343). Both carry
-    the regular dp_rank and the dp-attention rank under the same names."""
-    dp_rank = parallel.attn_dp_rank if enable_dp_attention else parallel.dp_rank
-    return parallel.tp_rank, parallel.pp_rank, dp_rank
+    exists; ``ModelRunner.ps`` was removed upstream, sglang #40343).
+
+    Only spawn-time ranks are read: the attention-DP ranks (``attn_dp_rank``,
+    ``attn_tp_rank``) are computed in ``initialize_dp_attention``, inside the
+    bring-up this runs ahead of. They are not needed either: attention-DP
+    groups sit inside the TP world, so ``tp_rank`` already tells them apart
+    (``tp_rank == attn_dp_rank * attn_tp_size + attn_tp_rank`` without
+    attention CP). ``dp_rank`` is the data-parallel replica; on an sglang
+    before #41818 it indexed the attention-DP groups instead, and
+    ``config.compute_workspace_rank`` ignores it there."""
+    return parallel.tp_rank, parallel.pp_rank, parallel.dp_rank
 
 
 def install_hooks(server_args) -> None:
@@ -199,12 +206,12 @@ def before_parallel_init(device: str) -> None:
 
     parallel = get_parallel()
     # get_parallel() answers from the published placement (resolved
-    # dp-attention flag and widths), unlike the raw record fields.
+    # widths and spawn ranks), unlike the raw record fields.
     _before_distributed_init(
         parallel,
         device,
         get_device().gpu_id,
-        _workspace_ranks(parallel, parallel.enable_dp_attention),
+        _workspace_ranks(parallel),
     )
 
 
@@ -671,7 +678,7 @@ def _patch_init_torch_distributed() -> None:
             self.server_args,
             self.device,
             self.gpu_id,
-            _workspace_ranks(self.ps, self.server_args.enable_dp_attention),
+            _workspace_ranks(self.ps),
         )
         result = orig(self, *args, **kwargs)
         _after_runner_distributed_init()

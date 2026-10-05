@@ -21,6 +21,7 @@ from foundry import ops as cge
 from foundry.allocation_region import parse_size
 from foundry.integration.sglang.config import (
     CUDAGraphExtensionMode,
+    attention_dp_active,
     compute_workspace_rank,
     get_config,
     get_graph_extension_mode,
@@ -170,7 +171,16 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
     Path(cfg.workspace_root).mkdir(parents=True, exist_ok=True)
     workspace_dir = Path(cfg.workspace_root) / f"rank_{rank}"
     cfg.workspace_dir = str(workspace_dir)
-    logger.info("[Foundry] SGLang rank=%d workspace_dir=%s", rank, workspace_dir)
+    logger.info(
+        "[Foundry] SGLang rank=%d (tp_rank=%d pp_rank=%d dp_rank=%s attention_dp=%s) "
+        "workspace_dir=%s",
+        rank,
+        tp_rank,
+        pp_rank,
+        dp_rank,
+        attention_dp_active(server_args),
+        workspace_dir,
+    )
 
     if cfg.mode == CUDAGraphExtensionMode.SAVE:
         if workspace_dir.exists():
