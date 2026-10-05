@@ -170,37 +170,50 @@ def get_verbs_udev_wait_shim_path() -> str | None:
     return _config.verbs_udev_wait_shim_path
 
 
-def legacy_dp_attention(server_args) -> bool:
-    """DP attention in sglang's layout before #41818 (no ``attn_dp_enabled``):
-    ``--dp-size N --enable-dp-attention`` made ``dp_size`` count the
-    attention-DP groups of one TP world and ``dp_rank`` index them. From #41818
-    on that resolves to ``attn_dp_size=N, dp_size=1``, ``enable_dp_attention``
-    is always False after resolution, attention DP is ``attn_dp_size > 1``
-    (``attn_dp_enabled``) and ``dp_rank`` counts true replicas, each with its
-    own TP world."""
-    if hasattr(server_args, "attn_dp_enabled"):
-        return False
-    return bool(getattr(server_args, "enable_dp_attention", False))
-
-
 def attention_dp_active(server_args) -> bool:
-    """Whether attention runs data parallel, on either sglang layout."""
+    """Whether attention runs data parallel: ``attn_dp_enabled`` on sglang
+    from #41818 on (``--attn-dp-size N``; the deprecated ``--dp-size N
+    --enable-dp-attention`` resolves to it and leaves ``enable_dp_attention``
+    False), ``enable_dp_attention`` before."""
     if hasattr(server_args, "attn_dp_enabled"):
         return bool(server_args.attn_dp_enabled)
     return bool(getattr(server_args, "enable_dp_attention", False))
 
 
-def compute_workspace_rank(server_args, tp_rank: int, pp_rank: int, dp_rank: int | None) -> int:
-    """``rank_<N>`` of this process: its place in its TP x PP world, offset by
-    its data-parallel replica. Attention-DP groups sit inside the TP world on
-    both sglang layouts, so a layout keeps its numbering across them (EP4 with
-    DP attention is rank_0..3 on either)."""
-    if legacy_dp_attention(server_args):
-        # dp_rank indexes the attention-DP groups here, not replicas.
-        return pp_rank * server_args.tp_size + tp_rank
+def _attn_dp_size(server_args) -> int:
+    # Derived on get_parallel() on both layouts; a ServerArgs from before
+    # #41818 counts the attention-DP groups in dp_size.
+    size = getattr(server_args, "attn_dp_size", None)
+    if not size:
+        size = getattr(server_args, "dp_size", 1)
+    return max(int(size or 1), 1)
+
+
+def dp_replica(server_args, dp_rank: int | None) -> int:
+    """The data-parallel replica this process belongs to.
+
+    Without attention DP, ``dp_rank`` is the replica: the DP controller spawns
+    one TP x PP world per replica. With attention DP (either sglang layout)
+    the DP controller spawns the ``tp_size`` schedulers of ONE TP world and
+    passes each ``dp_rank`` = its attention-DP group,
+    ``tp_rank // (attn_tp_size * attn_cp_size)``; sglang rejects
+    ``--dp-size > 1`` together with ``--attn-dp-size > 1``. The replica is then
+    ``dp_rank // attn_dp_size`` (0), which also numbers replica-major
+    ``replica * attn_dp_size + group`` ranks should the combination appear."""
     dp_index = dp_rank or 0
+    if attention_dp_active(server_args):
+        return dp_index // _attn_dp_size(server_args)
+    return dp_index
+
+
+def compute_workspace_rank(server_args, tp_rank: int, pp_rank: int, dp_rank: int | None) -> int:
+    """``rank_<N>`` of this process:
+    ``replica * tp_size * pp_size + pp_rank * tp_size + tp_rank`` with the
+    replica from :func:`dp_replica`. EP4 with DP attention (tp 4, attn_dp 4,
+    dp_rank 0..3 = tp_rank) is rank_0..3, as before #41818."""
+    replica = dp_replica(server_args, dp_rank)
     return (
-        dp_index * server_args.tp_size * server_args.pp_size
+        replica * server_args.tp_size * server_args.pp_size
         + pp_rank * server_args.tp_size
         + tp_rank
     )

@@ -23,6 +23,7 @@ from foundry.integration.sglang.config import (
     CUDAGraphExtensionMode,
     attention_dp_active,
     compute_workspace_rank,
+    dp_replica,
     get_config,
     get_graph_extension_mode,
     get_hook_library_path,
@@ -172,12 +173,13 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
     workspace_dir = Path(cfg.workspace_root) / f"rank_{rank}"
     cfg.workspace_dir = str(workspace_dir)
     logger.info(
-        "[Foundry] SGLang rank=%d (tp_rank=%d pp_rank=%d dp_rank=%s attention_dp=%s) "
-        "workspace_dir=%s",
+        "[Foundry] SGLang rank=%d (tp_rank=%d pp_rank=%d dp_rank=%s replica=%d "
+        "attention_dp=%s) workspace_dir=%s",
         rank,
         tp_rank,
         pp_rank,
         dp_rank,
+        dp_replica(server_args, dp_rank),
         attention_dp_active(server_args),
         workspace_dir,
     )

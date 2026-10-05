@@ -69,11 +69,11 @@ def _workspace_ranks(parallel) -> tuple[int, int, int | None]:
     Only spawn-time ranks are read: the attention-DP ranks (``attn_dp_rank``,
     ``attn_tp_rank``) are computed in ``initialize_dp_attention``, inside the
     bring-up this runs ahead of. They are not needed either: attention-DP
-    groups sit inside the TP world, so ``tp_rank`` already tells them apart
-    (``tp_rank == attn_dp_rank * attn_tp_size + attn_tp_rank`` without
-    attention CP). ``dp_rank`` is the data-parallel replica; on an sglang
-    before #41818 it indexed the attention-DP groups instead, and
-    ``config.compute_workspace_rank`` ignores it there."""
+    groups sit inside the TP world, so ``tp_rank`` already tells them apart.
+    ``dp_rank`` is what the DP controller passed: the replica without
+    attention DP, the attention-DP group with it;
+    ``config.compute_workspace_rank`` takes the replica from it
+    (``config.dp_replica``)."""
     return parallel.tp_rank, parallel.pp_rank, parallel.dp_rank
 
 
