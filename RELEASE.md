@@ -1,4 +1,4 @@
-# Foundry 0.1.0rc1
+# Foundry 0.1.0rc2
 
 Release candidate of 0.1.0: the first release on PyPI (`foundry-core`, import
 name `foundry`) and the first one SGLang can depend on. It carries everything
@@ -7,7 +7,8 @@ since 0.0.3.
 ## Highlights
 
 - **`pip install foundry-core`.** manylinux_2_28 wheels for CPython 3.10-3.13,
-  built against torch 2.13.0 / cu130; the wheel requires `torch==2.13.0`.
+  built against torch 2.14.1 / cu130, SGLang's current pin; the wheel requires
+  `torch==2.14.1`.
   Importing under another torch or CUDA major raises a readable `ImportError`.
 - **Optional SGLang dependency.** Installing Foundry does not require SGLang;
   an SGLang started with `--cuda-graph-persistence {save,load}` requires
