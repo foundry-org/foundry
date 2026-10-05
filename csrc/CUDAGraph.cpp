@@ -43,13 +43,140 @@
 #define FOUNDRY_TORCH_PER_CAPTURE_RNG \
   (TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 13))
 
+// torch >= 2.14 creates the per-capture state lazily: get_capture_state(id,
+// create_if_not_found=true) replaces init_capture_state, and
+// CUDAGeneratorImpl::register_graph is gone. libtorch's lazy path registers the
+// state with the at::cuda::CUDAGraph it finds through get_graph_from_capture_id,
+// which never sees a foundry::CUDAGraph, so foundry creates the capture state of
+// every generator it registers up front; libtorch's lookup then finds it.
+#define FOUNDRY_TORCH_LAZY_CAPTURE_RNG \
+  (TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 14))
+
 // #define FOUNDRY_DEBUG  // Verbose logging (see README "Debugging"); same flag as hook.cpp
 
 namespace at {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wattributes"
 
-#if FOUNDRY_TORCH_PER_CAPTURE_RNG
+#if FOUNDRY_TORCH_LAZY_CAPTURE_RNG
+
+// Local copies of torch 2.14's unexported CUDAGeneratorCaptureState /
+// CUDAGeneratorState members (aten/src/ATen/cuda/CUDAGeneratorImpl.cpp,
+// v2.14.1). libtorch's own philox_cuda_state / increase operate on the same
+// member data, so these must stay semantically identical to the upstream source.
+
+__attribute__((visibility("hidden"))) void CUDAGeneratorCaptureState::initialize(uint64_t seed) {
+  if (is_initialized()) {
+    return;
+  }
+
+  auto options = at::TensorOptions().device(at::kCUDA).dtype(at::kLong);
+  c10::InferenceMode inference_guard(false);
+
+  // Allocate on the default stream so that the caching allocator routes
+  // these tensors to the default memory pool, not the graph's capture pool.
+  c10::cuda::CUDAStreamCaptureModeGuard capture_mode_guard(cudaStreamCaptureModeRelaxed);
+  c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getDefaultCUDAStream());
+
+  rng_state_seed_extragraph_ = at::empty({1}, options);
+  rng_state_offset_extragraph_ = at::empty({1}, options);
+  // Captured graphs bake in these buffers' addresses: make the storage
+  // non-resizable so nothing can reallocate it.
+  rng_state_seed_extragraph_.storage().unsafeGetStorageImpl()->set_resizable(false);
+  rng_state_offset_extragraph_.storage().unsafeGetStorageImpl()->set_resizable(false);
+
+  c10::cuda::getDefaultCUDAStream().synchronize();
+
+  offset_intragraph_ = 0;
+}
+
+__attribute__((visibility("hidden"))) void CUDAGeneratorCaptureState::increase(uint64_t increment) {
+  TORCH_INTERNAL_ASSERT(offset_intragraph_ % 4 == 0, "RNG offset must be a multiple of 4.");
+  TORCH_INTERNAL_ASSERT(offset_intragraph_ <= std::numeric_limits<uint64_t>::max() - increment,
+                        "Increment causes overflow in the offset value.");
+  offset_intragraph_ += increment;
+}
+
+__attribute__((visibility("hidden"))) uint64_t CUDAGeneratorCaptureState::finalize() {
+  uint64_t result = offset_intragraph_;
+  offset_intragraph_ = 0;
+  return result;
+}
+
+__attribute__((visibility("hidden"))) void CUDAGeneratorCaptureState::setup_for_replay(
+    uint64_t seed, uint64_t philox_offset) {
+  TORCH_INTERNAL_ASSERT(is_initialized(), "Capture state not initialized");
+  rng_state_seed_extragraph_.fill_(static_cast<int64_t>(seed));
+  rng_state_offset_extragraph_.fill_(static_cast<int64_t>(philox_offset));
+
+  // Upstream Note [RNG state tensor lifetime and recordStream]: the replay
+  // stream reads these tensors, so a free must wait for it.
+  auto stream = c10::cuda::getCurrentCUDAStream();
+  c10::cuda::CUDACachingAllocator::recordStream(rng_state_seed_extragraph_.storage().data_ptr(),
+                                                stream);
+  c10::cuda::CUDACachingAllocator::recordStream(rng_state_offset_extragraph_.storage().data_ptr(),
+                                                stream);
+}
+
+// Upstream additionally looks up the capturing at::cuda::CUDAGraph and calls
+// its register_generator_state when it creates the state. A foundry::CUDAGraph
+// is not in that lookup; foundry's callers register the state themselves
+// (CUDAGraph::register_generator_state) before creating its capture state.
+__attribute__((visibility("hidden"))) CUDAGeneratorCaptureState*
+CUDAGeneratorState::get_capture_state(CaptureId_t capture_id, bool create_if_not_found) {
+  {
+    std::lock_guard<std::mutex> lock(capture_states_mutex_);
+    auto it = capture_states_.find(capture_id);
+    if (it != capture_states_.end()) {
+      return it->second.get();
+    }
+    if (!create_if_not_found) {
+      return nullptr;
+    }
+  }
+
+  auto capture_state = make_intrusive<CUDAGeneratorCaptureState>();
+  capture_state->initialize(seed_);
+
+  std::lock_guard<std::mutex> lock(capture_states_mutex_);
+  auto it = capture_states_.find(capture_id);
+  if (it != capture_states_.end()) {
+    return it->second.get();
+  }
+  auto* ptr = capture_state.get();
+  capture_states_[capture_id] = std::move(capture_state);
+  return ptr;
+}
+
+__attribute__((visibility("hidden"))) uint64_t
+CUDAGeneratorState::capture_epilogue(CaptureId_t capture_id) {
+  auto* capture_state = get_capture_state(capture_id, false);
+  if (capture_state) {
+    return capture_state->finalize();
+  }
+  return 0;
+}
+
+__attribute__((visibility("hidden"))) void CUDAGeneratorState::remove_capture_state(
+    CaptureId_t capture_id) {
+  std::lock_guard<std::mutex> lock(capture_states_mutex_);
+  capture_states_.erase(capture_id);
+}
+
+__attribute__((visibility("hidden"))) void CUDAGeneratorState::replay_prologue(
+    CaptureId_t capture_id, uint64_t wholegraph_increment) {
+  if (wholegraph_increment == 0) {
+    return;
+  }
+
+  auto* capture_state = get_capture_state(capture_id);
+  TORCH_INTERNAL_ASSERT(capture_state != nullptr,
+                        "replay_prologue called but no capture state found for this capture_id");
+  capture_state->setup_for_replay(seed_, philox_offset_per_thread_);
+  philox_offset_per_thread_ += wholegraph_increment;
+}
+
+#elif FOUNDRY_TORCH_PER_CAPTURE_RNG
 
 // Local copies of torch 2.13's unexported CUDAGeneratorCaptureState /
 // CUDAGeneratorState members (aten/src/ATen/cuda/CUDAGeneratorImpl.cpp).
@@ -250,6 +377,26 @@ namespace foundry {
 
 namespace {
 
+#if FOUNDRY_TORCH_LAZY_CAPTURE_RNG
+// torch 2.14 dropped CUDAGeneratorImpl::register_graph, the member through which
+// foundry reached a generator's private state_. An explicit instantiation is
+// exempt from access checking ([temp.spec.general]), which yields a
+// pointer-to-member for it; the layout is torch's own, nothing is assumed.
+struct GeneratorStateMember {
+  using type = c10::intrusive_ptr<at::CUDAGeneratorState> at::CUDAGeneratorImpl::*;
+};
+template <typename Tag, typename Tag::type Member>
+struct PrivateMemberAccess {
+  friend typename Tag::type member_pointer(Tag) { return Member; }
+};
+GeneratorStateMember::type member_pointer(GeneratorStateMember);
+template struct PrivateMemberAccess<GeneratorStateMember, &at::CUDAGeneratorImpl::state_>;
+
+c10::intrusive_ptr<at::CUDAGeneratorState> generator_state_of(at::CUDAGeneratorImpl* gen) {
+  return gen->*member_pointer(GeneratorStateMember{});
+}
+#endif  // FOUNDRY_TORCH_LAZY_CAPTURE_RNG
+
 MempoolId_t torch_graph_pool_handle(bool is_user_created = true) {
 #if FOUNDRY_HAS_ATEN_CUDA_MEMPOOL
   return at::cuda::MemPool::graph_pool_handle(is_user_created);
@@ -321,7 +468,11 @@ void CUDAGraph::register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorSta
 void CUDAGraph::register_generator_state(const at::Generator& generator) {
   c10::intrusive_ptr<at::CUDAGeneratorImpl> cuda_gen =
       c10::dynamic_intrusive_pointer_cast<at::CUDAGeneratorImpl>(generator.getIntrusivePtr());
+#if FOUNDRY_TORCH_LAZY_CAPTURE_RNG
+  register_generator_state(generator_state_of(cuda_gen.get()));
+#else
   cuda_gen->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
+#endif
 }
 
 #if FOUNDRY_TORCH_PER_CAPTURE_RNG
@@ -347,7 +498,11 @@ void CUDAGraph::register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorSta
   }
   // Allocates this (state, capture_id) pair's seed/offset extragraph tensors
   // (the lazy allocation register_graph used to do on the state itself).
+#if FOUNDRY_TORCH_LAZY_CAPTURE_RNG
+  state->get_capture_state(capture_id_, /*create_if_not_found=*/true);
+#else
   state->init_capture_state(capture_id_);
+#endif
 #else
   state->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
 #endif
@@ -361,7 +516,11 @@ void CUDAGraph::capture_begin(MempoolId_t pool, cudaStreamCaptureMode capture_mo
 
   auto* gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
       std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+#if FOUNDRY_TORCH_LAZY_CAPTURE_RNG
+  register_generator_state(generator_state_of(gen));
+#else
   gen->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
+#endif
 
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -411,7 +570,13 @@ void CUDAGraph::capture_begin(MempoolId_t pool, cudaStreamCaptureMode capture_mo
   // Per torch 2.13: per-capture RNG state is created once the capture id is
   // known (allocations route to the default pool via internal guards).
   for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
+#if FOUNDRY_TORCH_LAZY_CAPTURE_RNG
+    // torch 2.14 creates it on the first RNG op through the at::cuda::CUDAGraph
+    // lookup, which cannot find this graph: create it now instead.
+    generator_state->get_capture_state(capture_id_, /*create_if_not_found=*/true);
+#else
     generator_state->init_capture_state(capture_id_);
+#endif
   }
 #endif
 }
