@@ -23,11 +23,11 @@ major), like sglang-kernel and flashinfer. PyPI rejects local version labels
 
 | Release line | PyPI pair | CPython | Platform |
 |---|---|---|---|
-| 0.1.x | torch 2.13, cu130 | 3.10-3.13 | manylinux_2_28 x86_64 |
+| 0.1.x (0.1.0rc2 on) | torch 2.14, cu130 | 3.10-3.13 | manylinux_2_28 x86_64 |
 
-SGLang depends on `foundry-core>=0.1.0rc1,<0.2` (the rc lower bound lets pip pick the release candidate; it becomes `>=0.1.0` with the final release). Changing the PyPI pair (for
-example to torch 2.14) therefore needs a new minor line (0.2.0) coordinated
-with SGLang's own torch bump; 0.1.x patch releases keep torch 2.13 / cu130.
+SGLang depends on `foundry-core>=0.1.0rc2,<0.2` (the rc lower bound lets pip pick the release candidate; it becomes `>=0.1.0` with the final release). The PyPI pair follows SGLang's torch pin (torch 2.14.1 / cu130 for 0.1.x).
+Once 0.1.0 is final, changing the PyPI pair needs a new minor line (0.2.0)
+coordinated with SGLang's own torch bump; 0.1.x patch releases keep torch 2.14 / cu130.
 Keep the table above, the README installation table and `RELEASE.md` in sync
 with `BUILD_PAIRS`.
 
@@ -87,7 +87,7 @@ create releases (the default for a repository).
 3. **Validate on a GPU host** before tagging. With docker:
 
    ```bash
-   tools/release/build_wheel.sh --docker --python 3.12 --torch 2.13.0 --cuda cu130
+   tools/release/build_wheel.sh --docker --python 3.12 --torch 2.14.1 --cuda cu130
    FOUNDRY_DOCKER_GPUS=all tools/release/build_wheel.sh --docker --python 3.12   # smoke against the real driver
    ```
 
@@ -104,8 +104,8 @@ create releases (the default for a repository).
 5. **Tag and push**:
 
    ```bash
-   git tag v0.1.0rc1        # a pre-release: PEP 440 `0.1.0rc1`, the tag must equal `v` + the pyproject version
-   git push pub v0.1.0rc1   # the remote that holds the trusted-publisher repo
+   git tag v0.1.0rc2        # a pre-release: PEP 440 `0.1.0rc2`, the tag must equal `v` + the pyproject version
+   git push pub v0.1.0rc2   # the remote that holds the trusted-publisher repo
    ```
 
    The plan job checks that the tag equals `v<pyproject version>`. Then:
@@ -117,8 +117,8 @@ create releases (the default for a repository).
 6. **Verify** in a fresh venv:
 
    ```bash
-   pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
-   pip install foundry-core==0.1.0rc1
+   pip install "torch==2.14.1" --index-url https://download.pytorch.org/whl/cu130
+   pip install foundry-core==0.1.0rc2
    python -c "import foundry, foundry.integration.sglang.api as a; print(foundry.__version__, a.INTEGRATION_API_VERSION)"
    ```
 

@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       torch:
-        description: "torch version to build against, e.g. 2.13.0 (empty: every pair in BUILD_PAIRS)"
+        description: "torch version to build against, e.g. 2.14.1 (empty: every pair in BUILD_PAIRS)"
         required: false
         default: ""
       cuda:
@@ -33,7 +33,7 @@ env:
   # only, since PyPI rejects local versions. "image" is optional; the default
   # is pytorch/manylinux2_28-builder:cuda<major.minor of the cuda tag>.
   PYTHONS: '["3.10", "3.11", "3.12", "3.13"]'
-  BUILD_PAIRS: '[{"torch": "2.13.0", "cuda": "cu130"}]'
+  BUILD_PAIRS: '[{"torch": "2.14.1", "cuda": "cu130"}]'
 
 jobs:
   plan:

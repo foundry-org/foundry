@@ -130,11 +130,11 @@ is `foundry`). One torch/CUDA pairing per release line:
 
 | foundry-core | torch | CUDA | CPython | Platform |
 |---|---|---|---|---|
-| 0.1.x | 2.13 (`torch==2.13.*`, cu130 build) | 13.0 | 3.10-3.13 | manylinux_2_28 x86_64 |
+| 0.1.x (0.1.0rc2 on) | 2.14 (`torch==2.14.1`, cu130 build) | 13.0 | 3.10-3.13 | manylinux_2_28 x86_64 |
 
 ```bash
-pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
-pip install "foundry-core>=0.1.0rc1,<0.2"
+pip install "torch==2.14.1" --index-url https://download.pytorch.org/whl/cu130
+pip install "foundry-core>=0.1.0rc2,<0.2"
 python -c "import foundry; print(foundry.__version__)"
 ```
 
@@ -159,8 +159,8 @@ Needed for any other torch, or for development. Requirements:
 
 ```bash
 pip install "cmake>=4.0" ninja
-# Torch 2.13 with CUDA 13.0
-pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+# Torch 2.14 with CUDA 13.0
+pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
 pip install -e . --no-build-isolation
 ```
 

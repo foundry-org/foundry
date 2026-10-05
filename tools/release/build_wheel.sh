@@ -6,14 +6,14 @@
 # release workflow (.github/workflows/release.yml) does.
 #
 # Inside a manylinux builder container (pytorch/manylinux2_28-builder:cudaXY.Z):
-#   tools/release/build_wheel.sh --python 3.12 --torch 2.13.0 --cuda cu130
+#   tools/release/build_wheel.sh --python 3.12 --torch 2.14.1 --cuda cu130
 # From a host with docker (runs itself inside the matching builder image):
-#   tools/release/build_wheel.sh --docker --python 3.12 --torch 2.13.0 --cuda cu130
+#   tools/release/build_wheel.sh --docker --python 3.12 --torch 2.14.1 --cuda cu130
 #   FOUNDRY_DOCKER_GPUS=all tools/release/build_wheel.sh --docker ...   # smoke with a real driver
 #
 # Options:
 #   --python X.Y        CPython version (manylinux /opt/python/cpXY-cpXY)   [3.12]
-#   --torch  X.Y.Z      torch build to compile against                        [2.13.0]
+#   --torch  X.Y.Z      torch build to compile against                        [2.14.1]
 #   --cuda   cuXYZ      torch CUDA flavor (index https://download.pytorch.org/whl/cuXYZ) [cu130]
 #   --local-version S   append "+S" to the wheel version (GitHub-Release-only builds
 #                       for a non-default torch/CUDA pair; PyPI rejects local versions)
@@ -25,7 +25,7 @@
 set -euo pipefail
 
 PY_VER=3.12
-TORCH_VER=2.13.0
+TORCH_VER=2.14.1
 CUDA_TAG=cu130
 LOCAL_VERSION=""
 OUT=wheelhouse
