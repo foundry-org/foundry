@@ -367,9 +367,19 @@ def test_env_pin_already_set_to_the_pinned_value_is_kept(clean_pin_env):
 
 @pytest.mark.parametrize("pin", plugin.ENV_PINS, ids=lambda pin: pin.name)
 def test_explicit_contrary_env_is_rejected(clean_pin_env, pin):
-    os.environ[pin.name] = "1"
-    with pytest.raises(ValueError, match=f"{pin.name}='1' \\(Foundry needs 0\\)"):
+    contrary = "0" if pin.value == "1" else "1"
+    os.environ[pin.name] = contrary
+    with pytest.raises(
+        ValueError, match=f"{pin.name}='{contrary}' \\(Foundry needs {pin.value}\\)"
+    ):
         plugin.apply_env_pins()
+
+
+def test_torchdynamo_is_disabled(clean_pin_env):
+    """torch >= 2.14 dynamo cannot compile inside SAVE's capture window."""
+    assert ("TORCHDYNAMO_DISABLE", "1") in {(pin.name, pin.value) for pin in plugin.ENV_PINS}
+    plugin.apply_env_pins()
+    assert os.environ["TORCHDYNAMO_DISABLE"] == "1"
 
 
 def test_nccl_cumem_is_pinned_once_the_a2a_backend_is_known(clean_pin_env):

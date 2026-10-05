@@ -9,6 +9,24 @@ order, and LOAD cannot replay that layout. `region_layout.json` (per rank) recor
 or with another value: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the
 current code`. Rule: re-SAVE every archive saved by the old code.
 
+## torch 2.14: dynamo refuses to compile inside the capture window (PINNED, 2026-10-04)
+
+**Symptom.** With torch 2.14 (SGLang's pin from upstream f385390be5), SAVE fails at the first captured forward
+when it reaches a `@torch.compile`d helper (e.g. SGLang's MoE top-k post-processing): torch >= 2.14's dynamo
+refuses to JIT-compile while a stream is capturing.
+
+**Cause.** SAVE runs no warm-up forwards (their allocations would not be in LOAD's layout), so the first call
+of every compiled helper is inside the capture window by design.
+
+**Fix.** `TORCHDYNAMO_DISABLE=1` is an environment pin (`plugin.ENV_PINS`, both routes): set in the launcher
+before any scheduler or DP controller is spawned, so each child has it before it imports the model modules
+(dynamo reads it when a function is wrapped). Every compiled helper runs eager on SAVE and LOAD alike, and
+`--enable-torch-compile` becomes eager too. While the pin is on, the two compile-inside-capture entries below
+(inductor autotune, CPU constant copy) cannot occur.
+
+**Cost.** Qwen3-30B-A3B-FP8 EP4: decode TPOT unchanged against native (bs 1/8/32/128: 4.66/5.34/6.29/7.12 vs
+4.62/5.34/6.30/6.94 ms). Prefill throughput -11% in a single run, inconclusive, to be re-measured.
+
 ## DeepEP v2 (NCCL windows + GIN) not validated on the plugin route (TODO, 2026-09-30)
 
 `--moe-a2a-backend deepep_v2` was validated on the earlier fork route only (H100 EP2 / EP4, all 256 decode graphs,
