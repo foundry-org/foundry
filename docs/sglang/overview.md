@@ -90,7 +90,6 @@ backend and is pinned by the `handle_other_validations` hook, once `--moe-a2a-ba
 | `SGLANG_ENABLE_METADATA_GLUE_GRAPH` | `0` | the attention-metadata prep is captured into a second graph Foundry does not save | set to true |
 | `SGLANG_ENABLE_GRAPH_POOL_PRECARVE` | `0` | only upstream `capture_one` runs the precarve (measured over its two eager warmups, minted at the first capture); Foundry's `capture_one` replaces it on SAVE and LOAD, so the flag would be a no-op and the graph pool would not match a native run's layout | set to true |
 | `SGLANG_ENABLE_GRAPH_POOL_BORROW` | `0` | eager allocations would borrow free graph-pool extents whose addresses the restored graphs reference | set to true |
-| `TORCHDYNAMO_DISABLE` | `1` | torch >= 2.14's dynamo refuses to compile while a stream is capturing; SAVE captures without warm-up forwards, so every `torch.compile`d helper runs eager instead (`--enable-torch-compile` too); see [`known-issues.md`](known-issues.md#torch-214-dynamo-refuses-to-compile-inside-the-capture-window-pinned-2026-10-04) | set to anything but 1 |
 
 Rejected instead, because Foundry has no logic for them: speculative decoding, LoRA, PD multiplexing, elastic-EP
 recapture, attention graph variants, non-full graph backends, `--disable-cuda-graph`, CUDA-graph profiling,

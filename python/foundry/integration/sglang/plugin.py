@@ -474,17 +474,6 @@ ENV_PINS: tuple[EnvPin, ...] = (
         "eager allocations would borrow free graph-pool extents whose addresses the restored "
         "graphs reference",
     ),
-    # Read by dynamo when a function is wrapped (torch.compile / optimize), i.e.
-    # when sglang imports its model modules; the schedulers inherit it from the
-    # spawn environment, so it is set before their first import.
-    EnvPin(
-        "TORCHDYNAMO_DISABLE",
-        "1",
-        "torch >= 2.14's dynamo refuses to compile while a stream is capturing, and SAVE "
-        "captures without warm-up forwards, so the first call of every torch.compile'd helper "
-        "(e.g. the MoE top-k post-processing) would land inside the capture; eager helpers "
-        "keep SAVE and LOAD symmetric (--enable-torch-compile then runs eager)",
-    ),
 )
 
 # NCCL_CUMEM_ENABLE=0 unless the MoE all-to-all is DeepEP v2, whose NCCL

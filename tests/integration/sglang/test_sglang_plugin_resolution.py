@@ -375,12 +375,6 @@ def test_explicit_contrary_env_is_rejected(clean_pin_env, pin):
         plugin.apply_env_pins()
 
 
-def test_torchdynamo_is_disabled(clean_pin_env):
-    """torch >= 2.14 dynamo cannot compile inside SAVE's capture window."""
-    assert ("TORCHDYNAMO_DISABLE", "1") in {(pin.name, pin.value) for pin in plugin.ENV_PINS}
-    plugin.apply_env_pins()
-    assert os.environ["TORCHDYNAMO_DISABLE"] == "1"
-
 
 def test_nccl_cumem_is_pinned_once_the_a2a_backend_is_known(clean_pin_env):
     plugin.apply_env_pins(SimpleNamespace(moe_a2a_backend="deepep"))
