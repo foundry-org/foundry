@@ -448,10 +448,15 @@ def capture_one(
         raise RuntimeError("[Foundry] capture_one called without SAVE or LOAD")
     from foundry.integration.sglang import warmup_pool
 
-    if warmup_pool.current_phase() == warmup_pool.PREPARE:
+    phase = warmup_pool.current_phase()
+    if phase == warmup_pool.PREPARE:
         if mode == CUDAGraphExtensionMode.SAVE:
             warmup_pool.warm_up(shape_key, forward_fn, post_warmup_hook, tp_group)
         return None
+    if phase == warmup_pool.WARM_AND_CAPTURE and mode == CUDAGraphExtensionMode.SAVE:
+        # per_shape warm policy: warm this shape in the private pool, then
+        # capture it below.
+        warmup_pool.warm_up(shape_key, forward_fn, post_warmup_hook, tp_group)
     req_slots = prefill_req_slots
     if mode == CUDAGraphExtensionMode.LOAD:
         # LOAD, both runners: the upstream capture loop runs (see

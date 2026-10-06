@@ -41,6 +41,11 @@ was, so the preparation pass allocates identically on both modes. Per-shape prep
 idempotent across the two passes: FlashInfer's decode wrappers are reused (sglang-side change), since recreated
 wrappers sit in a reference cycle and are freed at a GC-dependent time.
 
+Experiment knob `FOUNDRY_SGLANG_WARM_POLICY` (default `two_pass`, the scheme above): `per_shape` runs the loop once,
+and SAVE warms each shape in the private pool right before capturing it (the prototype's `per_bs` policy); the
+pool lives across shapes and is released after the loop with the same checks, then the pointer audit runs. LOAD
+restores in a single pass. It exists to compare the two placements by experiment; `two_pass` stays the default.
+
 Validated (prototype, `experimental/torch214_capture`): Qwen3-1.7B and Qwen3-30B-A3B-FP8 with FlashInfer, TP1 and
 attention-DP2/EP2 with DeepEP v1 low-latency and v2 direct, Dynamo enabled; native/SAVE/LOAD greedy outputs and
 logprobs equal in the controlled runs (one intermittent LOAD logprob outlier in DeepEP auto mode, not reproduced

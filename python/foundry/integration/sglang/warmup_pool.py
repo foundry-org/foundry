@@ -25,6 +25,13 @@ in the private pool and be retained: :func:`bootstrap_persistent_resources`
 creates them in the normal allocation domain on both modes before pass A.
 After pass B, :func:`audit_graph_pointers` fails SAVE when a saved graph
 references the private pool's former address ranges.
+
+Experiment knob ``FOUNDRY_SGLANG_WARM_POLICY`` (:func:`warm_policy`):
+``two_pass`` (default) is the scheme above. ``per_shape`` runs the loop once:
+on SAVE ``capture_one`` warms THIS shape in the private pool and captures it
+right after; the pool lives across shapes and is released after the loop
+(same checks), then the pointer audit runs. LOAD runs the loop once and
+restores, as without the warm-up pool.
 """
 
 from __future__ import annotations
@@ -51,6 +58,22 @@ logger = logging.getLogger(__name__)
 
 PREPARE = "prepare"
 CAPTURE = "capture"
+# per_shape policy: warm the shape (SAVE), then capture or restore it.
+WARM_AND_CAPTURE = "warm_and_capture"
+
+TWO_PASS = "two_pass"
+PER_SHAPE = "per_shape"
+_POLICIES = (TWO_PASS, PER_SHAPE)
+
+
+def warm_policy() -> str:
+    """``FOUNDRY_SGLANG_WARM_POLICY``: ``two_pass`` (default) or ``per_shape``."""
+    policy = os.environ.get("FOUNDRY_SGLANG_WARM_POLICY", TWO_PASS) or TWO_PASS
+    if policy not in _POLICIES:
+        raise ValueError(
+            f"FOUNDRY_SGLANG_WARM_POLICY={policy!r}: use one of {', '.join(_POLICIES)}"
+        )
+    return policy
 
 
 class _Loop:
@@ -68,8 +91,9 @@ _loop: _Loop | None = None
 
 
 def current_phase() -> str | None:
-    """PREPARE or CAPTURE inside :func:`run_capture_loop`, None outside it
-    (a single-pass capture loop: capture_one captures or restores)."""
+    """PREPARE, CAPTURE or WARM_AND_CAPTURE inside :func:`run_capture_loop`,
+    None outside it (a single-pass capture loop: capture_one captures or
+    restores)."""
     return None if _loop is None else _loop.phase
 
 
@@ -369,27 +393,60 @@ def _graph_files(workspace_dir: str | None) -> set[Path]:
 
 
 # ---------------------------------------------------------------------------
-# The two passes
+# The capture loop
 # ---------------------------------------------------------------------------
+
+
+def _audit_new_graphs(loop: _Loop, before: set[Path]) -> None:
+    cfg = get_config()
+    new = sorted(_graph_files(cfg.workspace_dir if cfg else None) - before)
+    n_files, n_nodes = audit_graph_pointers(new, loop.pool_ranges)
+    logger.info(
+        "[Foundry] SAVE pointer audit: %d graphs, %d nodes, no reference into the "
+        "released warm-up pool (%d ranges)",
+        n_files,
+        n_nodes,
+        len(loop.pool_ranges),
+    )
 
 
 def run_capture_loop(runner: Any, loop_fn: Callable[[], Any]) -> Any:
     """Run a runner's per-shape capture loop (``_capture_one_stream``, inside
-    its capture session) as pass A (preparation; SAVE warm-ups in the private
-    pool) then pass B (capture or restore). Without SAVE / LOAD, or when the
-    integration is disabled with ``FOUNDRY_SGLANG_SINGLE_PASS=1``, the loop
-    runs once."""
+    its capture session) under the warm policy (:func:`warm_policy`):
+    ``two_pass`` runs pass A (preparation; SAVE warm-ups in the private pool)
+    then pass B (capture or restore); ``per_shape`` runs it once, SAVE warming
+    each shape right before capturing it. Without SAVE / LOAD, or with
+    ``FOUNDRY_SGLANG_SINGLE_PASS=1``, the loop runs once without warm-ups."""
     global _loop
     mode = get_graph_extension_mode()
     if mode == CUDAGraphExtensionMode.NONE or os.environ.get("FOUNDRY_SGLANG_SINGLE_PASS") == "1":
         return loop_fn()
     if _loop is not None:
         raise RuntimeError("[Foundry] nested capture loops are not supported")
+    policy = warm_policy()
     _loop = loop = _Loop(runner)
     try:
         prepared = bootstrap_persistent_resources(runner)
-        logger.info("[Foundry] persistent bootstrap (%s): %s", type(runner).__name__, prepared)
+        logger.info(
+            "[Foundry] warm policy %s (%s); persistent bootstrap: %s",
+            policy,
+            type(runner).__name__,
+            prepared,
+        )
         rt.log_alloc_offset("after_persistent_bootstrap")
+        cfg = get_config()
+        if policy == PER_SHAPE:
+            loop.phase = WARM_AND_CAPTURE
+            before = _graph_files(cfg.workspace_dir if cfg else None)
+            result = loop_fn()
+            gc.collect()
+            if mode == CUDAGraphExtensionMode.SAVE:
+                _release_pool(loop)
+                if loop.pool_ranges:
+                    _audit_new_graphs(loop, before)
+            rt.log_alloc_offset("after_capture_pass")
+            return result
+
         loop_fn()
         # Same sequence point on both modes: cyclic garbage of the preparation
         # pass (deterministic domain) is collected before the capture pass.
@@ -398,19 +455,10 @@ def run_capture_loop(runner: Any, loop_fn: Callable[[], Any]) -> Any:
             _release_pool(loop)
         rt.log_alloc_offset("after_preparation_pass")
         loop.phase = CAPTURE
-        cfg = get_config()
         before = _graph_files(cfg.workspace_dir if cfg else None)
         result = loop_fn()
         if mode == CUDAGraphExtensionMode.SAVE and loop.pool_ranges:
-            new = sorted(_graph_files(cfg.workspace_dir if cfg else None) - before)
-            n_files, n_nodes = audit_graph_pointers(new, loop.pool_ranges)
-            logger.info(
-                "[Foundry] SAVE pointer audit: %d graphs, %d nodes, no reference into the "
-                "released warm-up pool (%d ranges)",
-                n_files,
-                n_nodes,
-                len(loop.pool_ranges),
-            )
+            _audit_new_graphs(loop, before)
         rt.log_alloc_offset("after_capture_pass")
         return result
     finally:

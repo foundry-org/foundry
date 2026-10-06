@@ -104,3 +104,63 @@ def test_flashinfer_updater_found_behind_a_hybrid_wrapper():
 
 def test_outside_the_two_pass_loop_there_is_no_phase():
     assert warmup_pool.current_phase() is None
+
+
+def test_warm_policy_defaults_to_two_pass(monkeypatch):
+    monkeypatch.delenv("FOUNDRY_SGLANG_WARM_POLICY", raising=False)
+    assert warmup_pool.warm_policy() == warmup_pool.TWO_PASS
+    monkeypatch.setenv("FOUNDRY_SGLANG_WARM_POLICY", "")
+    assert warmup_pool.warm_policy() == warmup_pool.TWO_PASS
+
+
+def test_warm_policy_per_shape(monkeypatch):
+    monkeypatch.setenv("FOUNDRY_SGLANG_WARM_POLICY", "per_shape")
+    assert warmup_pool.warm_policy() == warmup_pool.PER_SHAPE
+
+
+def test_unknown_warm_policy_is_rejected(monkeypatch):
+    monkeypatch.setenv("FOUNDRY_SGLANG_WARM_POLICY", "per_bs")
+    with pytest.raises(ValueError, match="FOUNDRY_SGLANG_WARM_POLICY"):
+        warmup_pool.warm_policy()
+
+
+def test_loop_without_save_or_load_runs_once_under_either_policy(monkeypatch):
+    """Mode NONE: the loop runs once, no bootstrap, no phase."""
+    monkeypatch.setattr(
+        warmup_pool, "get_graph_extension_mode", lambda: warmup_pool.CUDAGraphExtensionMode.NONE
+    )
+    for policy in (warmup_pool.TWO_PASS, warmup_pool.PER_SHAPE):
+        monkeypatch.setenv("FOUNDRY_SGLANG_WARM_POLICY", policy)
+        runs = []
+        assert warmup_pool.run_capture_loop(object(), lambda: runs.append(1) or "r") == "r"
+        assert runs == [1]
+        assert warmup_pool.current_phase() is None
+
+
+def test_per_shape_runs_the_loop_once_in_warm_and_capture_phase(monkeypatch):
+    """LOAD under per_shape: one pass, phase WARM_AND_CAPTURE, no pool release."""
+    monkeypatch.setenv("FOUNDRY_SGLANG_WARM_POLICY", "per_shape")
+    monkeypatch.setattr(
+        warmup_pool, "get_graph_extension_mode", lambda: warmup_pool.CUDAGraphExtensionMode.LOAD
+    )
+    monkeypatch.setattr(warmup_pool, "bootstrap_persistent_resources", lambda runner: [])
+    monkeypatch.setattr(warmup_pool.rt, "log_alloc_offset", lambda label: None)
+    monkeypatch.setattr(warmup_pool, "get_config", lambda: None)
+    phases = []
+    warmup_pool.run_capture_loop(object(), lambda: phases.append(warmup_pool.current_phase()))
+    assert phases == [warmup_pool.WARM_AND_CAPTURE]
+    assert warmup_pool.current_phase() is None
+
+
+def test_two_pass_runs_prepare_then_capture(monkeypatch):
+    """LOAD under two_pass: preparation pass then capture pass."""
+    monkeypatch.delenv("FOUNDRY_SGLANG_WARM_POLICY", raising=False)
+    monkeypatch.setattr(
+        warmup_pool, "get_graph_extension_mode", lambda: warmup_pool.CUDAGraphExtensionMode.LOAD
+    )
+    monkeypatch.setattr(warmup_pool, "bootstrap_persistent_resources", lambda runner: [])
+    monkeypatch.setattr(warmup_pool.rt, "log_alloc_offset", lambda label: None)
+    monkeypatch.setattr(warmup_pool, "get_config", lambda: None)
+    phases = []
+    warmup_pool.run_capture_loop(object(), lambda: phases.append(warmup_pool.current_phase()))
+    assert phases == [warmup_pool.PREPARE, warmup_pool.CAPTURE]
