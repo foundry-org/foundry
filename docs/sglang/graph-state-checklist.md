@@ -16,8 +16,12 @@ Every item below is one of these.
   `cudaFuncSetAttribute`, `cudaMemcpyToSymbol` / `__device__`/`__constant__` initialisers, cache config, library
   device state. Foundry re-applies exactly four things: max dynamic smem (recorded), carveout (recorded, CUkernel
   only), the non-portable cluster opt-in (derived, 8298912) and NVSHMEM device state (init_nvshmem_for_loaded_modules).
-- **M2, SAVE runs no eager warm-up.** Foundry's `capture_one` skips upstream's two warm-up forwards, so on SAVE
-  the first call of every kernel and every lazy initialiser happens inside the first stream capture. Lazy work not
+- **M2, SAVE warm-ups run in a private pool.** Since 2026-10-06 the two upstream warm-up forwards per shape run on
+  SAVE right before the shape's capture, inside a private `torch.cuda.MemPool` with recording stopped, released
+  after the loop (`warmup_pool.py`); LOAD runs no forward. First calls of kernels and lazy initialisers therefore
+  happen before the capture again, but a persistent resource they create lands in the private pool and fails SAVE
+  unless the persistent bootstrap creates it first. Before that change the first call of every kernel and every
+  lazy initialiser happened inside the first stream capture. Lazy work not
   in the pre-capture bootstrap list ends up (a) failing the capture loudly, (b) allocated from graph #1's pool with
   a memset/arange node only graph #1 contains, or (c) silently on a different code path than native (probes that
   answer "not ready" while capturing).

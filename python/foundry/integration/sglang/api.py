@@ -35,6 +35,7 @@ scheduler / DP-controller spawn             :func:`configure_subprocess`
 ``ModelRunner.alloc_memory_pool``           :func:`before_alloc_memory_pool`,
                                             :func:`after_alloc_memory_pool`
 decode / prefill runner ``capture``         :func:`capture_scope`
+runners' ``_capture_one_stream`` call      :func:`run_capture_loop`
 ``FullCudaGraphBackend.capture_one``        :func:`capture_one`
 ``_resolve_shared_read_ends``               :func:`shared_read_ends_override`
 ==========================================  ===================================
@@ -54,7 +55,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-INTEGRATION_API_VERSION = (1, 0)
+INTEGRATION_API_VERSION = (1, 1)
 MODES = ("save", "load")
 FLAG = "--cuda-graph-persistence"
 
@@ -298,18 +299,40 @@ def capture_one(
     pool: Any,
     stream: Any,
     prefill_req_slots: int | None = None,
+    post_warmup_hook: Any = None,
+    tp_group: Any = None,
 ):
     """Replaces the body of ``FullCudaGraphBackend.capture_one`` and returns
-    ``(graph, output)`` for SGLang to store: SAVE captures the shape on
-    ``stream`` into ``pool`` without warm-up forwards and archives it; LOAD
-    restores the archived graph for the shape. ``prefill_req_slots`` is the
-    prefill runner's fixed request-slot count, None for a decode graph."""
+    ``(graph, output)`` for SGLang to store. Inside :func:`run_capture_loop`
+    SAVE first runs the shape's two warm-up forwards, with
+    ``post_warmup_hook`` and a ``tp_group`` barrier, in a private pool, then
+    captures the shape on ``stream`` into ``pool`` and archives it; LOAD
+    restores the archived graph and runs no forward. ``prefill_req_slots`` is
+    the prefill runner's fixed request-slot count, None for a decode graph.
+    ``post_warmup_hook`` / ``tp_group`` since 1.1."""
     _require_active()
     from foundry.integration.sglang import hooks
 
     return hooks.capture_one(
-        shape_key, forward_fn, pool=pool, stream=stream, prefill_req_slots=prefill_req_slots
+        shape_key,
+        forward_fn,
+        pool=pool,
+        stream=stream,
+        prefill_req_slots=prefill_req_slots,
+        post_warmup_hook=post_warmup_hook,
+        tp_group=tp_group,
     )
+
+
+def run_capture_loop(runner: Any, loop_fn) -> Any:
+    """Wrap a runner's per-shape capture loop (``_capture_one_stream``, called
+    inside its capture session): persistent bootstrap first, then the loop,
+    in which SAVE warms each shape in a private pool right before capturing
+    it; the pool is released and checked after the loop. Since 1.1."""
+    _require_active()
+    from foundry.integration.sglang import warmup_pool
+
+    return warmup_pool.run_capture_loop(runner, loop_fn)
 
 
 def shared_read_ends_override(runner: Any, attn_backend: Any, forward_mode: Any):

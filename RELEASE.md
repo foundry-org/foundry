@@ -20,6 +20,10 @@ since 0.0.3.
 - **Prefill CUDA graphs** are saved and restored next to the decode graphs.
   With power-of-two buckets, prefill TTFT and throughput of a LOADed engine
   match native capture.
+- **torch 2.14 support without disabling Dynamo:** SAVE runs SGLang's warm-up
+  forwards for each shape in a private CUDA memory pool right before capturing
+  it, so compiled helpers and autotuning run outside the capture and outside
+  the recorded layout; LOAD still runs no forward.
 - **LOAD re-runs SGLang's own capture loop** and substitutes only
   `capture_one`; the restore time is logged apart from the loop.
 - **Faster restore:** 0.5-1.6 s per rank for 128 decode graphs on 30B-235B

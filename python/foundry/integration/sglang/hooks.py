@@ -423,24 +423,40 @@ def _prefill_req_slots(backend) -> int | None:
     return None
 
 
-def capture_one(shape_key, forward_fn, *, pool, stream, prefill_req_slots=None):
+def capture_one(
+    shape_key,
+    forward_fn,
+    *,
+    pool,
+    stream,
+    prefill_req_slots=None,
+    post_warmup_hook=None,
+    tp_group=None,
+):
     """Replaces ``FullCudaGraphBackend.capture_one`` for one shape, SAVE or
     LOAD; the runner's capture loop around it is SGLang's own. Returns
-    ``(graph, output)``; the caller stores them in the backend.
+    ``(graph, output)`` for the caller to store in the backend. Inside
+    :func:`warmup_pool.run_capture_loop` SAVE first runs the shape's two
+    warm-up forwards in the private pool; LOAD runs no forward.
 
     ``pool`` / ``stream``: the backend's graph pool and capture stream (SAVE).
     ``prefill_req_slots``: the prefill runner's fixed request-slot count, None
-    for a decode graph."""
+    for a decode graph. ``post_warmup_hook`` / ``tp_group``: as upstream's
+    warm-ups use them."""
     mode = get_graph_extension_mode()
     if mode == CUDAGraphExtensionMode.NONE:
         raise RuntimeError("[Foundry] capture_one called without SAVE or LOAD")
+    from foundry.integration.sglang import warmup_pool
+
+    if mode == CUDAGraphExtensionMode.SAVE and warmup_pool.active():
+        warmup_pool.warm_up(shape_key, forward_fn, post_warmup_hook, tp_group)
     req_slots = prefill_req_slots
     if mode == CUDAGraphExtensionMode.LOAD:
         # LOAD, both runners: the upstream capture loop runs (see
         # capture_scope) and only the capture is replaced, by the archived
         # graph for this shape; its allocator events replay here, at the point
-        # SAVE captured it, after the same per-shape eager work. No warm-up
-        # forwards, as on SAVE.
+        # SAVE captured it, after the same per-shape eager work. No forward
+        # runs on LOAD.
         from foundry.integration.sglang.graph_ops import (
             restore_next_decode_graph,
             restore_next_prefill_graph,
@@ -456,12 +472,14 @@ def capture_one(shape_key, forward_fn, *, pool, stream, prefill_req_slots=None):
         # ``graph.reset()`` on each.
         return graph, out
 
-    # SAVE: suppress upstream's two pre-capture warmup forwards. Their
-    # non-deterministic activation allocations would pollute the torch caching
-    # allocator with freed segments that LOAD cannot reproduce — causing
-    # cache-miss vs cache-hit asymmetry that drifts the VMM cursor away from
-    # each saved ``start_base_addr``. JIT / lazy init still happens inside the
-    # captured forward and is recorded as alloc events.
+    # SAVE: capture. The warm-up forwards ran above, in a private pool outside
+    # the recorded layout (compiles, autotuning, kernel loads and one-time
+    # inits are done by now). Run here, their activations would leave freed
+    # segments in the default pool that LOAD cannot reproduce, drifting the
+    # cursor away from each saved ``start_base_addr``. In a single-pass loop
+    # (an sglang that does not call run_capture_loop) the first forward still
+    # happens inside the capture, which torch >= 2.14's dynamo rejects for
+    # compiled helpers.
     from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
 
     from foundry.integration.sglang.graph_ops import (
@@ -767,15 +785,30 @@ def _patch_cuda_graph_capture() -> None:
                 capture_inputs=capture_inputs,
                 post_warmup_hook=post_warmup_hook,
             )
-        graph, out = capture_one(
+        result = capture_one(
             shape_key,
             forward_fn,
             pool=self._pool,
             stream=self._capture_stream,
             prefill_req_slots=_prefill_req_slots(self),
+            post_warmup_hook=post_warmup_hook,
+            tp_group=self._tp_group,
         )
-        self._graphs[shape_key] = graph
-        self._outputs[shape_key] = out
+        if result is not None:
+            self._graphs[shape_key], self._outputs[shape_key] = result
+
+    from foundry.integration.sglang.warmup_pool import run_capture_loop
+
+    orig_decode_loop = runner_cls._capture_one_stream
+    orig_prefill_loop = prefill_runner_cls._capture_one_stream
+
+    @functools.wraps(orig_decode_loop)
+    def patched_decode_loop(self, *args, **kwargs):
+        return run_capture_loop(self, lambda: orig_decode_loop(self, *args, **kwargs))
+
+    @functools.wraps(orig_prefill_loop)
+    def patched_prefill_loop(self, *args, **kwargs):
+        return run_capture_loop(self, lambda: orig_prefill_loop(self, *args, **kwargs))
 
     @functools.wraps(orig_prefill_capture)
     def patched_prefill_capture(self):
@@ -795,6 +828,8 @@ def _patch_cuda_graph_capture() -> None:
         return orig_resolve_ends(self, attn_backend, forward_mode)
 
     backend_cls.capture_one = patched_capture_one
+    runner_cls._capture_one_stream = patched_decode_loop
+    prefill_runner_cls._capture_one_stream = patched_prefill_loop
     runner_cls.capture = patched
     prefill_runner_cls.capture = patched_prefill_capture
     runner_cls._resolve_shared_read_ends = patched_resolve_ends
