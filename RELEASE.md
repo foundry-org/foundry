@@ -10,6 +10,9 @@ since 0.0.3.
   built against torch 2.14.1 / cu130, SGLang's current pin; the wheel requires
   `torch==2.14.1`.
   Importing under another torch or CUDA major raises a readable `ImportError`.
+- **One package index per torch/CUDA pair**, like torch's own wheel indexes:
+  `pip install foundry-core --extra-index-url https://foundry-org.github.io/foundry/whl/<cuda>/torch<A.B>/`.
+  0.1.x also builds torch 2.13.0 / cu130 (`whl/cu130/torch2.13/`).
 - **Optional SGLang dependency.** Installing Foundry does not require SGLang;
   an SGLang started with `--cuda-graph-persistence {save,load}` requires
   Foundry (`pip install "sglang[foundry]"`) and calls
