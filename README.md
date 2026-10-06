@@ -125,24 +125,31 @@ See [ROADMAP.md](ROADMAP.md) for the full development plan and progress.
 
 ## Installation
 
-Prebuilt wheels are published to PyPI as **`foundry-core`** (the import name
-is `foundry`). One torch/CUDA pairing per release line:
+Prebuilt wheels are published as **`foundry-core`** (the import name is
+`foundry`). A wheel works only with the torch major.minor and CUDA major it was
+built for, so, like torch itself, the pairs live in separate package indexes
+selected with `--extra-index-url` (`whl/<cuda>/torch<A.B>/`); PyPI carries the
+pair SGLang pins:
 
-| foundry-core | torch | CUDA | CPython | Platform |
+| foundry-core | torch pair | index | CPython | Platform |
 |---|---|---|---|---|
-| 0.1.x (0.1.0rc2 on) | 2.14 (`torch==2.14.1`, cu130 build) | 13.0 | 3.10-3.13 | manylinux_2_28 x86_64 |
+| 0.1.x (0.1.0rc2 on) | 2.14 (`torch==2.14.1`), cu130 | PyPI, `whl/cu130/torch2.14/` | 3.10-3.13 | manylinux_2_28 x86_64 |
+| 0.1.x | 2.13 (`torch==2.13.0`), cu130 | `whl/cu130/torch2.13/` | 3.10-3.13 | manylinux_2_28 x86_64 |
 
 ```bash
 pip install "torch==2.14.1" --index-url https://download.pytorch.org/whl/cu130
 pip install "foundry-core>=0.1.0rc2,<0.2"
 python -c "import foundry; print(foundry.__version__)"
+
+# another pair: add its index (the wheel there carries a local version, +cu130.torch2.13)
+pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
+pip install "foundry-core>=0.1.0rc2,<0.2" --extra-index-url https://foundry-org.github.io/foundry/whl/cu130/torch2.13/
 ```
 
 The wheel ships `foundry/ops.*.so` and `foundry/libcuda_hook.so` (the hook
 SGLang/vLLM preload) and registers the SGLang plugin entry point. No Boost or
-other C++ runtime dependency is needed. Wheels for other torch/CUDA pairs, when
-built, are attached to the [GitHub Release](https://github.com/foundry-org/foundry/releases)
-with a local version (`0.1.0+cu128.torch2.12`) and install by URL.
+other C++ runtime dependency is needed. Every wheel is also attached to the
+[GitHub Release](https://github.com/foundry-org/foundry/releases).
 
 ### From source
 
