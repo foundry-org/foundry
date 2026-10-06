@@ -41,8 +41,9 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -64,6 +65,13 @@ WARM_AND_CAPTURE = "warm_and_capture"
 TWO_PASS = "two_pass"
 PER_SHAPE = "per_shape"
 _POLICIES = (TWO_PASS, PER_SHAPE)
+
+
+def pool_trace_enabled() -> bool:
+    """``FOUNDRY_SGLANG_WARM_POOL_TRACE=1``: record allocation stacks (Python
+    and C++) during the SAVE preparation pass so that a block retained by the
+    warm-up pool is reported with the stack that allocated it."""
+    return os.environ.get("FOUNDRY_SGLANG_WARM_POOL_TRACE") == "1"
 
 
 def warm_policy() -> str:
@@ -181,7 +189,15 @@ def bootstrap_persistent_resources(runner: Any) -> list[str]:
 
 
 def _pool_segments(pool: torch.cuda.MemPool) -> list[dict]:
-    return pool.snapshot(include_traces=False)
+    return pool.snapshot(include_traces=pool_trace_enabled())
+
+
+def _block_stack(block: dict, limit: int = 30) -> str:
+    """The recorded allocation stack of a snapshot block (empty unless
+    :func:`pool_trace_enabled`), innermost frame first."""
+    frames = block.get("frames") or []
+    lines = [f"{f.get('filename')}:{f.get('line')} {f.get('name')}" for f in frames[:limit]]
+    return "\n      ".join(lines)
 
 
 def _owner_paths(runner: Any, ranges: list[tuple[int, int]], depth: int = 5) -> list[str]:
@@ -283,25 +299,31 @@ def _release_pool(loop: _Loop) -> None:
     loop.pool_ranges = [(s["address"], s["address"] + s["total_size"]) for s in segments]
     if allocated:
         live = [
-            (b["address"], b["size"])
+            (b["address"], b["size"], _block_stack(b))
             for s in segments
             for b in s.get("blocks", [])
             if b.get("state") == "active_allocated"
         ]
-        owners = _owner_paths(loop.runner, [(a, a + n) for a, n in live])
+        owners = _owner_paths(loop.runner, [(a, a + n) for a, n, _ in live])
+        stacks = "".join(
+            f"\n  block 0x{a:x}+{n} allocated at:\n      {st}" for a, n, st in live[:8] if st
+        )
         raise RuntimeError(
             f"[Foundry] SAVE warm-up pool retains {allocated} allocated bytes after the "
             f"preparation pass ({len(live)} blocks: "
-            + ", ".join(f"0x{a:x}+{n}" for a, n in live[:8])
+            + ", ".join(f"0x{a:x}+{n}" for a, n, _ in live[:8])
             + f"); owners found: {owners or 'none'}. A persistent resource is created by a "
             "warm-up forward or a post-warm-up hook: create it in "
             "warmup_pool.bootstrap_persistent_resources instead"
+            + (stacks or " (set FOUNDRY_SGLANG_WARM_POOL_TRACE=1 for allocation stacks)")
         )
     pool_id = pool.id
     del pool
     gc.collect()
     remaining = [
-        s for s in torch.cuda.memory_snapshot() if tuple(s.get("segment_pool_id", ())) == tuple(pool_id)
+        s
+        for s in torch.cuda.memory_snapshot()
+        if tuple(s.get("segment_pool_id", ())) == tuple(pool_id)
     ]
     logger.info(
         "[Foundry] SAVE warm-ups of %d shapes ran in a private pool: reserved %.1f MB, "
@@ -377,7 +399,9 @@ def audit_graph_pointers(files: list[Path], ranges: list[tuple[int, int]]) -> tu
     for path in files:
         walk(json.loads(path.read_text()), path.name, "")
     if files and not nodes:
-        raise RuntimeError(f"[Foundry] SAVE pointer audit found no graph nodes in {len(files)} files")
+        raise RuntimeError(
+            f"[Foundry] SAVE pointer audit found no graph nodes in {len(files)} files"
+        )
     if hits:
         raise RuntimeError(
             f"[Foundry] SAVE: {len(hits)} captured-graph references into the released "
@@ -425,6 +449,9 @@ def run_capture_loop(runner: Any, loop_fn: Callable[[], Any]) -> Any:
         raise RuntimeError("[Foundry] nested capture loops are not supported")
     policy = warm_policy()
     _loop = loop = _Loop(runner)
+    tracing = mode == CUDAGraphExtensionMode.SAVE and pool_trace_enabled()
+    if tracing:
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000, stacks="all")
     try:
         prepared = bootstrap_persistent_resources(runner)
         logger.info(
@@ -463,3 +490,5 @@ def run_capture_loop(runner: Any, loop_fn: Callable[[], Any]) -> Any:
         return result
     finally:
         _loop = None
+        if tracing:
+            torch.cuda.memory._record_memory_history(enabled=None)
