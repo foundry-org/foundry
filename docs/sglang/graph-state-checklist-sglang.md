@@ -30,9 +30,12 @@ Every row below is one of these four mechanisms.
 
   Foundry records `CLUSTER_SCHEDULING_POLICY_PREFERENCE` but does not apply it (CUDAGraph.cpp:2516-2540).
   The dsv4 912 bug was this mechanism.
-- **M2. SAVE runs no eager warmup.** `patched_capture_one` (integration/sglang/hooks.py:470-517) skips upstream's
-  two warmup forwards (`full_cuda_graph_backend.py:137-151`) and their `post_warmup_hook`. So on SAVE, the
-  **first call of every kernel and every lazy initialiser happens inside the first stream capture.** Native sglang
+- **M2. SAVE warm-ups run in a private pool** (since 2026-10-06, `warmup_pool.py`): upstream's two warm-up
+  forwards and `post_warmup_hook` run in a preparation pass, inside a private MemPool with recording stopped,
+  released before the capture pass; LOAD runs no forward. Persistent state they create must come from the
+  persistent bootstrap or SAVE fails (retained block, pointer audit). The analysis below describes the earlier
+  design, in which SAVE ran no warm-up: the
+  **first call of every kernel and every lazy initialiser happened inside the first stream capture.** Native sglang
   does all of that eagerly.
 
   Anything lazy that is not in Foundry's pre-capture bootstrap list (hooks.py:405-446) then ends up in one of

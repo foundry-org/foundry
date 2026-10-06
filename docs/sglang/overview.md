@@ -155,7 +155,7 @@ SAVE:
 2. Distributed init / NCCL warmup runs in scratch space; the cursor is then forced to `scratch_space_size`.
 3. Model weights, KV pool, and FlashInfer workspace buffers allocate inside the VMM region at byte-deterministic offsets.
 4. `kernel_warmup` is a no-op.
-5. `DecodeCudaGraphRunner.capture` runs the upstream capture loop unchanged (per-shape FlashInfer wrappers and other metadata allocate where sglang puts them); only `FullCudaGraphBackend.capture_one` is patched, to capture into a foundry graph without the two pre-capture warmup forwards.
+5. Each runner's capture loop runs twice (`warmup_pool.run_capture_loop`): a preparation pass, in which `capture_one` runs upstream's two warm-up forwards in a private MemPool with recording stopped, then, after the pool is released, a capture pass that captures into foundry graphs (no warm-ups).
 6. Each captured graph is written to disk; a manifest groups topologically equivalent graphs.
 7. The final VMM cursor is recorded as `final_alloc_offset` in `region_layout.json`, with `capture_loop_version = 2`.
 
@@ -166,6 +166,25 @@ LOAD:
 3. Model weights and KV pool re-allocate at the same deterministic offsets. `init_memory_pool` reuses the saved `MemoryPoolConfig` (and calls `torch.cuda.empty_cache()` to mirror SAVE's `_resolve_memory_pool_config` side effect).
 4. `DecodeCudaGraphRunner.capture` preallocates the deterministic range up to `final_alloc_offset`, starts all decode graph builds in one `start_graph_builds(all_paths)` call (the manifest's template/on-demand linking needs one call), then runs the same upstream capture loop as SAVE. The patched `capture_one` takes the next archived graph for each shape (`finish_one_graph_load`: its allocator events replay where SAVE captured it) instead of capturing; `forward_fn` never runs.
 5. The restored graphs sit in the backend's `_graphs` / `_outputs` under the loop's own shape keys; the rest of SGLang's serving path runs unchanged.
+
+## Persistent bootstrap
+
+SAVE's warm-up forwards run in a private pool that must be empty and released before the capture. Anything a first
+forward creates and keeps (a cache, a workspace, a lazily built table) would stay in that pool, so
+`warmup_pool.bootstrap_persistent_resources` creates it first, on SAVE and LOAD alike, in the normal recorded
+domain on the capture stream:
+
+| resource | owner |
+|---|---|
+| cuBLAS handle and workspace of the capture stream | torch (per stream) |
+| ALiBi slopes buffer (created even without ALiBi) | FlashInfer `flashinfer.utils` global cache |
+| int32 placeholder pointer argument | SGLang MoE router (`moe_fused_gate._dummy_i32`) |
+| per-layer local expert map (EP > 1) | `StandardDispatcher.prepare_local_expert_mapping()` |
+
+The list is audited for the validated backends, not universal. A missing entry shows up on SAVE as a retained
+block (the error names the block and the attribute path that owns it) or as a pointer-audit hit. Extend the list
+with the owner's own idempotent initializer, called identically on SAVE and LOAD; never free the block, pad the
+layout or skip the warm-up instead.
 
 ## Doc set
 

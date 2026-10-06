@@ -9,23 +9,42 @@ order, and LOAD cannot replay that layout. `region_layout.json` (per rank) recor
 or with another value: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the
 current code`. Rule: re-SAVE every archive saved by the old code.
 
-## torch 2.14: dynamo refuses to compile inside the capture window (PINNED, 2026-10-04)
+## torch 2.14: dynamo refuses to compile inside the capture window (FIXED: SAVE warm-ups in a private MemPool, 2026-10-06)
 
-**Symptom.** With torch 2.14 (SGLang's pin from upstream f385390be5), SAVE fails at the first captured forward
-when it reaches a `@torch.compile`d helper (e.g. SGLang's MoE top-k post-processing): torch >= 2.14's dynamo
-refuses to JIT-compile while a stream is capturing.
+**Symptom.** With torch 2.14 (SGLang's pin from upstream f385390be5), SAVE failed at the first captured forward
+that reached a `@torch.compile`d helper (e.g. SGLang's MoE top-k post-processing): torch >= 2.14's dynamo refuses
+to trace while a stream is capturing.
 
-**Cause.** SAVE runs no warm-up forwards (their allocations would not be in LOAD's layout), so the first call
-of every compiled helper is inside the capture window by design.
+**Cause.** SAVE ran no warm-up forwards, so the first call of every compiled helper, every kernel load and every
+one-time initialization happened inside the capture window. The forwards were skipped because their activations,
+freed into the default caching-allocator pool, change which later allocations hit the cache, which LOAD (no
+forward) cannot reproduce.
 
-**Fix.** `TORCHDYNAMO_DISABLE=1` is an environment pin (`plugin.ENV_PINS`, both routes): set in the launcher
-before any scheduler or DP controller is spawned, so each child has it before it imports the model modules
-(dynamo reads it when a function is wrapped). Every compiled helper runs eager on SAVE and LOAD alike, and
-`--enable-torch-compile` becomes eager too. While the pin is on, the two compile-inside-capture entries below
-(inductor autotune, CPU constant copy) cannot occur.
+**Fix** (`warmup_pool.py`, both routes). Each runner's capture loop (`_capture_one_stream`) runs twice:
 
-**Cost.** Qwen3-30B-A3B-FP8 EP4: decode TPOT unchanged against native (bs 1/8/32/128: 4.66/5.34/6.29/7.12 vs
-4.62/5.34/6.30/6.94 ms). Prefill throughput -11% in a single run, inconclusive, to be re-measured.
+1. *Persistent bootstrap*, both modes, in the normal recorded domain: the capture stream's cuBLAS handle,
+   FlashInfer's global ALiBi slopes buffer, the MoE router's int32 placeholder, and with EP > 1 every
+   `StandardDispatcher.prepare_local_expert_mapping()`. These are real resources a first forward would create;
+   left to the warm-ups they would end up in the private pool and be retained (see overview.md).
+2. *Preparation pass*: SGLang's loop prepares every shape. On SAVE `capture_one` runs upstream's two warm-up
+   forwards (synchronize, TP barrier, forward, `post_warmup_hook`) inside one `torch.cuda.MemPool` per runner,
+   with Foundry's allocation region stopped; the cursor must not move. LOAD runs the same preparation and no
+   forward. The pool must then hold no live block; it is released by its destructor (no `empty_cache`), and no
+   allocator segment may still carry its id. A retained block fails SAVE, naming the block and its owner.
+3. *Capture pass*: the loop runs again; SAVE captures (no warm-ups), LOAD restores, as before. SAVE then scans the
+   new graph JSONs for kernel arguments into the pool's former segments and fails on any hit.
+
+Why the layout survives: the hook records every allocation in the region from `mark_layout_start`, and LOAD only
+requires its cursor to be at or below SAVE's at each graph's `start_base_addr` (replay fast-forwards to it; it aborts
+if LOAD consumed more). The warm-ups allocate outside the region and leave the default pool's cache state as it
+was, so the preparation pass allocates identically on both modes. Per-shape preparation must therefore be
+idempotent across the two passes: FlashInfer's decode wrappers are reused (sglang-side change), since recreated
+wrappers sit in a reference cycle and are freed at a GC-dependent time.
+
+Validated (prototype, `experimental/torch214_capture`): Qwen3-1.7B and Qwen3-30B-A3B-FP8 with FlashInfer, TP1 and
+attention-DP2/EP2 with DeepEP v1 low-latency and v2 direct, Dynamo enabled; native/SAVE/LOAD greedy outputs and
+logprobs equal in the controlled runs (one intermittent LOAD logprob outlier in DeepEP auto mode, not reproduced
+on repeat; native shows the same class of variation). Not yet: FA3 / triton / hybrid-linear / DSV4 backends, prefill graphs, full-model `--enable-torch-compile`.
 
 ## DeepEP v2 (NCCL windows + GIN) not validated on the plugin route (TODO, 2026-09-30)
 
@@ -119,7 +138,10 @@ natively, the pre-capture bootstrap on SAVE/LOAD). Restore time is unaffected. C
 `LD_PRELOAD` shim that removes it: [../bare-host-verbs-udev-wait.md](../bare-host-verbs-udev-wait.md)
 (`tools/host/no_cdev_wait.c`).
 
-## SAVE fails cold: inductor autotunes a fresh Triton kernel inside the capture window (LIMITATION, 2026-09-24)
+## SAVE fails cold: inductor autotunes a fresh Triton kernel inside the capture window (RESOLVED by the SAVE warm-up pool, 2026-10-06)
+
+Resolved: the warm-ups now run before the capture (entry "torch 2.14: dynamo refuses to compile inside the capture
+window"), so autotuning happens outside the capture window; a warm cache is no longer required. Original record:
 
 **Symptom.** GLM-5.3-Flash EP8 (dummy weights) as the FIRST engine ever run for that model in a fresh container:
 SAVE's first captured forward fails with `torch.AcceleratorError: CUDA error: operation not permitted when
@@ -150,7 +172,9 @@ sglang's pre-capture warmup forwards use the capture-mode inputs, so their artif
 Disabling pointwise autotuning (`torch._inductor.config.triton.autotune_pointwise=False`) would also avoid it
 but changes the kernels SAVE captures relative to native sglang, so it is not the default.
 
-## SAVE capture fails when a first torch.compile inside the capture window copies a CPU constant to the device (OPEN, 2026-09-23)
+## SAVE capture fails when a first torch.compile inside the capture window copies a CPU constant to the device (RESOLVED by the SAVE warm-up pool, 2026-10-06)
+
+Resolved the same way: the first compile now happens in a warm-up forward, outside the capture. Original record:
 
 **Symptom.** Inkling-Small (bf16, EP8, dummy weights) on 8xH200: the native sglang graph engine captures all
 decode graphs, Foundry SAVE fails in the first captured forward:
