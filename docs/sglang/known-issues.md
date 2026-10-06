@@ -9,6 +9,31 @@ order, and LOAD cannot replay that layout. `region_layout.json` (per rank) recor
 or with another value: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the
 current code`. Rule: re-SAVE every archive saved by the old code.
 
+## Hybrid GDN first eager extend compiles FlashInfer's CuTe-DSL kernels for 8-10 s per process (PATCHED, 2026-10-07)
+
+**Symptom.** Qwen3.5-122B EP4 (hybrid GDN, decode graphs only; prefill is eager because SGLang cannot capture
+FULL prefill graphs for GDN yet) on FlashInfer 0.7.0.post1: the first prefill of every scheduler process took
+10-11 s on native, SAVE and LOAD alike. LOAD's `/health` showed it as +38 s because the 1-token generate rotated
+over the four DP ranks and the probe timed out on each first prefill; the pre-rebase environment (FlashInfer
+0.6.18, another GDN prefill path) paid 1-3 s.
+
+**Cause** (faulthandler stacks during the gap, `final/r2_diag`): `flashinfer.gdn_prefill.chunk_gated_delta_rule`
+-> `gdn_kernels/delta_rule_dsl/delta_rule_cp_sm90.py` -> `custom_compile_cache.cached_compile` -> `cute.compile`
+of four SM90 kernels, cached only in a process-local dict. CuTe DSL's file cache (`CUTE_DSL_CACHE_DIR`) does not
+apply: `cute.compile` forces `no_cache=True` (`base_dsl/compiler.py`), measured as 8.4 s in every process even
+after a clean exit, 0 cache files. FlashInfer has a persistent `.o` cache (`jit/cute_dsl_core.build_and_load_cute_dsl_kernel`,
+`~/.cache/flashinfer/<ver>/<arch>/cached_ops/`, used by its SM100 GDN and other CuTe-DSL call sites) that the SM90
+delta_rule path does not use.
+
+**Patch** (`integration/sglang/flashinfer_cute_cache.py`, both modes, installed before the capture loop when
+SGLang's FlashInfer GDN kernel module is loaded): `cached_compile` keeps its in-memory dict and, on a miss, goes
+through `build_and_load_cute_dsl_kernel("gdn_delta_rule_dsl", <kernel class>_<sha256(compile key)[:16]>,
+compile_fn, delta_rule_dsl sources)`. The compile keys (class MRO + static attributes) are stable across
+processes; a key whose repr carries object ids takes the plain compile. Measured on the Q122 extend shapes: miss
+9.35 s (4 kernels compiled and persisted right away), hit 0.078 s; outputs bitwise equal to the unpatched compile.
+Not upstreamed on purpose: once SGLang captures FULL prefill graphs for GDN (sgl-project/sglang#36077), SAVE's
+warm-ups compile these kernels and the archived graphs carry them; the patch then has nothing to do and goes.
+
 ## torch 2.14: dynamo refuses to compile inside the capture window (FIXED: SAVE warm-ups in a private MemPool, 2026-10-06)
 
 **Symptom.** With torch 2.14 (SGLang's pin from upstream f385390be5), SAVE failed at the first captured forward

@@ -36,6 +36,7 @@ from typing import Any
 import torch
 
 from foundry import ops as cge
+from foundry.integration.sglang import flashinfer_cute_cache
 from foundry.integration.sglang import runtime as rt
 from foundry.integration.sglang.config import (
     CUDAGraphExtensionMode,
@@ -306,6 +307,13 @@ def run_capture_loop(runner: Any, loop_fn: Callable[[], Any]) -> Any:
             prepared,
         )
         rt.log_alloc_offset("after_persistent_bootstrap")
+        if flashinfer_cute_cache.gdn_flashinfer_in_use():
+            # Per-process, both modes, before the first eager extend: the SM90
+            # GDN prefill kernels load from FlashInfer's .o cache instead of
+            # compiling 8-10 s in every scheduler (see flashinfer_cute_cache).
+            status = flashinfer_cute_cache.install()
+            if status:
+                logger.info("[Foundry] FlashInfer CuTe-DSL cache: %s", status)
         result = loop_fn()
         # Same sequence point on both modes: cyclic garbage of the loop
         # (deterministic domain) is collected before the pool check.

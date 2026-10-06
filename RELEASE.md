@@ -43,6 +43,14 @@ since 0.0.3.
 - One preallocation mechanism on LOAD (backing segments, fenced release,
   on-demand holes).
 - Qwen3.5 + FlashInfer LOAD divergence.
+- Hybrid GDN models (Qwen3.5) with FlashInfer 0.7: the SM90 GDN prefill
+  CuTe-DSL kernels were compiled in every scheduler process on its first eager
+  extend (8-10 s, in the first request's TTFT; the DSL file cache does not
+  apply to `cute.compile`). Foundry routes that compile through FlashInfer's
+  own persistent `.o` cache (`build_and_load_cute_dsl_kernel`, as its SM100
+  GDN kernels already do): compiled once, loaded in milliseconds afterwards,
+  on SAVE and LOAD. Carried in `integration/sglang/flashinfer_cute_cache.py`
+  until SGLang captures FULL prefill graphs for GDN models (sgl-project/sglang#36077).
 - Optional udev-wait shim for bare hosts with blocked verbs devices
   (`tools/host/no_cdev_wait.c`, TOML `verbs_udev_wait_shim_path`).
 - The hook preload is scoped to the scheduler spawn; only schedulers and the
