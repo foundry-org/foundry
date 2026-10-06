@@ -149,9 +149,22 @@ def bootstrap_persistent_resources(runner: Any) -> list[str]:
     Returns the names of the resources prepared (logged)."""
     device = torch.device("cuda", torch.cuda.current_device())
     prepared = []
-    # 1. cuBLAS handle and workspace of the capture stream (per stream).
+    # 1. cuBLAS handle and workspace of the capture stream. torch keeps one
+    #    workspace per (handle, stream), so also for every side stream a model
+    #    module holds (e.g. Qwen3.5's GDN `alt_stream` for the qkvz/ba
+    #    projections): the first GEMM there would create one in the warm-up pool.
     torch.cuda.current_blas_handle()
     prepared.append("cublas_handle")
+    side_streams: dict[int, torch.cuda.Stream] = {}
+    for module in runner.model_runner.model.modules():
+        for value in vars(module).values():
+            if isinstance(value, torch.cuda.Stream):
+                side_streams[value.cuda_stream] = value
+    for stream in side_streams.values():
+        with torch.cuda.stream(stream):
+            torch.cuda.current_blas_handle()
+    if side_streams:
+        prepared.append(f"cublas_handle(side streams x{len(side_streams)})")
     # 2. FlashInfer's global ALiBi slopes buffer: FlashInfer creates it on the
     #    first decode plan, also for models without ALiBi.
     updater = _flashinfer_decode_updater(_attn_backend(runner))

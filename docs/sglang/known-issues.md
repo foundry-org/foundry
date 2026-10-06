@@ -22,8 +22,8 @@ forward) cannot reproduce.
 
 **Fix** (`warmup_pool.py`, both routes). Each runner's capture loop (`_capture_one_stream`) runs twice:
 
-1. *Persistent bootstrap*, both modes, in the normal recorded domain: the capture stream's cuBLAS handle,
-   FlashInfer's global ALiBi slopes buffer, the MoE router's int32 placeholder, and with EP > 1 every
+1. *Persistent bootstrap*, both modes, in the normal recorded domain: the cuBLAS handle and workspace of
+   the capture stream and of every side stream a model module holds (Qwen3.5's GDN `alt_stream`), FlashInfer's global ALiBi slopes buffer, the MoE router's int32 placeholder, and with EP > 1 every
    `StandardDispatcher.prepare_local_expert_mapping()`. These are real resources a first forward would create;
    left to the warm-ups they would end up in the private pool and be retained (see overview.md).
 2. *Preparation pass*: SGLang's loop prepares every shape. On SAVE `capture_one` runs upstream's two warm-up

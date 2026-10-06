@@ -176,7 +176,7 @@ domain on the capture stream:
 
 | resource | owner |
 |---|---|
-| cuBLAS handle and workspace of the capture stream | torch (per stream) |
+| cuBLAS handle and workspace of the capture stream and of every side stream a model module holds (e.g. Qwen3.5's GDN `alt_stream`) | torch (one workspace per handle and stream) |
 | ALiBi slopes buffer (created even without ALiBi) | FlashInfer `flashinfer.utils` global cache |
 | int32 placeholder pointer argument | SGLang MoE router (`moe_fused_gate._dummy_i32`) |
 | per-layer local expert map (EP > 1) | `StandardDispatcher.prepare_local_expert_mapping()` |
