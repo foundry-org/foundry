@@ -2118,6 +2118,13 @@ bool join_exec_pool_prewarm() {
 }  // namespace
 
 void CUDAGraph::start_exec_pool_prewarm(const std::vector<std::string>& json_paths) {
+  // Ablation knob: FOUNDRY_EXEC_POOL_PREWARM=0 skips the prewarm; Phase 2 then grows the
+  // driver's exec pool itself (join_exec_pool_prewarm reports "not used").
+  const char* prewarm_env = std::getenv("FOUNDRY_EXEC_POOL_PREWARM");
+  if (prewarm_env && prewarm_env[0] == '0') {
+    fprintf(stderr, "[foundry] exec pool prewarm disabled (FOUNDRY_EXEC_POOL_PREWARM=0)\n");
+    return;
+  }
   CUcontext ctx = nullptr;
   C10_CUDA_DRIVER_CHECK(cuCtxGetCurrent(&ctx));
   TORCH_CHECK(ctx != nullptr, "start_exec_pool_prewarm: no CUDA context on this thread");
@@ -2527,6 +2534,15 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       };
       const char* lazy_env = std::getenv("FOUNDRY_LAZY_GRAPH_EXEC");
       const bool lazy_graph_exec = lazy_env && lazy_env[0] == '1';
+      // Ablation knob: FOUNDRY_PHASE2_PIPELINE=0 runs every instantiate inline on this (build)
+      // thread instead of on the instantiate thread, so builds and instantiates no longer
+      // overlap (the pre-pipeline behaviour); the prep pool is unchanged.
+      const char* pipe_env = std::getenv("FOUNDRY_PHASE2_PIPELINE");
+      const bool serial_phase2 = pipe_env && pipe_env[0] == '0';
+      if (serial_phase2)
+        fprintf(stderr,
+                "[foundry] Phase 2 pipeline disabled (FOUNDRY_PHASE2_PIPELINE=0): instantiates "
+                "run inline on the build thread\n");
       auto binary_template = [&](size_t idx) {
         return bin_files[idx].valid() &&
                (bin_files[idx].header.flags & binary_format::FLAG_COMPLETE_KERNEL_ATTRS);
@@ -2597,11 +2613,17 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         }
         group_cv.notify_all();
       });
+      auto submit = [&](std::function<void()> job) {
+        if (serial_phase2)
+          job();
+        else
+          inst.push(std::move(job));
+      };
 
       // Free device memory around Phase 2's instantiates: what the execs took beyond the driver's
       // pool (the exec pool prewarm is meant to make this ~0).
       size_t free_before = 0, free_after = 0, mem_total = 0;
-      inst.push([&prewarm_done, &free_before, &mem_total] {
+      submit([&prewarm_done, &free_before, &mem_total] {
         prewarm_done = join_exec_pool_prewarm();
         C10_CUDA_DRIVER_CHECK(cuMemGetInfo(&free_before, &mem_total));
       });
@@ -2631,7 +2653,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
           tmpl_build_ms += build_ms;
           double prep = prep_ms[tmpl_idx];
           auto t_enq = clk::now();
-          inst.push([=, &set_free, &stats_mu, &tmpl_inst_ms, &ms_since]() {
+          submit([=, &set_free, &stats_mu, &tmpl_inst_ms, &ms_since]() {
             double queued = ms_since(t_enq);
             auto t_i = clk::now();
             shared->exec = reinterpret_cast<CUgraphExec>(
@@ -2654,8 +2676,8 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         } else {
           // JSON template (archive without a complete binary): the whole build runs in its
           // instantiate job, as it did before the pipeline.
-          inst.push([=, &all_parsed, &json_path_list, &bin_files, &set_free, &stats_mu,
-                     &tmpl_inst_ms, &ms_since]() {
+          submit([=, &all_parsed, &json_path_list, &bin_files, &set_free, &stats_mu, &tmpl_inst_ms,
+                  &ms_since]() {
             fprintf(stderr, "[foundry BUILD] Template %zu (%s): building...\n", tmpl_idx,
                     name.c_str());
             auto t_tmpl = clk::now();
@@ -2752,12 +2774,12 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
           std::lock_guard<std::mutex> lock(group_mu);
           group_busy[g] = true;
         }
-        inst.push([member, g, &set_free]() {
+        submit([member, g, &set_free]() {
           member->instantiate_member_exec();
           set_free(g);
         });
       }
-      inst.push([&free_after, &mem_total] {
+      submit([&free_after, &mem_total] {
         C10_CUDA_DRIVER_CHECK(cuMemGetInfo(&free_after, &mem_total));
       });
       inst.finish();
