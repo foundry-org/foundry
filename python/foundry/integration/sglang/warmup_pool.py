@@ -36,6 +36,12 @@ from foundry.integration.sglang.config import (
 logger = logging.getLogger(__name__)
 
 
+def warmup_passes() -> int:
+    """``FOUNDRY_SGLANG_WARMUP_PASSES``: warm-up forwards per shape on SAVE
+    (default 2, as upstream's capture runs)."""
+    return int(os.environ.get("FOUNDRY_SGLANG_WARMUP_PASSES", "2") or 2)
+
+
 def pool_trace_enabled() -> bool:
     """``FOUNDRY_SGLANG_WARM_POOL_TRACE=1``: record allocation stacks (Python
     and C++) during the SAVE capture loop so that a block retained by the
@@ -178,7 +184,7 @@ def warm_up(
     cge.stop_allocation_region()
     try:
         with torch.cuda.use_mem_pool(loop.pool):
-            for _ in range(2):
+            for _ in range(warmup_passes()):
                 torch.cuda.synchronize()
                 if tp_group is not None:
                     tp_group.barrier()
