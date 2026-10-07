@@ -367,8 +367,11 @@ def test_env_pin_already_set_to_the_pinned_value_is_kept(clean_pin_env):
 
 @pytest.mark.parametrize("pin", plugin.ENV_PINS, ids=lambda pin: pin.name)
 def test_explicit_contrary_env_is_rejected(clean_pin_env, pin):
-    os.environ[pin.name] = "1"
-    with pytest.raises(ValueError, match=f"{pin.name}='1' \\(Foundry needs 0\\)"):
+    contrary = "0" if pin.value == "1" else "1"
+    os.environ[pin.name] = contrary
+    with pytest.raises(
+        ValueError, match=f"{pin.name}='{contrary}' \\(Foundry needs {pin.value}\\)"
+    ):
         plugin.apply_env_pins()
 
 

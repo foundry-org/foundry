@@ -9,25 +9,33 @@ checklist and how torch/CUDA pairs map to wheels.
 
 `foundry.ops` is a torch C++ extension that uses ATen/c10 internals, so a
 wheel only works with the torch it was built against (major.minor and CUDA
-major), like sglang-kernel and flashinfer. PyPI rejects local version labels
-(`+cu130`), so the release follows sglang-kernel's convention:
+major), like sglang-kernel and flashinfer. pip cannot pick a wheel by the
+installed torch, and PyPI rejects local version labels (`+cu130`), so the
+release follows torch's own convention: one package index per pair, selected
+by the user with `--extra-index-url`.
 
 - **One torch/CUDA pair per release line goes to PyPI** with the plain
   version. It is the first entry of `BUILD_PAIRS` at the top of the workflow.
   Its wheels declare `Requires-Dist: torch==A.B.C`, the exact torch they were built against (SGLang pins torch the same way).
-- **Other pairs go to the GitHub Release only**, built with a local version
-  `X.Y.Z+cuNNN.torchA.B` (for example `0.1.0+cu128.torch2.12`) so the file
-  names do not collide. Users install them by URL.
+- **Other pairs** are built with a local version `X.Y.Z+cuNNN.torchA.B` (for
+  example `0.1.0+cu130.torch2.13`) so the file names do not collide.
+- **Every wheel** is attached to the GitHub Release and listed in the index of
+  its pair, `https://foundry-org.github.io/foundry/whl/<cuda>/torch<A.B>/`
+  (PEP 503, on the `gh-pages` branch; the links point at the Release assets
+  with their sha256). `pip install foundry-core --extra-index-url <that URL>`
+  then resolves the pair's wheel: a local version sorts above the plain one
+  of the same release, and the wheel's exact torch pin has to match.
 - The **sdist** goes to PyPI and to the GitHub Release. It contains the native
   sources and the vendored Boost headers.
 
-| Release line | PyPI pair | CPython | Platform |
-|---|---|---|---|
-| 0.1.x | torch 2.13, cu130 | 3.10-3.13 | manylinux_2_28 x86_64 |
+| Release line | Pair | Index | CPython | Platform |
+|---|---|---|---|---|
+| 0.1.x (0.1.0rc2 on) | torch 2.14.1, cu130 | PyPI, `whl/cu130/torch2.14/` | 3.10-3.13 | manylinux_2_28 x86_64 |
+| 0.1.x | torch 2.13.0, cu130 | `whl/cu130/torch2.13/` | 3.10-3.13 | manylinux_2_28 x86_64 |
 
-SGLang depends on `foundry-core>=0.1.0rc1,<0.2` (the rc lower bound lets pip pick the release candidate; it becomes `>=0.1.0` with the final release). Changing the PyPI pair (for
-example to torch 2.14) therefore needs a new minor line (0.2.0) coordinated
-with SGLang's own torch bump; 0.1.x patch releases keep torch 2.13 / cu130.
+SGLang depends on `foundry-core>=0.1.0rc2,<0.2` (the rc lower bound lets pip pick the release candidate; it becomes `>=0.1.0` with the final release). The PyPI pair follows SGLang's torch pin (torch 2.14.1 / cu130 for 0.1.x).
+Once 0.1.0 is final, changing the PyPI pair needs a new minor line (0.2.0)
+coordinated with SGLang's own torch bump; 0.1.x patch releases keep torch 2.14 / cu130.
 Keep the table above, the README installation table and `RELEASE.md` in sync
 with `BUILD_PAIRS`.
 
@@ -52,6 +60,15 @@ pending publisher > GitHub*, and enter:
 After the first successful upload the pending publisher becomes a normal
 publisher of the project (*Manage project > Publishing*). Add other
 maintainers as project owners there.
+
+### GitHub Pages for the wheel indexes
+
+The `index` job pushes the per-pair indexes to the `gh-pages` branch (created
+on the first release). Once, in *Settings > Pages*, set the source to *Deploy
+from a branch*, branch `gh-pages`, folder `/ (root)`. The indexes are then
+served at `https://<owner>.github.io/<repo>/whl/`. The branch holds only HTML
+and `whl/manifest.json` (one entry per released wheel, accumulated across
+releases); the wheels stay on the GitHub Releases.
 
 ### GitHub environment
 
@@ -87,7 +104,7 @@ create releases (the default for a repository).
 3. **Validate on a GPU host** before tagging. With docker:
 
    ```bash
-   tools/release/build_wheel.sh --docker --python 3.12 --torch 2.13.0 --cuda cu130
+   tools/release/build_wheel.sh --docker --python 3.12 --torch 2.14.1 --cuda cu130
    FOUNDRY_DOCKER_GPUS=all tools/release/build_wheel.sh --docker --python 3.12   # smoke against the real driver
    ```
 
@@ -104,22 +121,26 @@ create releases (the default for a repository).
 5. **Tag and push**:
 
    ```bash
-   git tag v0.1.0rc1        # a pre-release: PEP 440 `0.1.0rc1`, the tag must equal `v` + the pyproject version
-   git push pub v0.1.0rc1   # the remote that holds the trusted-publisher repo
+   git tag v0.1.0rc2        # a pre-release: PEP 440 `0.1.0rc2`, the tag must equal `v` + the pyproject version
+   git push pub v0.1.0rc2   # the remote that holds the trusted-publisher repo
    ```
 
    The plan job checks that the tag equals `v<pyproject version>`. Then:
    sdist, wheels (each repaired, checked and smoke-tested), the PyPI upload of
    the PyPI-pair wheels + sdist (waits for the `pypi` environment approval if
-   configured), and the GitHub Release `v0.1.0` with every wheel and the sdist
-   attached.
+   configured), the GitHub Release `v0.1.0` with every wheel and the sdist
+   attached, and the index update on `gh-pages`.
 
 6. **Verify** in a fresh venv:
 
    ```bash
-   pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
-   pip install foundry-core==0.1.0rc1
+   pip install "torch==2.14.1" --index-url https://download.pytorch.org/whl/cu130
+   pip install foundry-core==0.1.0rc2
    python -c "import foundry, foundry.integration.sglang.api as a; print(foundry.__version__, a.INTEGRATION_API_VERSION)"
+   # the other pair, through its index
+   pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
+   pip install foundry-core==0.1.0rc2 --extra-index-url https://foundry-org.github.io/foundry/whl/cu130/torch2.13/
+   pip show foundry-core | grep Version      # 0.1.0rc2+cu130.torch2.13
    ```
 
 A PyPI version can never be re-uploaded. If a published release is broken,
@@ -129,16 +150,19 @@ yank it on PyPI and release the next patch version.
 
 - **Permanent:** append `{"torch": "2.12.0", "cuda": "cu128"}` to
   `BUILD_PAIRS`. Every tagged release then also builds those wheels (local
-  version, GitHub Release only). The builder image is derived from the CUDA
-  tag (`cu128` uses `pytorch/manylinux2_28-builder:cuda12.8`); add
+  version), attaches them to the GitHub Release and lists them in
+  `whl/cu128/torch2.12/`. The builder image is derived from the CUDA tag
+  (`cu128` uses `pytorch/manylinux2_28-builder:cuda12.8`); add
   `"image": "..."` to the entry to override it.
 - **One-off:** *Run workflow* with `torch = 2.12.0`, `cuda = cu128`,
-  `publish = yes`. Only that pair is built; it skips PyPI and uploads to the
-  GitHub Release of `v<pyproject version>` (creating it if needed).
+  `publish = yes`. Only that pair is built; it skips PyPI, uploads to the
+  GitHub Release of `v<pyproject version>` (creating it if needed) and adds
+  the pair's index.
 
-Users install such a wheel by URL, matching their Python:
+Users select the pair with its index, or install a wheel by URL:
 
 ```bash
+pip install "foundry-core==0.1.0" --extra-index-url https://foundry-org.github.io/foundry/whl/cu128/torch2.12/
 pip install "https://github.com/foundry-org/foundry/releases/download/v0.1.0/foundry_core-0.1.0+cu128.torch2.12-cp312-cp312-manylinux_2_28_x86_64.whl"
 ```
 

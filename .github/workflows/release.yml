@@ -1,6 +1,8 @@
 # Build foundry-core wheels and the sdist; on a v* tag (or a manual run with
 # publish=yes) upload the PyPI-pair wheels + sdist to PyPI through trusted
-# publishing and attach every wheel to a GitHub Release. See docs/release.md.
+# publishing, attach every wheel to a GitHub Release and list them in the
+# per-pair package index on the gh-pages branch (whl/<cuda>/torch<A.B>/,
+# pip --extra-index-url). See docs/release.md.
 name: release
 
 on:
@@ -9,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       torch:
-        description: "torch version to build against, e.g. 2.13.0 (empty: every pair in BUILD_PAIRS)"
+        description: "torch version to build against, e.g. 2.14.1 (empty: every pair in BUILD_PAIRS)"
         required: false
         default: ""
       cuda:
@@ -28,12 +30,14 @@ permissions:
 env:
   # Release matrix: PYTHONS x BUILD_PAIRS. The FIRST pair is the PyPI pair:
   # its wheels carry the plain version (foundry-core X.Y.Z, Requires-Dist
-  # torch==A.B.*) and are uploaded to PyPI. Every other pair is built with a
-  # local version (X.Y.Z+cuNNN.torchA.B) and attached to the GitHub Release
-  # only, since PyPI rejects local versions. "image" is optional; the default
+  # torch==A.B.C) and are uploaded to PyPI. Every other pair is built with a
+  # local version (X.Y.Z+cuNNN.torchA.B), since PyPI rejects local versions.
+  # Every wheel is attached to the GitHub Release and listed in the package
+  # index of its pair, whl/<cuda>/torch<A.B>/ on the gh-pages branch, which
+  # users select with pip --extra-index-url. "image" is optional; the default
   # is pytorch/manylinux2_28-builder:cuda<major.minor of the cuda tag>.
   PYTHONS: '["3.10", "3.11", "3.12", "3.13"]'
-  BUILD_PAIRS: '[{"torch": "2.13.0", "cuda": "cu130"}]'
+  BUILD_PAIRS: '[{"torch": "2.14.1", "cuda": "cu130"}, {"torch": "2.13.0", "cuda": "cu130"}]'
 
 jobs:
   plan:
@@ -220,6 +224,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.plan.outputs.version }}
+          INDEX_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/whl
         run: |
           tag="v$VERSION"
           ls -l dist
@@ -228,7 +233,9 @@ jobs:
 
           PyPI wheels (\`pip install foundry-core==$VERSION\`) are built for the first pair of
           \`$BUILD_PAIRS\` (CPython 3.10-3.13, manylinux_2_28 x86_64). Wheels with a local version
-          (\`+cuNNN.torchA.B\`) target other torch/CUDA pairs: install them by URL from this page.
+          (\`+cuNNN.torchA.B\`) target other torch/CUDA pairs. Every pair has a package index:
+          \`pip install foundry-core==$VERSION --extra-index-url $INDEX_URL/<cuda>/torch<A.B>/\`
+          (for example \`$INDEX_URL/cu130/torch2.13/\`), or install the wheel by URL from this page.
           foundry.ops only loads with the torch major.minor and CUDA major it was built for.
           NOTES
           if gh release view "$tag" >/dev/null 2>&1; then
@@ -237,3 +244,101 @@ jobs:
             gh release create "$tag" dist/* --title "foundry-core $VERSION" \
               --notes-file notes.md --target "$GITHUB_SHA"
           fi
+
+  index:
+    # Per-pair package indexes (PEP 503) on the gh-pages branch:
+    # whl/<cuda>/torch<A.B>/foundry-core/ lists every released wheel of that
+    # pair, linking to the GitHub Release assets with their sha256. The
+    # manifest whl/manifest.json accumulates across releases; the HTML is
+    # regenerated from it on every run.
+    needs: [plan, release]
+    if: always() && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - name: Check out the gh-pages branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git"
+          if git ls-remote --exit-code --heads "$url" gh-pages >/dev/null; then
+            git clone --quiet --branch gh-pages --single-branch "$url" pages
+          else
+            git init --quiet -b gh-pages pages
+            git -C pages remote add origin "$url"
+          fi
+      - name: Update the manifest and regenerate the indexes
+        env:
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, html, json, os, re, urllib.parse
+          from pathlib import Path
+
+          repo, version = os.environ["GH_REPO"], os.environ["VERSION"]
+          entries = json.loads(os.environ["MATRIX"])["include"]
+          root = Path("pages/whl")
+          root.mkdir(parents=True, exist_ok=True)
+          manifest_path = root / "manifest.json"
+          manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+
+          def pair_of(name):
+              """(cuda, torch major.minor) of a wheel from this run's matrix."""
+              m = re.match(r"foundry_core-(?P<ver>[^-]+)-cp(?P<py>\d+)-", name)
+              ver, py = m["ver"], m["py"]
+              local = ver.split("+", 1)[1] if "+" in ver else ""
+              for e in entries:
+                  if e["python"].replace(".", "") == py and e["local_version"] == local:
+                      return e["cuda"], ".".join(e["torch"].split(".")[:2])
+              raise SystemExit(f"no matrix entry for {name}")
+
+          for wheel in sorted(Path("dist").glob("*.whl")):
+              cuda, torch_mm = pair_of(wheel.name)
+              manifest[wheel.name] = {
+                  "version": version, "cuda": cuda, "torch": torch_mm,
+                  "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+                  "url": f"https://github.com/{repo}/releases/download/v{version}/"
+                         + urllib.parse.quote(wheel.name),
+              }
+          manifest_path.write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n")
+
+          head = ('<!DOCTYPE html><html><head><meta charset="utf-8">'
+                  '<meta name="pypi:repository-version" content="1.0"><title>{}</title></head><body>')
+          pairs = sorted({(m["cuda"], m["torch"]) for m in manifest.values()})
+          for cuda, torch_mm in pairs:
+              d = root / cuda / f"torch{torch_mm}"
+              (d / "foundry-core").mkdir(parents=True, exist_ok=True)
+              files = sorted(n for n, m in manifest.items() if (m["cuda"], m["torch"]) == (cuda, torch_mm))
+              links = "".join(
+                  f'<a href="{html.escape(manifest[n]["url"])}#sha256={manifest[n]["sha256"]}">{html.escape(n)}</a><br>\n'
+                  for n in files)
+              (d / "foundry-core" / "index.html").write_text(
+                  head.format(f"foundry-core {cuda} torch{torch_mm}") + f"<h1>foundry-core ({cuda}, torch {torch_mm})</h1>\n{links}</body></html>\n")
+              (d / "index.html").write_text(
+                  head.format(f"foundry-core index {cuda} torch{torch_mm}") + '<a href="foundry-core/">foundry-core</a><br>\n</body></html>\n')
+          listing = "".join(f'<a href="{c}/torch{t}/">{c}/torch{t}/</a><br>\n' for c, t in pairs)
+          (root / "index.html").write_text(
+              head.format("foundry-core wheel indexes") + "<h1>foundry-core wheel indexes</h1>\n"
+              "<p>pip install foundry-core --extra-index-url &lt;this page&gt;/&lt;cuda&gt;/torch&lt;A.B&gt;/</p>\n"
+              + listing + "</body></html>\n")
+          (Path("pages") / ".nojekyll").touch()
+          print("\n".join(f"{c}/torch{t}: " + ", ".join(n for n, m in manifest.items() if (m['cuda'], m['torch']) == (c, t)) for c, t in pairs))
+          PY
+      - name: Push gh-pages
+        run: |
+          cd pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && { echo "index unchanged"; exit 0; }
+          git commit -q -m "whl index: foundry-core ${{ needs.plan.outputs.version }}"
+          git push origin gh-pages

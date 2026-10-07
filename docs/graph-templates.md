@@ -165,6 +165,9 @@ the driver. Test: `tests/test_cluster_optin.py` (driver-level, no archive).
 | `graph_templates = true/false` | SAVE TOML | group graphs into templates (default) or store every graph in full |
 | `FOUNDRY_LAZY_GRAPH_EXEC=1` | LOAD env | dedicated execs, instantiated at first replay instead of during Phase 2 |
 | `FOUNDRY_QMD_REPAIR=1` | LOAD env | shared exec per template, members switched with `cuGraphExecUpdate` + descriptor repair |
+| `FOUNDRY_EXEC_POOL_PREWARM=0` | LOAD env | ablation: skip the exec-pool prewarm (Phase 2 grows the driver's exec pool itself) |
+| `FOUNDRY_PHASE2_PIPELINE=0` | LOAD env | ablation: no build/instantiate overlap, every instantiate runs inline on the build thread (the prep pool stays) |
+| `FOUNDRY_SGLANG_WARMUP_PASSES=N` | SAVE env | warm-up forwards per shape before its capture (default 2) |
 | `FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0` | SAVE env | group graphs that differ only in per-node cluster dimensions (deep_gemm picks the cluster size by M): Qwen3-30B-A3B EP2 goes from 26 to 10 templates |
 | `FOUNDRY_MMAP_ARCHIVE` (default on; `0` disables) | LOAD env | mmap `fatbin_image_packed.img` instead of reading it into memory before `cuLibraryLoadData` |
 | `FOUNDRY_DEBUG` build | compile flag | logs per-graph edge verification and template/member decisions |

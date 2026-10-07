@@ -35,6 +35,7 @@ scheduler / DP-controller spawn             :func:`configure_subprocess`
 ``ModelRunner.alloc_memory_pool``           :func:`before_alloc_memory_pool`,
                                             :func:`after_alloc_memory_pool`
 decode / prefill runner ``capture``         :func:`capture_scope`
+runners' ``_capture_one_stream`` call      :func:`run_capture_loop`
 ``FullCudaGraphBackend.capture_one``        :func:`capture_one`
 ``_resolve_shared_read_ends``               :func:`shared_read_ends_override`
 ==========================================  ===================================
@@ -54,7 +55,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-INTEGRATION_API_VERSION = (1, 0)
+INTEGRATION_API_VERSION = (1, 2)
 MODES = ("save", "load")
 FLAG = "--cuda-graph-persistence"
 
@@ -234,14 +235,15 @@ def after_parallel_init() -> None:
     hooks.after_parallel_init()
 
 
-def after_runner_distributed_init(model_runner: Any) -> None:
-    """End of ``ModelRunner.init_torch_distributed`` (target runner only): move
-    the allocation cursor to the scratch boundary so weight loading starts at
-    the same offset on SAVE and LOAD."""
+def after_runner_distributed_init(is_draft_worker: bool) -> None:
+    """End of ``ModelRunner.init_torch_distributed``: move the allocation
+    cursor to the scratch boundary so weight loading starts at the same offset
+    on SAVE and LOAD. A draft worker (``is_draft_worker``) reuses the target's
+    groups and is skipped."""
     _require_active()
     from foundry.integration.sglang import hooks
 
-    hooks.after_runner_distributed_init(model_runner)
+    hooks.after_runner_distributed_init(is_draft_worker)
 
 
 def replay_saved_memory_pool_config():
@@ -263,32 +265,36 @@ def record_memory_pool_overrides() -> None:
     hooks.record_memory_pool_overrides()
 
 
-def before_alloc_memory_pool(model_runner: Any) -> None:
-    """Head of ``ModelRunner.alloc_memory_pool``."""
+def before_alloc_memory_pool(is_draft_worker: bool) -> None:
+    """Head of ``ModelRunner.alloc_memory_pool`` (draft workers skipped)."""
     _require_active()
     from foundry.integration.sglang import hooks
 
-    hooks.before_alloc_memory_pool(model_runner)
+    hooks.before_alloc_memory_pool(is_draft_worker)
 
 
-def after_alloc_memory_pool(model_runner: Any) -> None:
-    """End of ``ModelRunner.alloc_memory_pool`` (SAVE writes the warmup state)."""
+def after_alloc_memory_pool(memory_pool_config: Any, is_draft_worker: bool) -> None:
+    """End of ``ModelRunner.alloc_memory_pool``: SAVE records the resolved
+    ``MemoryPoolConfig`` (a dataclass) for LOAD; draft workers skipped."""
     _require_active()
     from foundry.integration.sglang import hooks
 
-    hooks.after_alloc_memory_pool(model_runner)
+    hooks.after_alloc_memory_pool(memory_pool_config, is_draft_worker)
 
 
-def capture_scope(runner: Any):
-    """Context manager around the body of ``DecodeCudaGraphRunner.capture`` or
-    ``PrefillCudaGraphRunner.capture``. SGLang's capture loop runs inside on
-    both modes; the scope adds the pre-capture bootstraps and the layout start
-    (first runner), LOAD's preallocation and restore bookkeeping, and SAVE's
-    manifest, fatbin pack and region layout."""
+def capture_scope(phase: str, *, model: Any, req_slots: int | None = None):
+    """Context manager around the body of ``DecodeCudaGraphRunner.capture``
+    (``phase="decode"``) or ``PrefillCudaGraphRunner.capture``
+    (``phase="prefill"``, with the runner's fixed request-slot count
+    ``req_slots``). ``model`` is the loaded model: the pre-capture bootstraps
+    walk its modules (logits gatherer, DeepEP buffer, NVSHMEM). SGLang's
+    capture loop runs inside on both modes; the scope adds the bootstraps and
+    the layout start (first runner), LOAD's preallocation and restore
+    bookkeeping, and SAVE's manifest, fatbin pack and region layout."""
     _require_active()
     from foundry.integration.sglang import hooks
 
-    return hooks.capture_scope(runner)
+    return hooks.capture_scope(phase, model, req_slots)
 
 
 def capture_one(
@@ -298,18 +304,42 @@ def capture_one(
     pool: Any,
     stream: Any,
     prefill_req_slots: int | None = None,
+    post_warmup_hook: Any = None,
+    tp_group: Any = None,
 ):
     """Replaces the body of ``FullCudaGraphBackend.capture_one`` and returns
-    ``(graph, output)`` for SGLang to store: SAVE captures the shape on
-    ``stream`` into ``pool`` without warm-up forwards and archives it; LOAD
-    restores the archived graph for the shape. ``prefill_req_slots`` is the
-    prefill runner's fixed request-slot count, None for a decode graph."""
+    ``(graph, output)`` for SGLang to store. Inside :func:`run_capture_loop`
+    SAVE first runs the shape's two warm-up forwards, with
+    ``post_warmup_hook`` and a ``tp_group`` barrier, in a private pool, then
+    captures the shape on ``stream`` into ``pool`` and archives it; LOAD
+    restores the archived graph and runs no forward. ``prefill_req_slots`` is
+    the prefill runner's fixed request-slot count, None for a decode graph.
+    ``post_warmup_hook`` / ``tp_group`` since 1.1."""
     _require_active()
     from foundry.integration.sglang import hooks
 
     return hooks.capture_one(
-        shape_key, forward_fn, pool=pool, stream=stream, prefill_req_slots=prefill_req_slots
+        shape_key,
+        forward_fn,
+        pool=pool,
+        stream=stream,
+        prefill_req_slots=prefill_req_slots,
+        post_warmup_hook=post_warmup_hook,
+        tp_group=tp_group,
     )
+
+
+def run_capture_loop(loop_fn, *, model: Any, attn_backend: Any) -> Any:
+    """Run a runner's per-shape capture loop (``loop_fn`` =
+    ``_capture_one_stream``, called inside its capture session): persistent
+    bootstrap first (``model``: the loaded model; ``attn_backend``: the
+    runner's attention backend), then the loop, in which SAVE warms each shape
+    in a private pool right before capturing it; the pool is released and
+    checked after the loop."""
+    _require_active()
+    from foundry.integration.sglang import warmup_pool
+
+    return warmup_pool.run_capture_loop(loop_fn, model=model, attn_backend=attn_backend)
 
 
 def shared_read_ends_override(runner: Any, attn_backend: Any, forward_mode: Any):

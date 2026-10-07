@@ -15,7 +15,7 @@ build-backend = "setuptools.build_meta"
 [project]
 # Distribution name on PyPI; the import name stays `foundry`.
 name = "foundry-core"
-version = "0.1.0rc1"
+version = "0.1.0rc2"
 description = "Foundry: CUDA graph persistence for LLM serving engines (save captured CUDA graphs, restore them at startup)"
 readme = "README.md"
 # Apache-2.0 (LICENSE, picked up by setuptools' default license-files globs);
