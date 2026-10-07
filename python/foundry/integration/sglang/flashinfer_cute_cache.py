@@ -2,23 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Persistent on-disk cache for FlashInfer's SM90 GDN prefill CuTe-DSL kernels.
 
-FlashInfer 0.7's ``gdn_kernels/delta_rule_dsl`` compiles its four SM90 kernels
-(T/MN precompute, fixup, prefill) with ``cute.compile`` behind a process-local
-dict (``custom_compile_cache._in_mem_compile_cache``): every scheduler process
-pays 8-10 s on its first eager extend of a hybrid GDN model (Qwen3.5), and the
-DSL's own file cache does not apply (``cute.compile`` forces ``no_cache``).
-FlashInfer's ``build_and_load_cute_dsl_kernel`` (its SM100 GDN and other
-CuTe-DSL call sites use it) exports a compiled kernel to a ``.o`` under
-``~/.cache/flashinfer/<version>/<arch>/cached_ops/`` and reloads it in
-milliseconds. :func:`install` routes ``cached_compile`` through it: the first
-process compiles and persists, every later process (SAVE, LOAD) loads. A
-compile key that is not stable across processes (object ids in its repr)
-takes the plain compile. Applied on both modes before the capture loop, only
-when SGLang's FlashInfer GDN kernel module is loaded.
-
-Temporary: once SGLang captures FULL prefill graphs for hybrid GDN models
-(sgl-project/sglang#36077) the compile happens in SAVE's warm-ups and lands
-in the archived graphs, and this module has nothing left to do.
+FlashInfer's ``gdn_kernels/delta_rule_dsl`` compiles its SM90 kernels with
+``cute.compile`` behind a process-local dict. :func:`install` routes that
+compile through FlashInfer's ``build_and_load_cute_dsl_kernel`` (its on-disk
+``.o`` cache under ``~/.cache/flashinfer/<version>/<arch>/cached_ops/``), so
+one process compiles and every later one loads. Applied on SAVE and LOAD
+before the capture loop when SGLang's FlashInfer GDN kernel module is loaded.
 """
 
 from __future__ import annotations

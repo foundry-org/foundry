@@ -1,82 +1,51 @@
 # Foundry 0.1.0rc2
 
 Release candidate of 0.1.0: the first release on PyPI (`foundry-core`, import
-name `foundry`) and the first one SGLang can depend on. It carries everything
-since 0.0.3.
+name `foundry`) and the first one SGLang can depend on.
 
 ## Highlights
 
-- **`pip install foundry-core`.** manylinux_2_28 wheels for CPython 3.10-3.13,
-  built against torch 2.14.1 / cu130, SGLang's current pin; the wheel requires
-  `torch==2.14.1`.
-  Importing under another torch or CUDA major raises a readable `ImportError`.
-- **One package index per torch/CUDA pair**, like torch's own wheel indexes:
-  `pip install foundry-core --extra-index-url https://foundry-org.github.io/foundry/whl/<cuda>/torch<A.B>/`.
-  0.1.x also builds torch 2.13.0 / cu130 (`whl/cu130/torch2.13/`).
-- **Optional SGLang dependency.** Installing Foundry does not require SGLang;
-  an SGLang started with `--cuda-graph-persistence {save,load}` requires
-  Foundry (`pip install "sglang[foundry]"`) and calls
-  `foundry.integration.sglang.api` from its own call sites. Settings a
-  restored graph cannot replay are pinned with a reason; unsupported features
-  are rejected at resolution. `python -m foundry.integration.sglang.preflight`
-  checks a launch beforehand. Integration API 1.2: every call site passes the
-  values Foundry needs (model, attention backend, draft flag, pool config,
-  prefill request slots), never a runner or backend object.
-- **Prefill CUDA graphs** are saved and restored next to the decode graphs.
-  With power-of-two buckets, prefill TTFT and throughput of a LOADed engine
-  match native capture.
-- **torch 2.14 support without disabling Dynamo:** SAVE runs SGLang's warm-up
-  forwards for each shape in a private CUDA memory pool right before capturing
-  it, so compiled helpers and autotuning run outside the capture and outside
-  the recorded layout; LOAD still runs no forward.
-- **LOAD re-runs SGLang's own capture loop** and substitutes only
-  `capture_one`; the restore time is logged apart from the loop.
-- **Faster restore:** 0.5-1.6 s per rank for 128 decode graphs on 30B-235B
-  models (binary templates, build/instantiate pipeline, exec-pool prewarm).
-  Non-portable cluster kernels are opted in on restore.
-- **No Boost runtime dependency.** Boost is header-only (vendored subset under
-  `third_party/boost`, system Boost >= 1.83 as fallback); `std::filesystem`
-  replaces `boost::filesystem`.
+- `pip install foundry-core`: manylinux_2_28 wheels for CPython 3.10-3.13,
+  built against torch 2.14.1 / cu130 (SGLang's pin).
+- One package index per torch/CUDA pair:
+  `pip install foundry-core --extra-index-url https://foundry-org.github.io/foundry/whl/<cuda>/torch<A.B>/`
+  (0.1.x also builds torch 2.13.0 / cu130).
+- Optional SGLang dependency: `pip install "sglang[foundry]"`, then
+  `--cuda-graph-persistence {save,load}` (integration API 1.2).
+- Prefill CUDA graphs are saved and restored next to the decode graphs.
+- torch 2.14 support: SAVE runs SGLang's warm-up forwards in a private memory
+  pool before capturing each shape; LOAD runs no forward.
+- Faster restore: binary templates, build/instantiate pipeline, exec-pool
+  prewarm.
+- No Boost runtime dependency (header-only, vendored subset).
 
 ## Fixes
 
-- SAVE over-read every fatbin (30 s per rank in distributed init, 4-5 GB
-  archives); the packed image is now 30-35 MB and mmap'd on LOAD.
-- One preallocation mechanism on LOAD (backing segments, fenced release,
-  on-demand holes).
+- Fatbin packing: the archived image is 30-35 MB and mmap'd on LOAD.
+- One preallocation mechanism on LOAD.
 - Qwen3.5 + FlashInfer LOAD divergence.
-- Hybrid GDN models (Qwen3.5) with FlashInfer 0.7: the SM90 GDN prefill
-  CuTe-DSL kernels were compiled in every scheduler process on its first eager
-  extend (8-10 s, in the first request's TTFT; the DSL file cache does not
-  apply to `cute.compile`). Foundry routes that compile through FlashInfer's
-  own persistent `.o` cache (`build_and_load_cute_dsl_kernel`, as its SM100
-  GDN kernels already do): compiled once, loaded in milliseconds afterwards,
-  on SAVE and LOAD. Carried in `integration/sglang/flashinfer_cute_cache.py`
-  until SGLang captures FULL prefill graphs for GDN models (sgl-project/sglang#36077).
-- Optional udev-wait shim for bare hosts with blocked verbs devices
-  (`tools/host/no_cdev_wait.c`, TOML `verbs_udev_wait_shim_path`).
-- The hook preload is scoped to the scheduler spawn; only schedulers and the
-  DP controller carry `LD_PRELOAD`.
+- FlashInfer SM90 GDN prefill kernels are loaded from FlashInfer's on-disk
+  cache instead of being compiled per process.
+- Optional udev-wait shim for bare hosts (`tools/host/no_cdev_wait.c`, TOML
+  `verbs_udev_wait_shim_path`).
+- The hook preload is scoped to the scheduler spawn.
 
 ## Validation
 
-4xH200, torch 2.14.1 / cu130, SGLang main with `--cuda-graph-persistence`:
-Qwen3-30B-A3B-FP8 (real weights, 7 layouts), Qwen3-235B-A22B-FP8,
-Qwen3.5-122B-A10B-FP8, Qwen3.5-35B-A3B, DeepSeek-V4-Flash-FP8, GLM-5.3-Flash
-and gpt-oss-120b in EP, TP and DP-attention layouts (16 rows), plus the 1-GPU
-e2e. Every row restores in 0.5-1.7 s per rank and reaches `/health` in 36-83 s
-against 75-154 s for native capture; native, SAVE and LOAD agree on the
-selected and top-3 logprobs of 74 greedy requests (exact on 15 rows, a
-scheduler-composition effect shared with native on the 16th), and LOAD TTFT /
-TPOT are within noise of native (`docs/sglang/validated-configs.md`).
+4xH200, torch 2.14.1 / cu130: Qwen3-30B-A3B-FP8 (real weights, 7 layouts),
+Qwen3-235B-A22B-FP8, Qwen3.5-122B-A10B-FP8, Qwen3.5-35B-A3B,
+DeepSeek-V4-Flash-FP8, GLM-5.3-Flash and gpt-oss-120b in EP, TP and
+DP-attention layouts, plus the 1-GPU e2e; native, SAVE and LOAD outputs agree
+and LOAD TTFT / TPOT match native (`docs/sglang/validated-configs.md`).
 
 ## Packaging
 
 - `FOUNDRY_WHEEL_BUILD=1` builds a relocatable wheel; `FOUNDRY_SDIST=1` builds
   the sdist without a CUDA toolkit.
 - `.github/workflows/release.yml` builds, repairs, smoke-tests and publishes
-  (PyPI trusted publishing + GitHub Release); `tools/release/build_wheel.sh`
-  runs the same steps locally. See `docs/release.md`.
+  (PyPI trusted publishing + GitHub Release + the per-pair wheel index on
+  `gh-pages`); `tools/release/build_wheel.sh` runs the same steps locally. See
+  `docs/release.md`.
 
 ## Upgrading
 

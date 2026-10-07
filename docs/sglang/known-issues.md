@@ -9,75 +9,6 @@ order, and LOAD cannot replay that layout. `region_layout.json` (per rank) recor
 or with another value: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the
 current code`. Rule: re-SAVE every archive saved by the old code.
 
-## Hybrid GDN first eager extend compiles FlashInfer's CuTe-DSL kernels for 8-10 s per process (PATCHED, 2026-10-07)
-
-**Symptom.** Qwen3.5-122B EP4 (hybrid GDN, decode graphs only; prefill is eager because SGLang cannot capture
-FULL prefill graphs for GDN yet) on FlashInfer 0.7.0.post1: the first prefill of every scheduler process took
-10-11 s on native, SAVE and LOAD alike. LOAD's `/health` showed it as +38 s because the 1-token generate rotated
-over the four DP ranks and the probe timed out on each first prefill; the pre-rebase environment (FlashInfer
-0.6.18, another GDN prefill path) paid 1-3 s.
-
-**Cause** (faulthandler stacks during the gap, `final/r2_diag`): `flashinfer.gdn_prefill.chunk_gated_delta_rule`
--> `gdn_kernels/delta_rule_dsl/delta_rule_cp_sm90.py` -> `custom_compile_cache.cached_compile` -> `cute.compile`
-of four SM90 kernels, cached only in a process-local dict. CuTe DSL's file cache (`CUTE_DSL_CACHE_DIR`) does not
-apply: `cute.compile` forces `no_cache=True` (`base_dsl/compiler.py`), measured as 8.4 s in every process even
-after a clean exit, 0 cache files. FlashInfer has a persistent `.o` cache (`jit/cute_dsl_core.build_and_load_cute_dsl_kernel`,
-`~/.cache/flashinfer/<ver>/<arch>/cached_ops/`, used by its SM100 GDN and other CuTe-DSL call sites) that the SM90
-delta_rule path does not use.
-
-**Patch** (`integration/sglang/flashinfer_cute_cache.py`, both modes, installed before the capture loop when
-SGLang's FlashInfer GDN kernel module is loaded): `cached_compile` keeps its in-memory dict and, on a miss, goes
-through `build_and_load_cute_dsl_kernel("gdn_delta_rule_dsl", <kernel class>_<sha256(compile key)[:16]>,
-compile_fn, delta_rule_dsl sources)`. The compile keys (class MRO + static attributes) are stable across
-processes; a key whose repr carries object ids takes the plain compile. Measured on the Q122 extend shapes: miss
-9.35 s (4 kernels compiled and persisted right away), hit 0.078 s; outputs bitwise equal to the unpatched compile.
-Not upstreamed on purpose: once SGLang captures FULL prefill graphs for GDN (sgl-project/sglang#36077), SAVE's
-warm-ups compile these kernels and the archived graphs carry them; the patch then has nothing to do and goes.
-
-## torch 2.14: dynamo refuses to compile inside the capture window (FIXED: SAVE warm-ups in a private MemPool, 2026-10-06)
-
-**Symptom.** With torch 2.14 (SGLang's pin from upstream f385390be5), SAVE failed at the first captured forward
-that reached a `@torch.compile`d helper (e.g. SGLang's MoE top-k post-processing): torch >= 2.14's dynamo refuses
-to trace while a stream is capturing.
-
-**Cause.** SAVE ran no warm-up forwards, so the first call of every compiled helper, every kernel load and every
-one-time initialization happened inside the capture window. The forwards were skipped because their activations,
-freed into the default caching-allocator pool, change which later allocations hit the cache, which LOAD (no
-forward) cannot reproduce.
-
-**Fix** (`warmup_pool.py`, both routes), around each runner's capture loop (`_capture_one_stream`):
-
-1. *Persistent bootstrap*, both modes, in the normal recorded domain: the cuBLAS handle and workspace of
-   the capture stream and of every side stream a model module holds, directly or in a list (Qwen3.5's GDN
-   `alt_stream`, DeepSeek-V4's `alt_streams`), FlashInfer's
-   global ALiBi slopes buffer, the MoE router's int32 placeholder, and with EP > 1 every
-   `StandardDispatcher.prepare_local_expert_mapping()`. These are real resources a first forward would create;
-   left to the warm-ups they would end up in the private pool and be retained (see overview.md).
-2. *The loop*, SGLang's own, once. On SAVE `capture_one` runs upstream's two warm-up forwards for the shape
-   (synchronize, TP barrier, forward, `post_warmup_hook`) inside one `torch.cuda.MemPool` per runner, with
-   Foundry's allocation region stopped (the cursor must not move), then captures the shape as before. LOAD
-   prepares the shape and restores its graph; no forward runs.
-3. *Pool release*, SAVE, after the loop: the pool must hold no live block; it is released by its destructor (no
-   `empty_cache`), and no allocator segment may still carry its id. A retained block fails SAVE, naming the block
-   and, with `FOUNDRY_SGLANG_WARM_POOL_TRACE=1`, the stack that allocated it.
-
-Why the layout survives: the hook records every allocation in the region from `mark_layout_start`, and LOAD only
-requires its cursor to be at or below SAVE's at each graph's `start_base_addr` (replay fast-forwards to it; it aborts
-if LOAD consumed more). The warm-ups allocate outside the region and never touch the default pool, so the
-per-shape preparation buffers the graphs reference (FlashInfer's per-batch-size wrappers and workspaces, the
-second runner's static buffers) are allocated from the same allocator state on both modes. Warm-ups in the
-default pool would break this: on SAVE those buffers would be served from cached warm-up blocks the hook never
-sees, on LOAD from fresh segments.
-
-The two-pass variant (all shapes prepared and warmed first, then all captured) was compared on Qwen3-30B TP2 and
-EP4 and gave the same correctness and timing; it needed idempotent per-shape preparation on the sglang side and
-was dropped.
-
-Validated (prototype, `experimental/torch214_capture`): Qwen3-1.7B and Qwen3-30B-A3B-FP8 with FlashInfer, TP1 and
-attention-DP2/EP2 with DeepEP v1 low-latency and v2 direct, Dynamo enabled; native/SAVE/LOAD greedy outputs and
-logprobs equal in the controlled runs (one intermittent LOAD logprob outlier in DeepEP auto mode, not reproduced
-on repeat; native shows the same class of variation). Not yet: FA3 / triton / hybrid-linear / DSV4 backends, prefill graphs, full-model `--enable-torch-compile`.
-
 ## DeepEP v2 (NCCL windows + GIN) not validated on the plugin route (TODO, 2026-09-30)
 
 `--moe-a2a-backend deepep_v2` was validated on the earlier fork route only (H100 EP2 / EP4, all 256 decode graphs,
@@ -170,10 +101,7 @@ natively, the pre-capture bootstrap on SAVE/LOAD). Restore time is unaffected. C
 `LD_PRELOAD` shim that removes it: [../bare-host-verbs-udev-wait.md](../bare-host-verbs-udev-wait.md)
 (`tools/host/no_cdev_wait.c`).
 
-## SAVE fails cold: inductor autotunes a fresh Triton kernel inside the capture window (RESOLVED by the SAVE warm-up pool, 2026-10-06)
-
-Resolved: the warm-ups now run before the capture (entry "torch 2.14: dynamo refuses to compile inside the capture
-window"), so autotuning happens outside the capture window; a warm cache is no longer required. Original record:
+## SAVE fails cold: inductor autotunes a fresh Triton kernel inside the capture window (LIMITATION, 2026-09-24)
 
 **Symptom.** GLM-5.3-Flash EP8 (dummy weights) as the FIRST engine ever run for that model in a fresh container:
 SAVE's first captured forward fails with `torch.AcceleratorError: CUDA error: operation not permitted when
@@ -204,9 +132,7 @@ sglang's pre-capture warmup forwards use the capture-mode inputs, so their artif
 Disabling pointwise autotuning (`torch._inductor.config.triton.autotune_pointwise=False`) would also avoid it
 but changes the kernels SAVE captures relative to native sglang, so it is not the default.
 
-## SAVE capture fails when a first torch.compile inside the capture window copies a CPU constant to the device (RESOLVED by the SAVE warm-up pool, 2026-10-06)
-
-Resolved the same way: the first compile now happens in a warm-up forward, outside the capture. Original record:
+## SAVE capture fails when a first torch.compile inside the capture window copies a CPU constant to the device (OPEN, 2026-09-23)
 
 **Symptom.** Inkling-Small (bf16, EP8, dummy weights) on 8xH200: the native sglang graph engine captures all
 decode graphs, Foundry SAVE fails in the first captured forward:

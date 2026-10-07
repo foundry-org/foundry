@@ -66,7 +66,7 @@ Model weights, KV pools, attention workspace buffers, FlashInfer wrapper `_int_w
 
 Anything that runs on one path but not the other. The fixes we landed identify and align the three known cases:
 
-1. The two pre-capture warm-up forwards per shape — run on SAVE only, in a private `torch.cuda.MemPool` with Foundry's allocation region stopped, right before the shape is captured (`warmup_pool.run_capture_loop`); the pool is released after the loop. The default pool's cache state, and so the recorded layout, is untouched; LOAD runs no forward. (See [`known-issues.md`](known-issues.md#torch-214-dynamo-refuses-to-compile-inside-the-capture-window-fixed-save-warm-ups-in-a-private-mempool-2026-10-06).)
+1. The two pre-capture warmup forwards in `capture_one_batch_size` — skipped on SAVE so they don't pollute the caching allocator with freed activations LOAD can't reproduce. (See doc 06.)
 2. The per-bs attention metadata init (`init_forward_metadata_out_graph(in_capture=True)`: FlashInfer wrappers, `_int_workspace_buffer`) outside the captured graph. Originally aligned with a pre-pass on both sides plus a SAVE-only reuse shim; now both modes run the upstream capture loop and substitute only `capture_one`, so the init runs at the same point and in the same order on SAVE and LOAD, with each graph's allocator events replayed where SAVE captured it. (See [`memory-consistency.md`](memory-consistency.md) Bug 3.)
 3. `_resolve_memory_pool_config` calls `get_available_gpu_memory(empty_cache=True)` on SAVE; LOAD's `_patch_init_memory_pool` mirrors it with an explicit `torch.cuda.empty_cache()` before `_apply_memory_pool_config`. (See below.)
 
@@ -101,7 +101,7 @@ Persisting the resolved `MemoryPoolConfig` (via `dataclasses.asdict`) and re-app
 
 `setup_graph_extension` (in `runtime.py`):
 
-- Computes the per-rank workspace path (`{workspace_root}/rank_{compute_workspace_rank(...)}`). N is `replica * tp_size * pp_size + pp_rank * tp_size + tp_rank` from the spawn ranks. Without attention DP the replica is `dp_rank`. With attention DP the DP controller spawns the schedulers of one TP world and passes `dp_rank` = attention-DP group (`tp_rank // (attn_tp_size * attn_cp_size)`), so the replica is `dp_rank // attn_dp_size` = 0; EP4 with DP attention is rank_0..3 on sglang before and after #41818 (`--attn-dp-size`)
+- Computes the per-rank workspace path (`{workspace_root}/rank_{compute_workspace_rank(...)}`)
 - On SAVE: removes the rank workspace if it exists, then creates it fresh
 - On LOAD:
     - `cge.set_skip_fatbin_processing(True)`

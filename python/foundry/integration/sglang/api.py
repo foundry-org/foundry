@@ -239,7 +239,7 @@ def after_runner_distributed_init(is_draft_worker: bool) -> None:
     """End of ``ModelRunner.init_torch_distributed``: move the allocation
     cursor to the scratch boundary so weight loading starts at the same offset
     on SAVE and LOAD. A draft worker (``is_draft_worker``) reuses the target's
-    groups and is skipped. Since 1.2 takes the flag, not the runner."""
+    groups and is skipped."""
     _require_active()
     from foundry.integration.sglang import hooks
 
@@ -266,8 +266,7 @@ def record_memory_pool_overrides() -> None:
 
 
 def before_alloc_memory_pool(is_draft_worker: bool) -> None:
-    """Head of ``ModelRunner.alloc_memory_pool`` (draft workers skipped).
-    Since 1.2 takes the flag, not the runner."""
+    """Head of ``ModelRunner.alloc_memory_pool`` (draft workers skipped)."""
     _require_active()
     from foundry.integration.sglang import hooks
 
@@ -276,8 +275,7 @@ def before_alloc_memory_pool(is_draft_worker: bool) -> None:
 
 def after_alloc_memory_pool(memory_pool_config: Any, is_draft_worker: bool) -> None:
     """End of ``ModelRunner.alloc_memory_pool``: SAVE records the resolved
-    ``MemoryPoolConfig`` (a dataclass) for LOAD; draft workers skipped. Since
-    1.2 takes the config and the flag, not the runner."""
+    ``MemoryPoolConfig`` (a dataclass) for LOAD; draft workers skipped."""
     _require_active()
     from foundry.integration.sglang import hooks
 
@@ -292,8 +290,7 @@ def capture_scope(phase: str, *, model: Any, req_slots: int | None = None):
     walk its modules (logits gatherer, DeepEP buffer, NVSHMEM). SGLang's
     capture loop runs inside on both modes; the scope adds the bootstraps and
     the layout start (first runner), LOAD's preallocation and restore
-    bookkeeping, and SAVE's manifest, fatbin pack and region layout. Since
-    1.2 takes the phase, the model and the slots, not the runner."""
+    bookkeeping, and SAVE's manifest, fatbin pack and region layout."""
     _require_active()
     from foundry.integration.sglang import hooks
 
@@ -338,8 +335,7 @@ def run_capture_loop(loop_fn, *, model: Any, attn_backend: Any) -> Any:
     bootstrap first (``model``: the loaded model; ``attn_backend``: the
     runner's attention backend), then the loop, in which SAVE warms each shape
     in a private pool right before capturing it; the pool is released and
-    checked after the loop. Since 1.1; 1.2 takes the model and the backend,
-    not the runner."""
+    checked after the loop."""
     _require_active()
     from foundry.integration.sglang import warmup_pool
 

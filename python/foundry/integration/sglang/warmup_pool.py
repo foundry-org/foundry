@@ -2,26 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """SAVE warm-up forwards in a private MemPool, per shape, before its capture.
 
-torch >= 2.14's dynamo refuses to compile while a stream is capturing, so the
-first call of every ``torch.compile``d helper must happen before the capture,
-as SGLang's own two warm-up forwards per shape do. Their allocations must not
-move the deterministic layout LOAD replays (LOAD runs no forward), and they
-must not share the default caching-allocator pool with the per-shape
-preparation buffers the graphs reference: a buffer served from a cached
-warm-up block on SAVE needs a fresh segment on LOAD. So, inside a runner's
-capture loop (:func:`run_capture_loop`), ``capture_one`` on SAVE runs the two
-warm-up forwards of each shape in ONE private ``torch.cuda.MemPool`` with the
-hook's allocation region stopped (checked per shape), then captures the shape
-as before. After the loop the pool must hold no live block; it is released
-(MemPool destructor) and no allocator segment may still carry its id. LOAD
-runs the same loop with no forward and restores each graph.
-
-Persistent resources first created by a forward (cuBLAS workspaces, global
-kernel-argument caches, lazily built per-layer buffers) would otherwise land
-in the private pool and be retained: :func:`bootstrap_persistent_resources`
-creates them in the normal allocation domain on both modes before the loop.
-A retained block fails SAVE; ``FOUNDRY_SGLANG_WARM_POOL_TRACE=1`` adds the
-stack that allocated it.
+Inside a runner's capture loop (:func:`run_capture_loop`), ``capture_one`` on
+SAVE runs SGLang's two warm-up forwards of each shape in one private
+``torch.cuda.MemPool`` with the hook's allocation region stopped, then
+captures the shape; after the loop the pool must hold no live block and is
+released. LOAD runs the same loop with no forward. Persistent resources a
+first forward would create (cuBLAS workspaces, FlashInfer caches, MoE
+placeholders, EP expert maps) are created by
+:func:`bootstrap_persistent_resources` before the loop, on both modes.
+``FOUNDRY_SGLANG_WARM_POOL_TRACE=1`` records the allocation stack of any
+block the pool retains.
 """
 
 from __future__ import annotations
@@ -100,15 +90,6 @@ def bootstrap_persistent_resources(model: Any, attn_backend: Any) -> list[str]:
     create inside the private warm-up pool. Runs once per runner, before its
     capture loop, on the capture stream. ``model``: the loaded model (its
     modules are walked); ``attn_backend``: the runner's attention backend.
-
-    The list is what a graph references and no capture allocates: audited for
-    the validated backends (FlashInfer and FA3 attention, DeepGEMM / Triton
-    MoE, standard and DeepEP dispatch), not a universal inventory. A missed
-    resource shows up as a block retained by the pool after the loop (SAVE
-    fails, naming the block and, with ``FOUNDRY_SGLANG_WARM_POOL_TRACE=1``,
-    the stack that allocated it). Extend the list here; never free a retained
-    block instead.
-
     Returns the names of the resources prepared (logged)."""
     device = torch.device("cuda", torch.cuda.current_device())
     prepared = []
