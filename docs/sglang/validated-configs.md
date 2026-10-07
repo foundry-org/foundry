@@ -9,6 +9,44 @@ Every model and configuration that passed Foundry SAVE + LOAD with SGLang, with 
 
 "Dummy text" parity means the greedy completion was identical under dummy weights. It shows that the same kernels ran, not model quality.
 
+## Final validation: dependency route, torch 2.14.1, 4xH200 (2026-10-07)
+
+sglang PR branch (#42254, `--cuda-graph-persistence`) on upstream `f385390be5` + foundry-core 0.1.0rc2 (dev
+`1124863`; the explicit-argument call sites of integration API 1.2 validated on top with the TP2, EP4 and 1-GPU
+rows). Stack: torch 2.14.1+cu130, flashinfer 0.7.0.post1, deep-ep 0.1.2.post1, NCCL 2.30.7. Correctness = strict
+check of native graph, SAVE and LOAD: 74 requests (9 batched calls of 1-32 requests, greedy, 12 tokens), selected
+and top-3 logprobs of every step, batched and one request at a time; "exact" = identical tokens, logprob max-abs 0
+on all three pairs in both forms. Times are launch to the first `/health` 200 in the engine log; restore is
+prefill + decode. LOAD TPOT (bs 1/8/32/128) and prefill throughput are within ±3% of native on every row except the
+noted ones. Full tables, reruns and attribution: `claude-doc/report_coldstart/final/final_report.md`.
+
+| model | layout (4 GPUs) | weights | graphs (prefill + decode per rank) | native graph -> LOAD (s) | SAVE (s) | restore (s) | correctness | notes |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3-235B-A22B-FP8 | attn TP4 + EP4, DeepEP LL | dummy | 10 (4..2048) + 128 | 119.0 -> **39.1** | 163.5 | 0.13 + 1.49 | exact | |
+| Qwen3-235B-A22B-FP8 | attn TP2 x DP2 + EP4 | dummy | 10 (2..1024) + 128 | 130.0 -> **48.1** | 177.3 | 0.14 + 1.54 | exact | |
+| Qwen3.5-122B-A10B-FP8 | EP4, DP attention | dummy | 0 + 128 (GDN: native limitation) | 102.1 -> **50.2** | 141.9 | 0.85 | exact | first eager prefill: FlashInfer CuTe-DSL compile, cached by foundry (known-issues) |
+| Qwen3.5-122B-A10B-FP8 | attn TP2 x DP2 + EP4 | dummy | 0 + 128 | 137.2 -> **53.8** | 139.3 | 1.26 | exact | |
+| DeepSeek-V4-Flash-FP8 | EP4, DP attention | dummy | 0 + 128 | 109.3 -> **51.0** | 143.3 | 1.17 | exact | side-stream cuBLAS workspaces in the bootstrap (`alt_streams`) |
+| GLM-5.3-Flash (FP8) | EP4, DP attention | dummy | 0 + 128 | 153.9 -> **82.8** | 164.4 | 1.09 | exact | bs-128 TPOT noisy on both engines (A2); prefill throughput rerun pending |
+| gpt-oss-120b | EP4, a2a none | dummy | 10 (1..512) + 128 | 76.8 -> **50.5** | 103.3 | 0.05 + 0.52 | exact | |
+| Qwen3.5-35B-A3B | EP4, DP attention, DeepEP | dummy | 0 + 128 | 83.5 -> **45.9** | 94.2 | 0.63 | sequential exact; batched 2e-3 logprob delta from a scheduler composition race, same on native | |
+| Qwen3.5-35B-A3B | attn TP4 + EP4 | dummy | 0 + 128 | 75.2 -> **36.4** | 88.5 | 1.00 | exact | |
+| Qwen3-30B-A3B-FP8 | EP4, DP attention, DeepEP LL | **real** | 10 (1..512) + 128 | 86.6 -> **49.8** | 107.7 | 0.06 + 0.72 | exact | prefill throughput rerun pending (native 98k vs LOAD 84k tok/s once) |
+| Qwen3-30B-A3B-FP8 | TP2 | **real** | 12 (1..2048) + 128 | 75.5 -> **41.5** | 94.6 | 0.06 + 0.54 | exact | |
+| Qwen3-30B-A3B-FP8 | attn TP2 x DP2 + EP4 | **real** | 10 (2..1024) + 128 | 91.2 -> **51.8** | 116.0 | 0.06 + 0.81 | exact | |
+| Qwen3-30B-A3B-FP8 | DP4 | **real** | 12 (1..2048) + 128 | 81.0 -> **47.3** | 98.6 | 0.06 + 0.59 | exact | |
+| Qwen3-30B-A3B-FP8 | attn TP4 + EP4 | **real** | 10 (4..2048) + 128 | 79.4 -> **42.9** | 101.7 | 0.06 + 0.73 | exact | |
+| Qwen3-30B-A3B-FP8 | EP2, DP attention | **real** | 10 (1..512) + 128 | 82.2 -> **46.6** | 103.6 | 0.05 + 0.78 | exact | |
+| Qwen3-30B-A3B-FP8 | attn TP2 + EP2 | **real** | 10 (2..1024) + 128 | 74.9 -> **38.1** | 105.5 | 0.06 + 0.74 | exact | |
+| Qwen3-1.7B | 1 GPU, flashinfer | real | 4 + 8 | e2e | | 0.01 + 0.02 | greedy equal, 8/8 prefill replays | sglang e2e class, 12/12 |
+| Qwen3.5-2B | 1 GPU, fa3 | real | 0 + 8 | e2e | | 0.02 | greedy equal; TPOT native/LOAD 4.46 / 4.39 ms | |
+
+SAVE is longer than native capture by the two warm-up forwards per shape that run in the private pool (native runs
+them inside its capture phase as well); LOAD runs no forward. The 3-5 s by which some LOAD times exceed the 10-03
+plugin-route numbers are process start and distributed init, which grew by the same amount on the native engine.
+
+## Earlier validation (plugin route and forks, 2026-09/10-03)
+
 Code labels:
 
 - `main`: sglang upstream `fa090f7755` with the Foundry plugin (entry point, `FOUNDRY_GRAPH_EXTENSION_CONFIG`).

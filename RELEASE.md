@@ -60,12 +60,15 @@ since 0.0.3.
 
 ## Validation
 
-4xH200, SGLang main with `--cuda-graph-persistence`: Qwen3-30B-A3B-FP8 (real
-weights, 7 layouts), Qwen3-235B-A22B-FP8, Qwen3.5-122B-A10B-FP8,
-Qwen3.5-35B-A3B, DeepSeek-V4-Flash-FP8, GLM-5.3-Flash and gpt-oss-120b in EP,
-TP and DP-attention layouts. Every row restores in 0.5-1.6 s per rank, reaches
-`/health` within a few seconds of the eager engine, and greedy output, TTFT
-and TPOT match native capture (`docs/sglang/validated-configs.md`).
+4xH200, torch 2.14.1 / cu130, SGLang main with `--cuda-graph-persistence`:
+Qwen3-30B-A3B-FP8 (real weights, 7 layouts), Qwen3-235B-A22B-FP8,
+Qwen3.5-122B-A10B-FP8, Qwen3.5-35B-A3B, DeepSeek-V4-Flash-FP8, GLM-5.3-Flash
+and gpt-oss-120b in EP, TP and DP-attention layouts (16 rows), plus the 1-GPU
+e2e. Every row restores in 0.5-1.7 s per rank and reaches `/health` in 36-83 s
+against 75-154 s for native capture; native, SAVE and LOAD agree on the
+selected and top-3 logprobs of 74 greedy requests (exact on 15 rows, a
+scheduler-composition effect shared with native on the 16th), and LOAD TTFT /
+TPOT are within noise of native (`docs/sglang/validated-configs.md`).
 
 ## Packaging
 
