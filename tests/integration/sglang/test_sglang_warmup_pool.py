@@ -52,7 +52,12 @@ def test_loop_without_save_or_load_runs_as_it_is(monkeypatch):
         warmup_pool, "get_graph_extension_mode", lambda: warmup_pool.CUDAGraphExtensionMode.NONE
     )
     runs = []
-    assert warmup_pool.run_capture_loop(object(), lambda: runs.append(1) or "r") == "r"
+    assert (
+        warmup_pool.run_capture_loop(
+            lambda: runs.append(1) or "r", model=object(), attn_backend=None
+        )
+        == "r"
+    )
     assert runs == [1]
     assert not warmup_pool.active()
 
@@ -61,11 +66,15 @@ def test_load_runs_the_loop_once_after_the_bootstrap(monkeypatch):
     monkeypatch.setattr(
         warmup_pool, "get_graph_extension_mode", lambda: warmup_pool.CUDAGraphExtensionMode.LOAD
     )
-    monkeypatch.setattr(warmup_pool, "bootstrap_persistent_resources", lambda runner: ["x"])
+    monkeypatch.setattr(
+        warmup_pool, "bootstrap_persistent_resources", lambda model, attn_backend: ["x"]
+    )
     monkeypatch.setattr(warmup_pool.rt, "log_alloc_offset", lambda label: None)
     seen = []
     assert (
-        warmup_pool.run_capture_loop(object(), lambda: seen.append(warmup_pool.active()) or "r")
+        warmup_pool.run_capture_loop(
+            lambda: seen.append(warmup_pool.active()) or "r", model=object(), attn_backend=None
+        )
         == "r"
     )
     assert seen == [True]
@@ -76,12 +85,14 @@ def test_nested_loops_are_rejected(monkeypatch):
     monkeypatch.setattr(
         warmup_pool, "get_graph_extension_mode", lambda: warmup_pool.CUDAGraphExtensionMode.LOAD
     )
-    monkeypatch.setattr(warmup_pool, "bootstrap_persistent_resources", lambda runner: [])
+    monkeypatch.setattr(
+        warmup_pool, "bootstrap_persistent_resources", lambda model, attn_backend: []
+    )
     monkeypatch.setattr(warmup_pool.rt, "log_alloc_offset", lambda label: None)
 
     def inner():
-        return warmup_pool.run_capture_loop(object(), lambda: None)
+        return warmup_pool.run_capture_loop(lambda: None, model=object(), attn_backend=None)
 
     with pytest.raises(RuntimeError, match="nested"):
-        warmup_pool.run_capture_loop(object(), inner)
+        warmup_pool.run_capture_loop(inner, model=object(), attn_backend=None)
     assert not warmup_pool.active()

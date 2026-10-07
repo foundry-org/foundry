@@ -568,7 +568,7 @@ def bootstrap_collective_connections() -> None:
     )
 
 
-def bootstrap_logits_gatherer(cuda_graph_runner) -> bool:
+def bootstrap_logits_gatherer(model) -> bool:
     """Create the logits all-gather's symmetric-memory state BEFORE capture, on
     SAVE and LOAD alike.
 
@@ -598,7 +598,6 @@ def bootstrap_logits_gatherer(cuda_graph_runner) -> bool:
         )
     except Exception:
         return False
-    model = cuda_graph_runner.model_runner.model
     built = False
     for module in model.modules():
         gatherer = getattr(module, "_logits_gatherer", None)
@@ -738,7 +737,7 @@ def bootstrap_lazy_runtimes() -> None:
     logger.info("[Foundry] SGLang lazy runtimes bootstrapped in %.3fs", time.perf_counter() - t0)
 
 
-def bootstrap_deepep_buffer(cuda_graph_runner) -> bool:
+def bootstrap_deepep_buffer(model) -> bool:
     """Force the singleton DeepEP ``Buffer`` (NVSHMEM runtime + symmetric heap)
     to be created BEFORE the cuda-graph capture loop.
 
@@ -766,9 +765,9 @@ def bootstrap_deepep_buffer(cuda_graph_runner) -> bool:
     # Outside the guard: a failure to build the buffer must surface here, not
     # resurface as a native abort when the capture forward retries lazily.
     if backend.is_deepep_v2():
-        return _bootstrap_deepep_v2_buffer(cuda_graph_runner)
+        return _bootstrap_deepep_v2_buffer(model)
     if backend.is_mooncake():
-        return _bootstrap_mooncake_buffer(cuda_graph_runner)
+        return _bootstrap_mooncake_buffer(model)
     if not backend.is_deepep():
         return False
 
@@ -782,7 +781,6 @@ def bootstrap_deepep_buffer(cuda_graph_runner) -> bool:
     if DeepEPBuffer._state().buffer is not None:
         return True
 
-    model = cuda_graph_runner.model_runner.model
     for module in model.modules():
         dispatcher = getattr(module, "dispatcher", None)
         if dispatcher is None:
@@ -817,7 +815,7 @@ def bootstrap_deepep_buffer(cuda_graph_runner) -> bool:
     return False
 
 
-def _bootstrap_mooncake_buffer(cuda_graph_runner) -> bool:
+def _bootstrap_mooncake_buffer(model) -> bool:
     """Mooncake EP counterpart (elastic EP): create the process-wide mooncake
     ``Buffer`` (RDMA-registered EP buffer) before capture / graph load, for the
     same SAVE/LOAD allocation-sequence parity reasons as DeepEP. Without it the
@@ -831,7 +829,6 @@ def _bootstrap_mooncake_buffer(cuda_graph_runner) -> bool:
     if EPBuffer.get_existing_buffer() is not None:
         return True
 
-    model = cuda_graph_runner.model_runner.model
     for module in model.modules():
         dispatcher = getattr(module, "dispatcher", None)
         if dispatcher is None:
@@ -858,7 +855,7 @@ def _bootstrap_mooncake_buffer(cuda_graph_runner) -> bool:
     return False
 
 
-def _bootstrap_deepep_v2_buffer(cuda_graph_runner) -> bool:
+def _bootstrap_deepep_v2_buffer(model) -> bool:
     """DeepEP v2 counterpart: create the process-wide ``ElasticBuffer`` (its own
     NCCL communicator + symmetric-memory windows) before capture / graph load.
 
@@ -875,7 +872,6 @@ def _bootstrap_deepep_v2_buffer(cuda_graph_runner) -> bool:
     if DeepEPv2Buffer._state().buffer is not None:
         return True
 
-    model = cuda_graph_runner.model_runner.model
     for module in model.modules():
         dispatcher = getattr(module, "dispatcher", None)
         if dispatcher is None:

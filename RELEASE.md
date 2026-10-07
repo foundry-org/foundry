@@ -19,7 +19,9 @@ since 0.0.3.
   `foundry.integration.sglang.api` from its own call sites. Settings a
   restored graph cannot replay are pinned with a reason; unsupported features
   are rejected at resolution. `python -m foundry.integration.sglang.preflight`
-  checks a launch beforehand.
+  checks a launch beforehand. Integration API 1.2: every call site passes the
+  values Foundry needs (model, attention backend, draft flag, pool config,
+  prefill request slots), never a runner or backend object.
 - **Prefill CUDA graphs** are saved and restored next to the decode graphs.
   With power-of-two buckets, prefill TTFT and throughput of a LOADed engine
   match native capture.

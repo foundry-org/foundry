@@ -222,13 +222,13 @@ def after_parallel_init() -> None:
     rt.log_alloc_offset("after_init_parallel_runtime")
 
 
-def after_runner_distributed_init(model_runner) -> None:
+def after_runner_distributed_init(is_draft_worker: bool) -> None:
     """End of ``ModelRunner.init_torch_distributed`` (upstream layout). Draft
     workers reuse the target's groups and never reach init_parallel_runtime;
     only the target runner closes the window."""
     if (
         get_graph_extension_mode() != CUDAGraphExtensionMode.NONE
-        and not model_runner.is_draft_worker
+        and not is_draft_worker
         and rt.get_state() is not None
     ):
         _after_runner_distributed_init()
@@ -314,24 +314,24 @@ def record_memory_pool_overrides() -> None:
     _resolve_log_start = None
 
 
-def before_alloc_memory_pool(model_runner) -> None:
+def before_alloc_memory_pool(is_draft_worker: bool) -> None:
     """Head of ``ModelRunner.alloc_memory_pool``. Draft-worker pools reuse the
     target's resolved config upstream and are left alone."""
-    if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE or model_runner.is_draft_worker:
+    if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE or is_draft_worker:
         return
     rt.log_alloc_offset("before_init_memory_pool")
 
 
-def after_alloc_memory_pool(model_runner) -> None:
+def after_alloc_memory_pool(memory_pool_config, is_draft_worker: bool) -> None:
     """End of ``ModelRunner.alloc_memory_pool``: SAVE records the resolved
     MemoryPoolConfig and the resolver's context overrides."""
     mode = get_graph_extension_mode()
-    if mode == CUDAGraphExtensionMode.NONE or model_runner.is_draft_worker:
+    if mode == CUDAGraphExtensionMode.NONE or is_draft_worker:
         return
     rt.log_alloc_offset("after_init_memory_pool")
     if mode == CUDAGraphExtensionMode.SAVE:
         state = rt.create_warmup_state(
-            asdict(model_runner.memory_pool_config), context_overrides=_resolve_overrides
+            asdict(memory_pool_config), context_overrides=_resolve_overrides
         )
         rt.save_warmup_state(state)
 
@@ -344,7 +344,7 @@ def _prefill_runner_cls():
     return PrefillCudaGraphRunner
 
 
-def _begin_graph_layout(runner, mode) -> None:
+def _begin_graph_layout(model, mode) -> None:
     """Pre-capture bootstraps + layout start, once per process, at the first
     runner capture: the prefill runner's when prefill graphs are on (sglang
     captures prefill before decode), the decode runner's otherwise. Same
@@ -375,14 +375,14 @@ def _begin_graph_layout(runner, mode) -> None:
     #    on a host with multicast by any eager forward before capture, and
     #    invisible to the hook (torch symmetric memory is not cudaMalloc).
     rt.log_alloc_offset("before_logits_gatherer")
-    bootstrap_logits_gatherer(runner)
+    bootstrap_logits_gatherer(model)
     rt.log_alloc_offset("after_logits_gatherer")
     # 3. The DeepEP buffer (both modes, DeepEP-family backends): NVSHMEM
     #    runtime + symmetric heap, otherwise created inside the first captured
     #    forward, where deep_ep_cpp.Buffer(...) aborts.
     if _ep_lazy_init_needed():
         rt.log_alloc_offset("before_deepep_bootstrap")
-        bootstrap_deepep_buffer(runner)
+        bootstrap_deepep_buffer(model)
         rt.log_alloc_offset("after_deepep_bootstrap")
     # 4. SAVE only, every model: the two one-time runtime initializations
     #    capture rejects (inductor's lazy init, DeepGEMM's runtime init), with
@@ -446,6 +446,15 @@ def capture_one(
     mode = get_graph_extension_mode()
     if mode == CUDAGraphExtensionMode.NONE:
         raise RuntimeError("[Foundry] capture_one called without SAVE or LOAD")
+    if getattr(shape_key, "attention_variant", None) is not None:
+        # ShapeKey.attention_variant (e.g. DSV4.1 candidate-indexer graphs on
+        # SM100, the HIP DSA dual graph): several graphs per shape, which the
+        # archive cannot represent.
+        raise RuntimeError(
+            f"[Foundry] shape {shape_key} captures an attention graph variant "
+            f"({shape_key.attention_variant!r}); Foundry save/load does not support "
+            "graph variants"
+        )
     from foundry.integration.sglang import warmup_pool
 
     if mode == CUDAGraphExtensionMode.SAVE and warmup_pool.active():
@@ -496,18 +505,16 @@ def capture_one(
 
 
 @contextlib.contextmanager
-def prefill_capture_scope(runner):
+def prefill_capture_scope(model, req_slots: int):
     """Around ``PrefillCudaGraphRunner.capture`` (its body, SGLang's capture
-    loop, runs inside on both modes)."""
+    loop, runs inside on both modes). ``model``: the loaded model (the
+    bootstraps walk its modules); ``req_slots``: the runner's fixed request-
+    slot count, recorded with the prefill graphs. The prefill backend is
+    full: the resolution step validated it (full or disabled)."""
     mode = get_graph_extension_mode()
     if mode == CUDAGraphExtensionMode.NONE:
         yield
         return
-    if not runner._is_full_backend:
-        raise RuntimeError(
-            "[Foundry] prefill CUDA graphs are persisted for the full backend only, got "
-            f"{runner.prefill_backend_name!r}: use --cuda-graph-backend-prefill full or disabled"
-        )
     from sglang.srt.runtime_context import get_flags
 
     from foundry.integration.sglang.graph_ops import (
@@ -516,7 +523,7 @@ def prefill_capture_scope(runner):
         start_prefill_graph_restore,
     )
 
-    _begin_graph_layout(runner, mode)
+    _begin_graph_layout(model, mode)
     dp_flags = get_flags().dp
     if mode == CUDAGraphExtensionMode.LOAD:
         _preallocate_once()
@@ -543,23 +550,25 @@ def prefill_capture_scope(runner):
     yield
     rt.log_alloc_offset("save_after_prefill_capture")
     save_prefill_graph_state(
-        req_slots=runner._capture_req_slots,
+        req_slots=req_slots,
         has_dp_gather=bool(dp_flags.prefill_graph_has_dp_gather),
     )
 
 
 @contextlib.contextmanager
-def decode_capture_scope(runner):
+def decode_capture_scope(model):
     """Around ``DecodeCudaGraphRunner.capture`` (its body, SGLang's capture
-    loop, runs inside on both modes)."""
+    loop, runs inside on both modes). ``model``: the loaded model (the
+    bootstraps walk its modules). The decode backend is full and elastic-EP
+    recapture is off: the resolution steps pinned and validated them;
+    attention graph variants are rejected per shape in :func:`capture_one`."""
     mode = get_graph_extension_mode()
     if mode == CUDAGraphExtensionMode.NONE:
         yield
         return
 
-    reject_unsupported_decode_runner(runner)
     # No-op when the prefill runner captured first.
-    _begin_graph_layout(runner, mode)
+    _begin_graph_layout(model, mode)
 
     if mode == CUDAGraphExtensionMode.LOAD:
         import torch
@@ -614,11 +623,16 @@ def decode_capture_scope(runner):
     rt.record_region_layout()
 
 
-def capture_scope(runner):
-    """Prefill or decode capture scope, by runner class."""
-    if isinstance(runner, _prefill_runner_cls()):
-        return prefill_capture_scope(runner)
-    return decode_capture_scope(runner)
+def capture_scope(phase: str, model, req_slots: int | None = None):
+    """Prefill or decode capture scope (dependency route): ``phase`` is
+    ``"prefill"`` (with the runner's ``req_slots``) or ``"decode"``."""
+    if phase == "prefill":
+        if req_slots is None:
+            raise ValueError("[Foundry] capture_scope('prefill') needs req_slots")
+        return prefill_capture_scope(model, req_slots)
+    if phase == "decode":
+        return decode_capture_scope(model)
+    raise ValueError(f"[Foundry] capture_scope: unknown phase {phase!r}")
 
 
 def shared_read_ends_override(runner, attn_backend, forward_mode):
@@ -674,7 +688,7 @@ def _patch_init_parallel_runtime(bootstrap) -> None:
     @functools.wraps(orig_runner_init)
     def patched_runner_init(self, *args, **kwargs):
         result = orig_runner_init(self, *args, **kwargs)
-        after_runner_distributed_init(self)
+        after_runner_distributed_init(self.is_draft_worker)
         return result
 
     cls.init_torch_distributed = patched_runner_init
@@ -742,9 +756,9 @@ def _patch_alloc_memory_pool() -> None:
 
     @functools.wraps(orig_alloc)
     def patched_alloc(self, *args, **kwargs):
-        before_alloc_memory_pool(self)
+        before_alloc_memory_pool(self.is_draft_worker)
         result = orig_alloc(self, *args, **kwargs)
-        after_alloc_memory_pool(self)
+        after_alloc_memory_pool(self.memory_pool_config, self.is_draft_worker)
         return result
 
     cls.alloc_memory_pool = patched_alloc
@@ -804,20 +818,35 @@ def _patch_cuda_graph_capture() -> None:
 
     @functools.wraps(orig_decode_loop)
     def patched_decode_loop(self, *args, **kwargs):
-        return run_capture_loop(self, lambda: orig_decode_loop(self, *args, **kwargs))
+        return run_capture_loop(
+            lambda: orig_decode_loop(self, *args, **kwargs),
+            model=self.model_runner.model,
+            attn_backend=self.attn_backend,
+        )
 
     @functools.wraps(orig_prefill_loop)
     def patched_prefill_loop(self, *args, **kwargs):
-        return run_capture_loop(self, lambda: orig_prefill_loop(self, *args, **kwargs))
+        return run_capture_loop(
+            lambda: orig_prefill_loop(self, *args, **kwargs),
+            model=self.model_runner.model,
+            attn_backend=self.model_runner.attn_backend,
+        )
 
     @functools.wraps(orig_prefill_capture)
     def patched_prefill_capture(self):
-        with prefill_capture_scope(self):
+        if not self._is_full_backend:
+            raise RuntimeError(
+                "[Foundry] prefill CUDA graphs are persisted for the full backend only, "
+                f"got {self.prefill_backend_name!r}: use --cuda-graph-backend-prefill "
+                "full or disabled"
+            )
+        with prefill_capture_scope(self.model_runner.model, self._capture_req_slots):
             return orig_prefill_capture(self)
 
     @functools.wraps(orig_capture)
     def patched(self):
-        with decode_capture_scope(self):
+        reject_unsupported_decode_runner(self)
+        with decode_capture_scope(self.model_runner.model):
             return orig_capture(self)
 
     @functools.wraps(orig_resolve_ends)

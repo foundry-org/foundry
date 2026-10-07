@@ -56,8 +56,7 @@ def pool_trace_enabled() -> bool:
 class _Loop:
     """State of the capture loop being run by :func:`run_capture_loop`."""
 
-    def __init__(self, runner: Any):
-        self.runner = runner
+    def __init__(self):
         self.pool: torch.cuda.MemPool | None = None
         self.warmed_shapes = 0
 
@@ -77,10 +76,6 @@ def active() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _attn_backend(runner: Any) -> Any:
-    return getattr(runner, "attn_backend", None) or runner.model_runner.attn_backend
-
-
 def _flashinfer_decode_updater(attn_backend: Any) -> Any:
     """``indices_updater_decode`` of a FlashInfer backend, also when it is the
     full-attention child of a hybrid (linear-attention) wrapper."""
@@ -91,19 +86,20 @@ def _flashinfer_decode_updater(attn_backend: Any) -> Any:
     return None
 
 
-def _dispatchers(runner: Any) -> dict[str, Any]:
+def _dispatchers(model: Any) -> dict[str, Any]:
     return {
         name: module.dispatcher
-        for name, module in runner.model_runner.model.named_modules()
+        for name, module in model.named_modules()
         if hasattr(module, "dispatcher")
     }
 
 
-def bootstrap_persistent_resources(runner: Any) -> list[str]:
+def bootstrap_persistent_resources(model: Any, attn_backend: Any) -> list[str]:
     """Create, on SAVE and LOAD alike and in the normal (recorded) allocation
     domain, the persistent device resources a first forward would otherwise
     create inside the private warm-up pool. Runs once per runner, before its
-    capture loop, on the capture stream.
+    capture loop, on the capture stream. ``model``: the loaded model (its
+    modules are walked); ``attn_backend``: the runner's attention backend.
 
     The list is what a graph references and no capture allocates: audited for
     the validated backends (FlashInfer and FA3 attention, DeepGEMM / Triton
@@ -124,7 +120,7 @@ def bootstrap_persistent_resources(runner: Any) -> list[str]:
     torch.cuda.current_blas_handle()
     prepared.append("cublas_handle")
     side_streams: dict[int, torch.cuda.Stream] = {}
-    for module in runner.model_runner.model.modules():
+    for module in model.modules():
         for value in vars(module).values():
             items = value if isinstance(value, (list, tuple)) else (value,)
             for item in items:
@@ -137,12 +133,12 @@ def bootstrap_persistent_resources(runner: Any) -> list[str]:
         prepared.append(f"cublas_handle(side streams x{len(side_streams)})")
     # 2. FlashInfer's global ALiBi slopes buffer: FlashInfer creates it on the
     #    first decode plan, also for models without ALiBi.
-    updater = _flashinfer_decode_updater(_attn_backend(runner))
+    updater = _flashinfer_decode_updater(attn_backend)
     fi_utils = sys.modules.get("flashinfer.utils")
     if updater is not None and fi_utils is not None:
         fi_utils._get_cache_alibi_slopes_buf(updater.num_qo_heads, device)
         prepared.append("flashinfer_alibi_slopes")
-    dispatchers = _dispatchers(runner)
+    dispatchers = _dispatchers(model)
     if dispatchers:
         # 3. MoE router's cached int32 placeholder (a kernel pointer argument).
         from sglang.kernels.ops.moe.moe_fused_gate import _dummy_i32
@@ -283,9 +279,10 @@ def _release_pool(loop: _Loop) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_capture_loop(runner: Any, loop_fn: Callable[[], Any]) -> Any:
-    """Run a runner's per-shape capture loop (``_capture_one_stream``, inside
-    its capture session): persistent bootstrap, then the loop, in which
+def run_capture_loop(loop_fn: Callable[[], Any], *, model: Any, attn_backend: Any) -> Any:
+    """Run a runner's per-shape capture loop (``loop_fn`` =
+    ``_capture_one_stream``, inside its capture session): persistent
+    bootstrap (``model``, ``attn_backend``), then the loop, in which
     ``capture_one`` on SAVE warms each shape in the private pool right before
     capturing it (LOAD restores); then, on SAVE, the pool is released and
     checked. Without SAVE / LOAD the loop runs as it is."""
@@ -295,17 +292,13 @@ def run_capture_loop(runner: Any, loop_fn: Callable[[], Any]) -> Any:
         return loop_fn()
     if _loop is not None:
         raise RuntimeError("[Foundry] nested capture loops are not supported")
-    _loop = loop = _Loop(runner)
+    _loop = loop = _Loop()
     tracing = mode == CUDAGraphExtensionMode.SAVE and pool_trace_enabled()
     if tracing:
         torch.cuda.memory._record_memory_history(max_entries=1_000_000, stacks="all")
     try:
-        prepared = bootstrap_persistent_resources(runner)
-        logger.info(
-            "[Foundry] capture loop (%s); persistent bootstrap: %s",
-            type(runner).__name__,
-            prepared,
-        )
+        prepared = bootstrap_persistent_resources(model, attn_backend)
+        logger.info("[Foundry] capture loop; persistent bootstrap: %s", prepared)
         rt.log_alloc_offset("after_persistent_bootstrap")
         if flashinfer_cute_cache.gdn_flashinfer_in_use():
             # Per-process, both modes, before the first eager extend: the SM90
