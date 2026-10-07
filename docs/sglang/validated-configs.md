@@ -12,8 +12,9 @@ Every model and configuration that passed Foundry SAVE + LOAD with SGLang, with 
 ## Final validation: dependency route, torch 2.14.1, 4xH200 (2026-10-07)
 
 sglang PR branch (#42254, `--cuda-graph-persistence`) on upstream `f385390be5` + foundry-core 0.1.0rc2 (dev
-`1124863`; the explicit-argument call sites of integration API 1.2 validated on top with the TP2, EP4 and 1-GPU
-rows). Stack: torch 2.14.1+cu130, flashinfer 0.7.0.post1, deep-ep 0.1.2.post1, NCCL 2.30.7. Correctness = strict
+`1124863`). The PR series as submitted (rebased onto upstream `e13933c4fd`, integration API 1.2 explicit-argument
+call sites, foundry dev `0427503`) was validated on top with the same protocol on Qwen3-30B TP2 (74.1 -> 37.7 s)
+and EP4 DeepEP LL (84.4 -> 46.7 s), Qwen3.5-35B EP4 (94.8 -> 53.7 s), the 1-GPU e2e (12/12) and the unit tests. Stack: torch 2.14.1+cu130, flashinfer 0.7.0.post1, deep-ep 0.1.2.post1, NCCL 2.30.7. Correctness = strict
 check of native graph, SAVE and LOAD: 74 requests (9 batched calls of 1-32 requests, greedy, 12 tokens), selected
 and top-3 logprobs of every step, batched and one request at a time; "exact" = identical tokens, logprob max-abs 0
 on all three pairs in both forms. Times are launch to the first `/health` 200 in the engine log; restore is
@@ -27,11 +28,11 @@ noted ones. Full tables, reruns and attribution: `claude-doc/report_coldstart/fi
 | Qwen3.5-122B-A10B-FP8 | EP4, DP attention | dummy | 0 + 128 (GDN: native limitation) | 102.1 -> **50.2** | 141.9 | 0.85 | exact | first eager prefill: FlashInfer CuTe-DSL compile, cached by foundry (known-issues) |
 | Qwen3.5-122B-A10B-FP8 | attn TP2 x DP2 + EP4 | dummy | 0 + 128 | 137.2 -> **53.8** | 139.3 | 1.26 | exact | |
 | DeepSeek-V4-Flash-FP8 | EP4, DP attention | dummy | 0 + 128 | 109.3 -> **51.0** | 143.3 | 1.17 | exact | side-stream cuBLAS workspaces in the bootstrap (`alt_streams`) |
-| GLM-5.3-Flash (FP8) | EP4, DP attention | dummy | 0 + 128 | 153.9 -> **82.8** | 164.4 | 1.09 | exact | bs-128 TPOT noisy on both engines (A2); prefill throughput rerun pending |
+| GLM-5.3-Flash (FP8) | EP4, DP attention | dummy | 0 + 128 | 153.9 -> **82.8** | 164.4 | 1.09 | exact | bs-128 TPOT noisy on both engines (A2); prefill throughput LOAD 12.6k vs native 12.2k tok/s on rerun (one earlier LOAD rep hit a 7 s all-rank stall that did not recur) |
 | gpt-oss-120b | EP4, a2a none | dummy | 10 (1..512) + 128 | 76.8 -> **50.5** | 103.3 | 0.05 + 0.52 | exact | |
 | Qwen3.5-35B-A3B | EP4, DP attention, DeepEP | dummy | 0 + 128 | 83.5 -> **45.9** | 94.2 | 0.63 | sequential exact; batched 2e-3 logprob delta from a scheduler composition race, same on native | |
 | Qwen3.5-35B-A3B | attn TP4 + EP4 | dummy | 0 + 128 | 75.2 -> **36.4** | 88.5 | 1.00 | exact | |
-| Qwen3-30B-A3B-FP8 | EP4, DP attention, DeepEP LL | **real** | 10 (1..512) + 128 | 86.6 -> **49.8** | 107.7 | 0.06 + 0.72 | exact | prefill throughput rerun pending (native 98k vs LOAD 84k tok/s once) |
+| Qwen3-30B-A3B-FP8 | EP4, DP attention, DeepEP LL | **real** | 10 (1..512) + 128 | 86.6 -> **49.8** | 107.7 | 0.06 + 0.72 | exact | prefill throughput LOAD 100.4k vs native 99.9k tok/s on rerun (the first run's 14% gap was 110 ms of a 0.66 s bench) |
 | Qwen3-30B-A3B-FP8 | TP2 | **real** | 12 (1..2048) + 128 | 75.5 -> **41.5** | 94.6 | 0.06 + 0.54 | exact | |
 | Qwen3-30B-A3B-FP8 | attn TP2 x DP2 + EP4 | **real** | 10 (2..1024) + 128 | 91.2 -> **51.8** | 116.0 | 0.06 + 0.81 | exact | |
 | Qwen3-30B-A3B-FP8 | DP4 | **real** | 12 (1..2048) + 128 | 81.0 -> **47.3** | 98.6 | 0.06 + 0.59 | exact | |
