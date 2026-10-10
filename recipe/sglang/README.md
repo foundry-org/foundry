@@ -76,17 +76,18 @@ removed upstream, so they no longer run on the 0.0.2-era fork branch as-is.
 A single SAVE pass is enough — SGLang has no startup profile-forward, so there is no
 non-determinism that requires a two-pass save (unlike the vLLM recipe).
 
+**Run every engine with `TORCHDYNAMO_DISABLE=1` (the scripts export it; set it yourself when
+launching sglang by hand).** With it unset, SAVE fails at the first `@torch.compile` helper inside
+the capture window on torch >= 2.14.
+
 **Warm the JIT caches once per machine and model before the first SAVE:** run the recipe
-once without `--save`/`--load` (or with `--warm`, the same thing), wait for `/health`, stop it.
-SAVE runs no eager forward and compiles inside the capture window on purpose; inductor's
-Triton autotuning of a freshly compiled kernel synchronizes the device, which capture
-forbids, so a SAVE on a cold cache fails (foundry replaces the cryptic capture error with a
-message naming this step). Plain SGLang's pre-capture warmup forwards compile and autotune
-every kernel with capture-mode inputs, so afterwards the inductor / Triton / DeepGEMM caches
-under `SGLANG_CACHE_DIR` hold exactly the artifacts SAVE loads. An eager run
-(`--disable-cuda-graph`) is not a substitute: the compiled functions then see plain tensors
-instead of views of the static batch buffers, dynamo guards differently, and the artifacts
-differ. Any earlier graph-mode run of the same model on the machine (a baseline, a previous
+once without `--save`/`--load`, wait for `/health`, stop it.
+SAVE runs no eager forward, so each shape's first forward, and with it the first load of
+every JIT kernel (Triton, DeepGEMM, FlashInfer), happens inside the capture window. Plain
+SGLang's pre-capture warmup forwards build every kernel with capture-mode inputs, so
+afterwards the caches under `SGLANG_CACHE_DIR` hold exactly the artifacts SAVE loads. An
+eager run (`--disable-cuda-graph`) is not a substitute: it builds kernels for different
+inputs. Any earlier graph-mode run of the same model on the machine (a baseline, a previous
 SAVE) warms the caches too; a fresh container or a restored radix host does not.
 
 LOAD maps the packed kernel image (default; `FOUNDRY_MMAP_ARCHIVE=0` reads it eagerly) instead of reading
@@ -110,7 +111,7 @@ model or topology before SAVE.
 
 The scripts turn Foundry on through the environment, not a flag: `--save` / `--load` export
 `FOUNDRY_GRAPH_EXTENSION_CONFIG` to `foundry_save.toml` / `foundry_load.toml` next to the script, and every other
-mode (baseline, `--warm`) unsets it, so a stray export in your shell cannot turn a baseline into a SAVE. Without the
+mode (baseline) unsets it, so a stray export in your shell cannot turn a baseline into a SAVE. Without the
 scripts, the equivalent is
 
 ```bash
@@ -154,12 +155,13 @@ the activation line is missing it prints a warning that SGLang ran natively. It 
 On `--save` / `--load` the plugin itself sets every config that selects state Foundry cannot replay (custom
 all-reduce off, torch symm-mem all-reduce on, NCCL buffer registration / cuMem / NVLS off, NCCL symmetric memory,
 NVLS and MSCCL++ off, the DeepGEMM precompile sweep off, two-batch overlap off, the memory-saver and graph-pool
-variants off, `--dsv4-attn-backend` not `trtllm`), prints one `[Foundry] pin:` line per value, and stops with the
+variants off, `--dsv4-attn-backend` not `trtllm`, `TORCHDYNAMO_DISABLE=1` because dynamo refuses to trace inside
+the capture window where SAVE runs each shape's first forward), prints one `[Foundry] pin:` line per value, and stops with the
 reason if you set a contrary value yourself. The table and the reasons are in
 [`docs/sglang/overview.md`](../../docs/sglang/overview.md#what-the-plugin-pins-and-why). The scripts therefore do not
-pass these flags or variables on SAVE / LOAD; a baseline or `--warm` run (no plugin) gets the pinned collective flags
-and `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0` from `foundry_baseline_pins` in `serve_common.sh`, so it captures the same
-graphs and warms the same kernels.
+pass these flags or variables on SAVE / LOAD, except `TORCHDYNAMO_DISABLE=1`, which `foundry_baseline_pins` in
+`serve_common.sh` exports in every mode; a baseline run (no plugin) also gets the pinned collective flags
+and `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0` from it, so it captures the same graphs and warms the same kernels.
 
 What the plugin cannot pin, and the scripts keep doing:
 
@@ -167,7 +169,8 @@ What the plugin cannot pin, and the scripts keep doing:
   `--cuda-graph-bs-decode`, `--disable-cuda-graph-padding`): the archive holds exactly the captured sizes;
 - DeepEP low-latency on the EP rows (`--moe-a2a-backend deepep --deepep-mode low_latency`) with the dispatch cap
   raised identically on SAVE and LOAD;
-- warm JIT caches before SAVE (`--warm`, once per machine and model): SAVE compiles inside the capture window;
+- warm JIT caches before SAVE (a baseline run, once per machine and model): SAVE loads each JIT kernel (Triton,
+  DeepGEMM, FlashInfer) for the first time inside the capture window;
 - pinned hybrid state pools (`MODEL_EXTRA`, e.g. the Mamba/GDN state-pool cap);
 - identical flags and environment on SAVE and LOAD.
 

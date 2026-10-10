@@ -197,11 +197,24 @@ def _patch_distributed_init() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _disable_dynamo() -> None:
+    """Scheduler process: besides the ``TORCHDYNAMO_DISABLE=1`` pin (read when
+    ``torch.compile`` decorates), set ``torch._dynamo.config.disable``, which
+    dynamo checks on every frame, so a helper decorated before the pin took
+    effect does not compile inside a capture either."""
+    import torch._dynamo
+
+    if not torch._dynamo.config.disable:
+        torch._dynamo.config.disable = True
+        logger.info("[Foundry] torch._dynamo.config.disable = True (TORCHDYNAMO_DISABLE=1 pin)")
+
+
 def before_parallel_init(device: str) -> None:
     """Head of ``bootstrap.init_parallel_runtime`` (upstream layout): bind this
     rank's VMM region before any communicator exists."""
     if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
         return
+    _disable_dynamo()
     from sglang.srt.runtime_context import get_device, get_parallel
 
     parallel = get_parallel()
@@ -393,6 +406,15 @@ def _begin_graph_layout(model, mode) -> None:
         with rt.allocation_region_suspended():
             bootstrap_lazy_runtimes()
         rt.log_alloc_offset("after_lazy_runtimes")
+    # 5. Both modes, before the first eager extend: the FlashInfer SM90 GDN
+    #    prefill kernels load from FlashInfer's .o cache instead of compiling
+    #    8-10 s in every scheduler (host-side patch, see flashinfer_cute_cache).
+    from foundry.integration.sglang import flashinfer_cute_cache
+
+    if flashinfer_cute_cache.gdn_flashinfer_in_use():
+        status = flashinfer_cute_cache.install()
+        if status:
+            logger.info("[Foundry] FlashInfer CuTe-DSL cache: %s", status)
 
     # The deterministic layout begins here on both modes: same sequence
     # point, same (empty) caching-allocator state; LOAD's
@@ -423,26 +445,15 @@ def _prefill_req_slots(backend) -> int | None:
     return None
 
 
-def capture_one(
-    shape_key,
-    forward_fn,
-    *,
-    pool,
-    stream,
-    prefill_req_slots=None,
-    post_warmup_hook=None,
-    tp_group=None,
-):
+def capture_one(shape_key, forward_fn, *, pool, stream, prefill_req_slots=None):
     """Replaces ``FullCudaGraphBackend.capture_one`` for one shape, SAVE or
     LOAD; the runner's capture loop around it is SGLang's own. Returns
-    ``(graph, output)`` for the caller to store in the backend. Inside
-    :func:`warmup_pool.run_capture_loop` SAVE first runs the shape's two
-    warm-up forwards in the private pool; LOAD runs no forward.
+    ``(graph, output)`` for the caller to store in the backend. Neither mode
+    runs upstream's warm-up forwards.
 
     ``pool`` / ``stream``: the backend's graph pool and capture stream (SAVE).
     ``prefill_req_slots``: the prefill runner's fixed request-slot count, None
-    for a decode graph. ``post_warmup_hook`` / ``tp_group``: as upstream's
-    warm-ups use them."""
+    for a decode graph."""
     mode = get_graph_extension_mode()
     if mode == CUDAGraphExtensionMode.NONE:
         raise RuntimeError("[Foundry] capture_one called without SAVE or LOAD")
@@ -455,10 +466,6 @@ def capture_one(
             f"({shape_key.attention_variant!r}); Foundry save/load does not support "
             "graph variants"
         )
-    from foundry.integration.sglang import warmup_pool
-
-    if mode == CUDAGraphExtensionMode.SAVE and warmup_pool.active():
-        warmup_pool.warm_up(shape_key, forward_fn, post_warmup_hook, tp_group)
     req_slots = prefill_req_slots
     if mode == CUDAGraphExtensionMode.LOAD:
         # LOAD, both runners: the upstream capture loop runs (see
@@ -481,14 +488,15 @@ def capture_one(
         # ``graph.reset()`` on each.
         return graph, out
 
-    # SAVE: capture. The warm-up forwards ran above, in a private pool outside
-    # the recorded layout (compiles, autotuning, kernel loads and one-time
-    # inits are done by now). Run here, their activations would leave freed
-    # segments in the default pool that LOAD cannot reproduce, drifting the
-    # cursor away from each saved ``start_base_addr``. In a single-pass loop
-    # (an sglang that does not call run_capture_loop) the first forward still
-    # happens inside the capture, which torch >= 2.14's dynamo rejects for
-    # compiled helpers.
+    # SAVE: capture directly; the shape's first forward happens inside the
+    # capture. Upstream's two warm-up forwards are not run: their activations
+    # would leave freed segments in the default pool that LOAD (no forward)
+    # cannot reproduce, drifting the cursor away from each saved
+    # ``start_base_addr``. JIT / lazy init inside the captured forward is
+    # recorded as alloc events. torch >= 2.14's dynamo refuses to compile
+    # while a stream is capturing, so dynamo is pinned off in the scheduler
+    # processes (TORCHDYNAMO_DISABLE=1, plugin.ENV_PINS): SGLang's compiled
+    # helpers then run as plain Python.
     from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
 
     from foundry.integration.sglang.graph_ops import (
@@ -799,38 +807,15 @@ def _patch_cuda_graph_capture() -> None:
                 capture_inputs=capture_inputs,
                 post_warmup_hook=post_warmup_hook,
             )
-        result = capture_one(
+        graph, out = capture_one(
             shape_key,
             forward_fn,
             pool=self._pool,
             stream=self._capture_stream,
             prefill_req_slots=_prefill_req_slots(self),
-            post_warmup_hook=post_warmup_hook,
-            tp_group=self._tp_group,
         )
-        if result is not None:
-            self._graphs[shape_key], self._outputs[shape_key] = result
-
-    from foundry.integration.sglang.warmup_pool import run_capture_loop
-
-    orig_decode_loop = runner_cls._capture_one_stream
-    orig_prefill_loop = prefill_runner_cls._capture_one_stream
-
-    @functools.wraps(orig_decode_loop)
-    def patched_decode_loop(self, *args, **kwargs):
-        return run_capture_loop(
-            lambda: orig_decode_loop(self, *args, **kwargs),
-            model=self.model_runner.model,
-            attn_backend=self.attn_backend,
-        )
-
-    @functools.wraps(orig_prefill_loop)
-    def patched_prefill_loop(self, *args, **kwargs):
-        return run_capture_loop(
-            lambda: orig_prefill_loop(self, *args, **kwargs),
-            model=self.model_runner.model,
-            attn_backend=self.model_runner.attn_backend,
-        )
+        self._graphs[shape_key] = graph
+        self._outputs[shape_key] = out
 
     @functools.wraps(orig_prefill_capture)
     def patched_prefill_capture(self):
@@ -857,8 +842,6 @@ def _patch_cuda_graph_capture() -> None:
         return orig_resolve_ends(self, attn_backend, forward_mode)
 
     backend_cls.capture_one = patched_capture_one
-    runner_cls._capture_one_stream = patched_decode_loop
-    prefill_runner_cls._capture_one_stream = patched_prefill_loop
     runner_cls.capture = patched
     prefill_runner_cls.capture = patched_prefill_capture
     runner_cls._resolve_shared_read_ends = patched_resolve_ends

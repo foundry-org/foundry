@@ -11,10 +11,10 @@ name `foundry`) and the first one SGLang can depend on.
   `pip install foundry-core --extra-index-url https://foundry-org.github.io/foundry/whl/<cuda>/torch<A.B>/`
   (0.1.x also builds torch 2.13.0 / cu130).
 - Optional SGLang dependency: `pip install "sglang[foundry]"`, then
-  `--cuda-graph-persistence {save,load}` (integration API 1.2).
+  `--cuda-graph-persistence {save,load}` (integration API 2.0).
 - Prefill CUDA graphs are saved and restored next to the decode graphs.
-- torch 2.14 support: SAVE runs SGLang's warm-up forwards in a private memory
-  pool before capturing each shape; LOAD runs no forward.
+- torch 2.14 support: the scheduler processes run with `TORCHDYNAMO_DISABLE=1`
+  (pinned by Foundry).
 - Faster restore: binary templates, build/instantiate pipeline, exec-pool
   prewarm.
 - No Boost runtime dependency (header-only, vendored subset).

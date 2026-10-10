@@ -181,10 +181,9 @@ def test_explicit_full_prefill_is_honoured(model_dir, plugin_hooks):
     assert "cuda_graph_backend_prefill" not in declared
 
 
-@pytest.mark.parametrize("backend", [Backend.BREAKABLE, Backend.TC_PIECEWISE])
-def test_non_full_prefill_flag_is_rejected(model_dir, plugin_hooks, backend):
+def test_non_full_prefill_flag_is_rejected(model_dir, plugin_hooks):
     with pytest.raises(ValueError, match="Foundry persists full prefill graphs only"):
-        _resolve(model_dir, cuda_graph_backend_prefill=backend)
+        _resolve(model_dir, cuda_graph_backend_prefill=Backend.BREAKABLE)
 
 
 def test_non_full_decode_flag_is_rejected(model_dir, plugin_hooks):
@@ -196,7 +195,6 @@ def test_non_full_decode_flag_is_rejected(model_dir, plugin_hooks):
     "json_cfg, match",
     [
         ({"prefill": {"backend": "breakable"}}, "prefill graphs only"),
-        ({"prefill": {"backend": "tc_piecewise"}}, "prefill graphs only"),
         ({"decode": {"backend": "disabled"}}, "decode graphs only"),
     ],
 )

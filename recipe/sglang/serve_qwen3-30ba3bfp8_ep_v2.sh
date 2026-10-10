@@ -37,7 +37,7 @@ fi
 
 # --save/--load: export FOUNDRY_GRAPH_EXTENSION_CONFIG="$FOUNDRY_TOML" after the preflight; baseline: unset it.
 foundry_select "$2" "${FOUNDRY_TOML:-}"
-foundry_baseline_pins   # baseline only: the plugin's collective pins (custom AR off, torch symm-mem on), see serve_common.sh
+foundry_baseline_pins   # every mode: TORCHDYNAMO_DISABLE=1; baseline only: the plugin's collective pins, see serve_common.sh
 
 # NCCL_CUMEM_ENABLE: v2's NCCL windows need cuMem; sglang defaults it to 1 for
 # deepep_v2 and the Foundry plugin leaves it alone for that backend (it pins it
