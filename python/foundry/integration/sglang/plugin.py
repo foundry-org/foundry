@@ -54,8 +54,7 @@ spawned (spawned processes inherit ``os.environ``; values that sglang caches
 at import time, such as ``SGLANG_JIT_DEEPGEMM_PRECOMPILE``, are only correct
 this way). They are re-asserted at the top of every scheduler process
 (``activate`` runs there too) and at each spawn site
-(``runtime.setup_ld_preload_env``), which also covers processes that do not
-descend from a launcher that ran the plugin (the fork base's in-tree route).
+(``runtime.setup_ld_preload_env``).
 """
 
 from __future__ import annotations
@@ -80,8 +79,6 @@ PIN_RESOLUTION_SOURCE = "foundry_graph_extension_pins"
 _FLAG = f"Foundry graph persistence ({CONFIG_ENV})"
 _DISABLE_HINT = f"unset {CONFIG_ENV} to run without graphs"
 _EXTENSION = f"the Foundry graph extension ({CONFIG_ENV})"
-# False on the dependency route: nothing there reads CONFIG_ENV.
-_PLUGIN_ROUTE = True
 # Whitelisted resolution steps the plugin wraps (register_resolution_hooks);
 # the preflight checks that the installed sglang still offers them.
 RESOLUTION_HOOK_STEPS = (
@@ -133,11 +130,10 @@ def activate(cfg_path: str) -> None:
 def use_flag_labels(flag: str = "--cuda-graph-persistence") -> None:
     """Dependency route: name SGLang's flag instead of the plugin's
     environment variable in every pin and reject message."""
-    global _FLAG, _DISABLE_HINT, _EXTENSION, _PLUGIN_ROUTE
+    global _FLAG, _DISABLE_HINT, _EXTENSION
     _FLAG = f"Foundry graph persistence ({flag})"
     _DISABLE_HINT = f"drop {flag} to run without graphs"
     _EXTENSION = f"the Foundry graph extension ({flag})"
-    _PLUGIN_ROUTE = False
 
 
 def _sglang_has_dependency_route() -> bool:
@@ -200,8 +196,7 @@ def _backend():
 
 
 def pin_graph_fields(server_args: Any) -> None:
-    """Former in-tree ``handle_graph_extension`` (fork 4f018fd052), hardened:
-    decode ``full``; prefill ``full`` or ``disabled`` (default ``disabled``, not
+    """Decode ``full``; prefill ``full`` or ``disabled`` (default ``disabled``, not
     the platform default, which on CUDA is ``breakable``; leaving it unset
     would also let a model default such as Inkling's pick it); profiling and
     FlashInfer autotune off."""
@@ -210,16 +205,6 @@ def pin_graph_fields(server_args: Any) -> None:
     Backend = _backend()
     cfg = resolving_view(server_args)
 
-    in_tree = getattr(cfg, "foundry_graph_extension_config_path", None)
-    if (
-        _PLUGIN_ROUTE
-        and in_tree
-        and os.path.abspath(in_tree) != os.path.abspath(os.environ.get(CONFIG_ENV, ""))
-    ):
-        raise ValueError(
-            f"--foundry-graph-extension-config-path={in_tree!r} and {CONFIG_ENV} "
-            "name different Foundry configs; set one of them"
-        )
     disabled = getattr(cfg, "disable_cuda_graph", False)
     if disabled or getattr(cfg, "disable_decode_cuda_graph", False):
         raise ValueError(

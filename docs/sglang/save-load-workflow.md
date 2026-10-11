@@ -171,7 +171,7 @@ The graphs are finished one per shape inside sglang's capture loop. The two timi
 LOAD: ...` the same way when prefill graphs are on), mean:
 
 - `Loaded N ... in X s`: only Foundry's restore work. `builds` is the time from the start of this runner's restore
-  (the builds being launched, or taken over when they were started at setup) to the last build / instantiate
+  (the builds being launched) to the last build / instantiate
   finishing (Phase 1 + Phase 2). `handover` is the part of the per-shape `restore_next_*` calls after the builds
   finished (allocator replay, output reconstruction). A call's wait for the builds is counted once, in `builds`.
   X = builds + handover.

@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Contract test: every sglang symbol Foundry patches or reads at a fixed
-signature still exists, on either layout Foundry supports (upstream main:
-``bootstrap.init_parallel_runtime``, no ``ModelRunner.ps``; fork base: groups
-built in ``ModelRunner.init_torch_distributed``). A rename upstream fails here
+signature still exists (process groups are built in
+``bootstrap.init_parallel_runtime``). A rename upstream fails here
 instead of at a user's LOAD.
 
     pytest tests/integration/sglang/test_sglang_hook_points.py -v
@@ -168,8 +167,8 @@ def test_attributes_read_on_the_decode_runner():
 
 def test_install_patches_keep_dispatch_shape(tmp_path):
     """After hooks.install (fresh interpreter: the patches are process-global):
-    the launch patch is still a classmethod, and the bring-up wrapper sits on
-    the site this layout uses."""
+    the launch patch is still a classmethod, and the bring-up wrappers are
+    installed."""
     cfg = tmp_path / "foundry.toml"
     cfg.write_text(f'mode = "save"\nworkspace_root = "{tmp_path / "ws"}"\n')
     code = textwrap.dedent(
@@ -180,8 +179,7 @@ def test_install_patches_keep_dispatch_shape(tmp_path):
         from sglang.srt.distributed import bootstrap
         from sglang.srt.model_executor.model_runner import ModelRunner
         assert isinstance(Engine.__dict__["_launch_scheduler_processes"], classmethod)
-        if hasattr(bootstrap, "init_parallel_runtime"):
-            assert hasattr(bootstrap.init_parallel_runtime, "__wrapped__")
+        assert hasattr(bootstrap.init_parallel_runtime, "__wrapped__")
         assert hasattr(ModelRunner.init_torch_distributed, "__wrapped__")
         print("OK")
         """
