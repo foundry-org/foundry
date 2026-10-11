@@ -37,15 +37,12 @@ import pytest
 pytest.importorskip("sglang")
 torch = pytest.importorskip("torch")
 
-import requests  # noqa: E402
 from conftest import ACTIVE as _ACTIVE  # noqa: E402
-from conftest import foundry_launch  # noqa: E402
+from conftest import foundry_toml, serve  # noqa: E402
 from sglang.benchmark.serving import run_benchmark  # noqa: E402
 from sglang.test.test_utils import (  # noqa: E402
     DEFAULT_URL_FOR_TEST,
     get_benchmark_args,
-    popen_launch_server,
-    terminate_and_kill_process_tree,
 )
 
 # H200, 3 real-weight runs per 35B case: tp2 within 1.3%; ep2 -0.4%, +1.2%, +12.3%.
@@ -147,11 +144,7 @@ def _selected(case_id):
 
 def _toml(path, mode, workspace):
     # 4 GB scratch: TP/EP dist init takes 1.8-2.9 GB before the region opens (1 GB default is too small).
-    path.write_text(
-        f'mode = "{mode}"\nbase_addr = 0x600000000000\nregion_size = "256GB"\n'
-        f'workspace_root = "{workspace}"\nscratch_space_size = "4096MB"\n'
-    )
-    return str(path)
+    return foundry_toml(path, mode, workspace, scratch_space_size="4096MB")
 
 
 def _server_args(case):
@@ -188,35 +181,25 @@ def _bench_tpot(model, out_path):
     return run_benchmark(args)["median_tpot_ms"]
 
 
-def _serve(tmp_path, name, case, foundry_toml, bench, mode=None):
-    launch_env, foundry_args = foundry_launch({**os.environ, **case["env"]}, mode, foundry_toml)
-    result = {}
-    with open(tmp_path / f"{name}.out", "w") as out, open(tmp_path / f"{name}.err", "w") as err:
-        process = popen_launch_server(
-            case["model"],
-            DEFAULT_URL_FOR_TEST,
-            timeout=LAUNCH_TIMEOUT_S,
-            other_args=_server_args(case) + foundry_args,
-            env=launch_env,
-            return_stdout_stderr=(out, err),
-        )
-        try:
-            ids = []
-            for prompt in _PROMPTS:
-                r = requests.post(
-                    DEFAULT_URL_FOR_TEST + "/generate",
-                    json={"text": prompt, "sampling_params": _SAMPLING},
-                    timeout=600,
-                )
-                r.raise_for_status()
-                ids.append(r.json()["output_ids"])
-            result["ids"] = ids
-            if bench:
-                result["tpot_ms"] = _bench_tpot(case["model"], tmp_path / f"bench_{name}.jsonl")
-        finally:
-            terminate_and_kill_process_tree(process)
-    result["log"] = (tmp_path / f"{name}.err").read_text() + (tmp_path / f"{name}.out").read_text()
-    return result
+def _serve(tmp_path, name, case, toml, bench, mode=None):
+    def bench_tpot():
+        return _bench_tpot(case["model"], tmp_path / f"bench_{name}.jsonl")
+
+    responses, tpot_ms, log = serve(
+        tmp_path,
+        name,
+        case["model"],
+        _server_args(case),
+        _PROMPTS,
+        _SAMPLING,
+        mode=mode,
+        toml=toml,
+        env=case["env"],
+        launch_timeout=LAUNCH_TIMEOUT_S,
+        request_timeout=600,
+        while_up=bench_tpot if bench else None,
+    )
+    return {"ids": [r["output_ids"] for r in responses], "tpot_ms": tpot_ms, "log": log}
 
 
 @pytest.mark.parametrize("case", CASES)
