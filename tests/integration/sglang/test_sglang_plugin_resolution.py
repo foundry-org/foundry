@@ -13,11 +13,8 @@ test/registered/unit/server_args/test_resolution_declarations.py.
     pytest tests/integration/sglang/test_sglang_plugin_resolution.py -v
 """
 
-import json
 import os
-import subprocess
 import sys
-import textwrap
 from importlib.metadata import entry_points
 from types import SimpleNamespace
 from unittest import mock
@@ -26,30 +23,12 @@ import pytest
 
 pytest.importorskip("sglang")
 
-from conftest import plugin_route_only  # noqa: E402
+from conftest import plugin_route_only, run_python  # noqa: E402
 from foundry.integration.sglang import plugin  # noqa: E402
 from sglang.srt.arg_groups import resolution_hooks  # noqa: E402
 from sglang.srt.arg_groups.overrides import resolution_result  # noqa: E402
 from sglang.srt.model_executor.cuda_graph_config import Backend  # noqa: E402
 from sglang.srt.server_args import ServerArgs  # noqa: E402
-
-_MINI_CONFIG = {
-    "architectures": ["LlamaForCausalLM"],
-    "model_type": "llama",
-    "hidden_size": 16,
-    "intermediate_size": 32,
-    "num_attention_heads": 2,
-    "num_key_value_heads": 2,
-    "num_hidden_layers": 2,
-    "vocab_size": 128,
-    "max_position_embeddings": 2048,
-}
-
-
-@pytest.fixture
-def model_dir(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps(_MINI_CONFIG))
-    return str(tmp_path)
 
 
 @pytest.fixture
@@ -93,18 +72,6 @@ def _resolve(model_dir, **fields):
     return sa
 
 
-def _run_python(code, env_extra=None):
-    env = {k: v for k, v in os.environ.items() if k != plugin.CONFIG_ENV}
-    env.update(env_extra or {})
-    return subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(code)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-
-
 # ---------------------------------------------------------------------------
 # No-op without the env var
 # ---------------------------------------------------------------------------
@@ -120,7 +87,7 @@ def test_load_plugins_without_env_imports_nothing_from_foundry():
     """sglang's load_plugins() imports the entry module in every process; with
     the env var unset nothing from the foundry package (native extension
     included) may be imported and no resolution hook may be registered."""
-    result = _run_python(
+    result = run_python(
         """
         import sys
         from sglang.srt.plugins import load_plugins
@@ -147,7 +114,7 @@ def test_resolution_without_plugin_hooks_is_untouched(model_dir, restore_environ
 def test_activation_failure_exits_instead_of_being_swallowed(tmp_path):
     """load_plugins() swallows Exceptions from plugins; a bad config must stop
     the process (SystemExit) rather than leave sglang running natively."""
-    result = _run_python(
+    result = run_python(
         """
         from sglang.srt.plugins import load_plugins
         load_plugins()
@@ -341,7 +308,7 @@ def test_launcher_hook_sets_every_env_pin(tmp_path, clean_pin_env, capsys):
 def test_env_pins_are_inherited_by_spawned_processes(clean_pin_env):
     plugin.apply_env_pins()
     names = [pin.name for pin in plugin.ENV_PINS]
-    result = _run_python(
+    result = run_python(
         f"""
         import os
         print(",".join(os.environ.get(n, "UNSET") for n in {names!r}))

@@ -10,30 +10,16 @@ check that activates runs in a fresh interpreter. No GPU needed.
     pytest tests/integration/sglang/test_sglang_dependency_route.py -v
 """
 
-import json
-import os
-import subprocess
-import sys
-import textwrap
+import functools
 
 import pytest
 
 pytest.importorskip("sglang")
 adapter = pytest.importorskip("sglang.srt.utils.foundry_adapter")
 
+from conftest import run_python  # noqa: E402
 from foundry.integration.sglang import api, plugin  # noqa: E402
 
-_MINI_CONFIG = {
-    "architectures": ["LlamaForCausalLM"],
-    "model_type": "llama",
-    "hidden_size": 16,
-    "intermediate_size": 32,
-    "num_attention_heads": 2,
-    "num_key_value_heads": 2,
-    "num_hidden_layers": 2,
-    "vocab_size": 128,
-    "max_position_embeddings": 2048,
-}
 _PIN_ENV_NAMES = [pin.name for pin in plugin.ENV_PINS] + [
     plugin.NCCL_CUMEM_PIN.name,
     plugin._ENV_PINNED_MARK,
@@ -43,23 +29,8 @@ _PIN_ENV_NAMES = [pin.name for pin in plugin.ENV_PINS] + [
 ]
 
 
-@pytest.fixture
-def model_dir(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps(_MINI_CONFIG))
-    return str(tmp_path)
-
-
-def _run_python(code, cwd, env_extra=None):
-    env = {k: v for k, v in os.environ.items() if k not in _PIN_ENV_NAMES}
-    env.update(env_extra or {})
-    return subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(code)],
-        env=env,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
+# A fresh interpreter without any pinned variable inherited from this shell.
+_run_python = functools.partial(run_python, env_drop=_PIN_ENV_NAMES)
 
 
 def _resolve_code(model_dir, fields):
