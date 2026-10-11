@@ -14,18 +14,14 @@ list it in that module's ``__all__`` so the next run doesn't strip it again.
 
 import importlib
 
+import pytest
+
 PUBLIC_MODULES = [
     # Top-level
     "foundry",
     "foundry.ops",
     "foundry.graph",
     "foundry.allocation_region",
-    # vLLM integration
-    "foundry.integration.vllm",
-    "foundry.integration.vllm.config",
-    "foundry.integration.vllm.hooks",
-    "foundry.integration.vllm.runtime",
-    "foundry.integration.vllm.graph_ops",
     # SGLang integration
     "foundry.integration.sglang",
     "foundry.integration.sglang.config",
@@ -35,6 +31,15 @@ PUBLIC_MODULES = [
     "foundry.integration.sglang.plugin",
     # sglang plugin entry point (pyproject [project.entry-points."sglang.srt.plugins"])
     "foundry_sglang_plugin",
+]
+
+# vLLM integration: imports vllm at module import, so tested only when vllm is installed.
+VLLM_MODULES = [
+    "foundry.integration.vllm",
+    "foundry.integration.vllm.config",
+    "foundry.integration.vllm.hooks",
+    "foundry.integration.vllm.runtime",
+    "foundry.integration.vllm.graph_ops",
 ]
 
 # Names that have historically been ruff --fix victims because they live in
@@ -62,6 +67,12 @@ def test_public_modules_importable():
         importlib.import_module(name)
 
 
+def test_vllm_modules_importable():
+    pytest.importorskip("vllm")
+    for name in VLLM_MODULES:
+        importlib.import_module(name)
+
+
 def test_re_exports_present():
     foundry = importlib.import_module("foundry")
     missing = [n for n in PUBLIC_NAMES_FROM_FOUNDRY if not hasattr(foundry, n)]
@@ -80,6 +91,7 @@ def test_cudagraph_reexport_uses_python_wrapper():
 
 
 def test_vllm_integration_public_api():
+    pytest.importorskip("vllm")
     mod = importlib.import_module("foundry.integration.vllm")
     for name in ("install_hooks", "CUDAGraphExtensionMode", "get_graph_extension_mode"):
         assert hasattr(mod, name), f"foundry.integration.vllm.{name} not exported"
