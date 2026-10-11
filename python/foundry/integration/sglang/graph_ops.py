@@ -21,15 +21,12 @@ from foundry.graph import graph as foundry_graph_ctx
 from foundry.integration.sglang.config import (
     CUDAGraphExtensionMode,
     get_config,
-    get_graph_extension_mode,
 )
 from foundry.integration.sglang.nvtx import nvtx_range, nvtx_traced
 from foundry.integration.sglang.runtime import get_state
 
 logger = logging.getLogger(__name__)
 
-# (pending, graph files, perf_counter when the builds were started).
-_pending_graph_builds: tuple[Any, list[tuple[int, str, dict[str, Any]]], float] | None = None
 _GRAPH_FILENAME_RE = re.compile(r"^graph_(?P<index>\d+)_FULL_t(?P<bs>\d+)_r\d+_UX_pcN\.json$")
 # Full-backend prefill graphs: one per token bucket t and cached-prefix variant
 # pc (prefix chunks, 0 = suffix-only), captured with r request slots. Their own
@@ -48,21 +45,15 @@ _prefill_output_specs: dict[str, Any] = {}
 
 
 def _batch_size_from_key(key: Any) -> int:
-    if isinstance(key, int):
-        return key
-    # ShapeKey(size, stream_idx, variant_label, attention_variant) -- the last
-    # field was called dsa_variant before sglang #39176. Phase 1 persists only
-    # plain single-stream decode graphs, where size == bs.
-    if hasattr(key, "size"):
-        variant = getattr(key, "attention_variant", None) or getattr(key, "dsa_variant", None)
-        if key.stream_idx is not None or key.variant_label is not None or variant is not None:
-            raise ValueError(f"Foundry SGLang save/load does not support graph variants: {key!r}")
-        return key.size
-    key_str = str(key)
-    for part in reversed(key_str.split("_")):
-        if part.isdigit():
-            return int(part)
-    raise ValueError(f"Cannot derive batch size from SGLang CUDA graph key: {key!r}")
+    """Decode ShapeKey(size, stream_idx, variant_label, attention_variant):
+    only plain single-stream graphs are persisted, where size == bs."""
+    if (
+        key.stream_idx is not None
+        or key.variant_label is not None
+        or key.attention_variant is not None
+    ):
+        raise ValueError(f"Foundry SGLang save/load does not support graph variants: {key!r}")
+    return key.size
 
 
 def _graph_filename(index: int, key: Any) -> str:
@@ -72,8 +63,7 @@ def _graph_filename(index: int, key: Any) -> str:
 
 def _prefill_shape(key: Any) -> tuple[int, int]:
     """(num_tokens, prefix chunks) of a prefill ShapeKey."""
-    variant = getattr(key, "attention_variant", None) or getattr(key, "dsa_variant", None)
-    if key.stream_idx is not None or variant is not None:
+    if key.stream_idx is not None or key.attention_variant is not None:
         raise ValueError(f"Foundry SGLang save/load does not support graph variants: {key!r}")
     label = key.variant_label
     if label is None:
@@ -188,20 +178,14 @@ def _scan_graph_files(workspace_dir: str) -> list[tuple[int, str, dict[str, Any]
     return graph_files
 
 
-def create_device_graph():
-    mode = get_graph_extension_mode()
-    if mode == CUDAGraphExtensionMode.SAVE:
-        return FoundryCUDAGraph()
-    return torch.cuda.CUDAGraph()
-
-
 @nvtx_traced("foundry.save.capture_graph")
-def capture_graph(graph, pool, stream, run_once_fn):
-    mode = get_graph_extension_mode()
-    if mode == CUDAGraphExtensionMode.SAVE:
-        with foundry_graph_ctx(graph, pool=pool, stream=stream):
-            return run_once_fn()
-    return None
+def capture_graph(pool, stream, forward_fn) -> tuple[Any, Any]:
+    """SAVE: capture ``forward_fn`` on ``stream`` into ``pool`` as a new
+    foundry graph; returns ``(graph, output)``."""
+    graph = FoundryCUDAGraph()
+    with foundry_graph_ctx(graph, pool=pool, stream=stream):
+        out = forward_fn()
+    return graph, out
 
 
 def save_graph(graph, output: Any, key: Any, prefill_req_slots: int | None = None) -> None:
@@ -272,16 +256,11 @@ def _scan_prefill_graph_files(workspace_dir: str) -> list[tuple[int, str, dict[s
 class _RestoreTiming:
     """LOAD: timing of one runner's graph restore, logged by _log_restore."""
 
-    # When this runner's restore started (its capture, before the builds are
-    # launched or taken over) and when its start_graph_builds was called
-    # (earlier than t0 only for the builds started at setup).
+    # When this runner's restore started (its capture; its start_graph_builds
+    # call follows immediately).
     t0: float
-    builds_t0: float
     # (start, end) of each restore_next_* call.
     calls: list[tuple[float, float]] = field(default_factory=list)
-
-
-_warned_no_build_seconds = False
 
 
 def _log_restore(what: str, n: int, pending: Any, timing: _RestoreTiming, loop_s: float) -> None:
@@ -296,20 +275,7 @@ def _log_restore(what: str, n: int, pending: Any, timing: _RestoreTiming, loop_s
     (warmup, freeze_gc, dummy batches, attention metadata, ...). The builds
     run on the background thread during the loop, so restore + prep can
     exceed the loop wall."""
-    global _warned_no_build_seconds
-    build_s = getattr(pending, "build_seconds", None)
-    if build_s is None:
-        # Extension built before PendingGraphLoads.build_seconds: count the
-        # waits inside the restore calls instead of the builds.
-        if not _warned_no_build_seconds:
-            _warned_no_build_seconds = True
-            logger.warning(
-                "[Foundry] the foundry extension has no PendingGraphLoads.build_seconds "
-                "(rebuild it); the restore time below counts only the restore calls"
-            )
-        build_end = timing.t0
-    else:
-        build_end = timing.builds_t0 + build_s
+    build_end = timing.t0 + pending.build_seconds
     builds = max(0.0, build_end - timing.t0)
     handover = sum(max(0.0, end - max(start, build_end)) for start, end in timing.calls)
     in_calls = sum(end - start for start, end in timing.calls)
@@ -381,7 +347,7 @@ def start_prefill_graph_restore() -> dict[str, Any]:
         pending=pending,
         graph_files=graph_files,
         output_specs=record.get("output_specs", {}),
-        timing=_RestoreTiming(t0=t0, builds_t0=t0),
+        timing=_RestoreTiming(t0=t0),
     )
     logger.info(
         "[Foundry] Started SGLang prefill graph builds for %d graphs in %.3fs",
@@ -472,28 +438,6 @@ def start_exec_pool_prewarm() -> None:
         return
     FoundryCUDAGraph.start_exec_pool_prewarm(
         [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in files]
-    )
-
-
-@nvtx_traced("foundry.graph_restore.start")
-def start_graph_builds() -> None:
-    global _pending_graph_builds
-    cfg = get_config()
-    if cfg is None or cfg.workspace_dir is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
-        return
-
-    graph_files = _scan_graph_files(cfg.workspace_dir)
-    if not graph_files:
-        raise RuntimeError(f"No Foundry SGLang graph files found in {cfg.workspace_dir}")
-
-    paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
-    t0 = time.perf_counter()
-    pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
-    _pending_graph_builds = (pending, graph_files, t0)
-    logger.info(
-        "[Foundry] Started SGLang graph builds for %d graphs in %.3fs",
-        len(paths),
-        time.perf_counter() - t0,
     )
 
 
@@ -737,6 +681,20 @@ def bootstrap_lazy_runtimes() -> None:
     logger.info("[Foundry] SGLang lazy runtimes bootstrapped in %.3fs", time.perf_counter() - t0)
 
 
+def _find_dispatcher(model, cls) -> Any:
+    """The first ``cls`` dispatcher on the model: ``module.dispatcher`` itself
+    or one of its ``_inners`` (the two-batch-overlap wrapper holds the real
+    dispatchers there)."""
+    for module in model.modules():
+        dispatcher = getattr(module, "dispatcher", None)
+        if dispatcher is None:
+            continue
+        for candidate in (dispatcher, *getattr(dispatcher, "_inners", [])):
+            if isinstance(candidate, cls):
+                return candidate
+    return None
+
+
 def bootstrap_deepep_buffer(model) -> bool:
     """Force the singleton DeepEP ``Buffer`` (NVSHMEM runtime + symmetric heap)
     to be created BEFORE the cuda-graph capture loop.
@@ -781,25 +739,15 @@ def bootstrap_deepep_buffer(model) -> bool:
     if DeepEPBuffer._state().buffer is not None:
         return True
 
-    for module in model.modules():
-        dispatcher = getattr(module, "dispatcher", None)
-        if dispatcher is None:
-            continue
-        # ``module.dispatcher`` is normally a MaybeTboDeepEPDispatcher wrapper
-        # whose ``_inners`` hold the real DeepEPDispatcher(s); unwrap it. (Also
-        # handle a bare DeepEPDispatcher for safety.)
-        candidates = [dispatcher, *getattr(dispatcher, "_inners", [])]
-        deepep = next((d for d in candidates if isinstance(d, DeepEPDispatcher)), None)
-        if deepep is None:
-            continue
-        # Prefer the low-latency impl (the mode foundry captures); the buffer
-        # is sized for whichever impls exist, so either bootstraps the shared
-        # singleton.
-        impl = getattr(deepep, "_low_latency_dispatcher", None) or getattr(
-            deepep, "_normal_dispatcher", None
-        )
-        if impl is None:
-            continue
+    deepep = _find_dispatcher(model, DeepEPDispatcher)
+    # Prefer the low-latency impl (the mode foundry captures); the buffer is
+    # sized for whichever impls exist, so either bootstraps the shared
+    # singleton.
+    impl = deepep and (
+        getattr(deepep, "_low_latency_dispatcher", None)
+        or getattr(deepep, "_normal_dispatcher", None)
+    )
+    if impl is not None:
         t0 = time.perf_counter()
         impl._get_buffer()
         logger.info(
@@ -829,17 +777,9 @@ def _bootstrap_mooncake_buffer(model) -> bool:
     if EPBuffer.get_existing_buffer() is not None:
         return True
 
-    for module in model.modules():
-        dispatcher = getattr(module, "dispatcher", None)
-        if dispatcher is None:
-            continue
-        candidates = [dispatcher, *getattr(dispatcher, "_inners", [])]
-        mk = next((d for d in candidates if isinstance(d, MooncakeEPDispatcher)), None)
-        if mk is None:
-            continue
-        impl = getattr(mk, "_low_latency_dispatcher", None)
-        if impl is None:
-            continue
+    mk = _find_dispatcher(model, MooncakeEPDispatcher)
+    impl = getattr(mk, "_low_latency_dispatcher", None)
+    if impl is not None:
         t0 = time.perf_counter()
         impl._get_buffer()
         logger.info(
@@ -872,31 +812,13 @@ def _bootstrap_deepep_v2_buffer(model) -> bool:
     if DeepEPv2Buffer._state().buffer is not None:
         return True
 
-    for module in model.modules():
-        dispatcher = getattr(module, "dispatcher", None)
-        if dispatcher is None:
-            continue
-        candidates = [dispatcher, *getattr(dispatcher, "_inners", [])]
-        v2 = next((d for d in candidates if isinstance(d, DeepEPv2Dispatcher)), None)
-        if v2 is None:
-            continue
+    v2 = _find_dispatcher(model, DeepEPv2Dispatcher)
+    if v2 is not None:
         t0 = time.perf_counter()
-        # Prototype bisect knob: build the buffer (NCCL comm, GIN/GDAKI context,
-        # symmetric windows) with the hook's region suspended, so its
-        # allocations go to plain CUDA memory. Non-deterministic across
-        # SAVE/LOAD; only for isolating hook-vs-NCCL failures.
-        outside_region = os.environ.get("FOUNDRY_V2_BUFFER_OUTSIDE_REGION") == "1"
-        if outside_region:
-            cge.stop_allocation_region()
-        try:
-            v2._impl._get_buffer()
-        finally:
-            if outside_region:
-                cge.resume_allocation_region()
+        v2._impl._get_buffer()
         logger.info(
-            "[Foundry] Bootstrapped DeepEP v2 ElasticBuffer pre-capture in %.3fs%s",
+            "[Foundry] Bootstrapped DeepEP v2 ElasticBuffer pre-capture in %.3fs",
             time.perf_counter() - t0,
-            " (outside region)" if outside_region else "",
         )
         return True
 
@@ -923,11 +845,11 @@ def start_decode_graph_restore() -> None:
     """LOAD, at the decode runner's capture: start building every decode graph
     in one ``start_graph_builds`` call (the manifest's template / on-demand
     linking needs them in one call; the builds run on foundry's background
-    thread), or take over the builds started at setup. The graphs are then
+    thread). The graphs are then
     finished one at a time by restore_next_decode_graph, from inside the
     upstream capture loop, so their allocator events replay at the points SAVE
     captured them, between the same per-shape eager work."""
-    global _decode_restore, _pending_graph_builds
+    global _decode_restore
     cfg = get_config()
     if cfg is None or cfg.workspace_dir is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
         raise RuntimeError("Foundry SGLang graph extension is not initialized for LOAD")
@@ -940,24 +862,10 @@ def start_decode_graph_restore() -> None:
     cge.init_nvshmem_for_loaded_modules()
 
     t0 = time.perf_counter()
-    if _pending_graph_builds is not None:
-        # Builds started at setup (start_graph_builds, opt-in) ran on the
-        # background thread during torch-distributed init, weight loading and
-        # the memory-pool setup; allocator replay and output reconstruction
-        # still happen per shape below, at the capture points.
-        pending, early_files, builds_t0 = _pending_graph_builds
-        _pending_graph_builds = None
-        if [f for _, f, _ in early_files] != [f for _, f, _ in graph_files]:
-            raise RuntimeError("Foundry: graph file list changed between setup and load")
-        logger.info("[Foundry] Using the %d graph builds started at setup", len(graph_files))
-    else:
-        paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
-        pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
-        builds_t0 = t0
+    paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
+    pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
     _decode_restore = _DecodeRestore(
-        pending=pending,
-        graph_files=graph_files,
-        timing=_RestoreTiming(t0=t0, builds_t0=builds_t0),
+        pending=pending, graph_files=graph_files, timing=_RestoreTiming(t0=t0)
     )
 
 

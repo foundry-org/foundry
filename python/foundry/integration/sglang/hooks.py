@@ -1,26 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
-"""Runtime call-site functions of the Foundry SGLang integration.
-
-Two routes reach them: an SGLang that declares Foundry as a dependency calls
-them from its own call sites (through ``api.py``), and the general plugin
-(``install``) wraps SGLang's functions with them. Either way the same code
-runs at the same sequence points.
-
-Targets the runner architecture introduced after sglang 0.5.16: cuda-graph
-capture lives in per-phase runners (DecodeCudaGraphRunner) that delegate the
-actual graph create/capture/replay to a pluggable backend
-(FullCudaGraphBackend). Foundry only supports the `full` backend: server-args
-resolution forces decode=full and keeps prefill disabled unless full is
-requested explicitly (PrefillCudaGraphRunner, captured before decode). The
-pins come from the plugin's resolution hooks (plugin.py) or, on the fork base,
-from the in-tree handle_graph_extension.
-
-Kernel warmup no longer needs a patch: BaseRunner.warmup() runs no model
-forwards (workspace prealloc + autotune, which foundry disables) and executes
-at the same sequence point on SAVE and LOAD (EagerRunner.__init__), so its
-allocations are symmetric by construction.
-"""
+"""Runtime call-site functions of the Foundry SGLang integration, called
+from SGLang's own call sites (dependency route, through ``api.py``), and the
+plugin route's wrappers (``install``) that call them from patched SGLang
+functions."""
 
 from __future__ import annotations
 
@@ -45,26 +28,11 @@ logger = logging.getLogger(__name__)
 _INSTALLED = False
 
 
-def _ep_lazy_init_needed() -> bool:
-    """True when a DeepEP-family all-to-all backend (DeepEP, DeepEP v2,
-    Mooncake EP) is active, so pre-capture lazy
-    init (NVSHMEM buffer, DeepGEMM JIT) must be warmed up outside stream capture."""
-    try:
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
-        backend = get_moe_a2a_backend()
-        return backend.is_deepep() or backend.is_deepep_v2() or backend.is_mooncake()
-    except Exception:
-        return False
-
-
 def _workspace_ranks(parallel) -> tuple[int, int, int | None]:
     """(tp_rank, pp_rank, dp_rank) for the Foundry workspace rank.
 
-    ``parallel`` is whatever carries this process's placement: the fork's
-    per-runner ``ModelRunner.ps`` record, or upstream's ``get_parallel()``
-    context (stamped by ``publish(ranks=...)`` before any process group
-    exists; ``ModelRunner.ps`` was removed upstream, sglang #40343).
+    ``parallel`` is upstream's ``get_parallel()`` context (stamped by
+    ``publish(ranks=...)`` before any process group exists).
 
     Only spawn-time ranks are read: the attention-DP ranks (``attn_dp_rank``,
     ``attn_tp_rank``) are computed in ``initialize_dp_attention``, inside the
@@ -77,17 +45,10 @@ def _workspace_ranks(parallel) -> tuple[int, int, int | None]:
     return parallel.tp_rank, parallel.pp_rank, parallel.dp_rank
 
 
-def install_hooks(server_args) -> None:
-    """In-tree shim entry (fork base: ``--foundry-graph-extension-config-path``)."""
-    install(getattr(server_args, "foundry_graph_extension_config_path", None))
-
-
 def install(cfg_path: str | None) -> None:
     """Install the runtime patches for the TOML at ``cfg_path`` (idempotent).
-
-    Reached from the in-tree shim on the fork base, or from the sglang plugin
-    (``foundry.integration.sglang.plugin``) in every process that runs
-    ``load_plugins()``."""
+    Reached from the sglang plugin (``foundry.integration.sglang.plugin``) in
+    every process that runs ``load_plugins()``."""
     global _INSTALLED
     if not cfg_path:
         return
@@ -97,7 +58,7 @@ def install(cfg_path: str | None) -> None:
     t0_ns = os.environ.get("FOUNDRY_SPAWN_T0_NS")
     if t0_ns:
         logger.info(
-            "[Foundry] SGLang spawn -> install_hooks: %.1f ms",
+            "[Foundry] SGLang spawn -> install: %.1f ms",
             (time.perf_counter_ns() - int(t0_ns)) / 1e6,
         )
 
@@ -108,7 +69,9 @@ def install(cfg_path: str | None) -> None:
         get_workspace_root(),
     )
 
-    _patch_distributed_init()
+    from sglang.srt.distributed import bootstrap
+
+    _patch_init_parallel_runtime(bootstrap)
     _patch_alloc_memory_pool()
     _patch_cuda_graph_capture()
     _patch_spawn_sites()
@@ -118,11 +81,9 @@ def install(cfg_path: str | None) -> None:
 
 
 def _before_distributed_init(server_args, device: str, gpu_id: int, ranks) -> None:
-    """Bind this rank's VMM region before any communicator exists.
-
-    Same sequence point on SAVE and LOAD on both sglang layouts: the head of
-    the process-group bring-up (``bootstrap.init_parallel_runtime`` upstream,
-    ``ModelRunner.init_torch_distributed`` on the fork base)."""
+    """Bind this rank's VMM region before any communicator exists. Same
+    sequence point on SAVE and LOAD: the head of the process-group bring-up
+    (``bootstrap.init_parallel_runtime``)."""
     mode = get_graph_extension_mode()
     # Bind this rank's CUDA device BEFORE reserving the VMM region. The
     # distributed bring-up calls set_device(gpu_id) itself, but foundry's
@@ -148,24 +109,10 @@ def _before_distributed_init(server_args, device: str, gpu_id: int, ranks) -> No
         from foundry.integration.sglang.graph_ops import start_exec_pool_prewarm
 
         start_exec_pool_prewarm()
-    if mode == CUDAGraphExtensionMode.LOAD and _early_graph_builds_enabled():
-        # Start rebuilding the CUDA graphs now, on foundry's background
-        # thread, so template builds and member instantiation overlap
-        # torch-distributed init, weight loading and the memory-pool
-        # setup instead of sitting on the critical path at the capture
-        # point. Only CUDA graph objects are created here (no torch
-        # allocations: allocator replay and output-tensor reconstruction
-        # happen in finish_graph_loads at the capture point, and NVSHMEM
-        # module init still precedes it), so the deterministic layout is
-        # unchanged. Opt-in (FOUNDRY_SGLANG_EARLY_GRAPH_BUILDS=1): see
-        # _early_graph_builds_enabled for why it is off by default.
-        from foundry.integration.sglang.graph_ops import start_graph_builds
-
-        start_graph_builds()
 
 
 def _after_runner_distributed_init() -> None:
-    """End of ModelRunner.init_torch_distributed (both layouts): the groups
+    """End of ModelRunner.init_torch_distributed: the groups
     exist and pre-model-load memory has been measured; everything allocated
     since the region was bound sits in the scratch space, and the cursor jumps
     to the scratch boundary so weight loading starts at the same offset on
@@ -173,21 +120,6 @@ def _after_runner_distributed_init() -> None:
     rt.log_alloc_offset("after_init_torch_dist")
     rt.skip_to_scratch_boundary()
     rt.log_alloc_offset("after_scratch_skip")
-
-
-def _patch_distributed_init() -> None:
-    """Pick the bring-up site by attribute, not by version: upstream moved
-    process-group creation out of the model runner into
-    ``bootstrap.init_parallel_runtime``, called from ``Scheduler.__init__``
-    before any ModelRunner exists (sglang #40345)."""
-    try:
-        from sglang.srt.distributed import bootstrap
-    except ImportError:
-        bootstrap = None
-    if bootstrap is not None and hasattr(bootstrap, "init_parallel_runtime"):
-        _patch_init_parallel_runtime(bootstrap)
-    else:
-        _patch_init_torch_distributed()
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +142,7 @@ def _disable_dynamo() -> None:
 
 
 def before_parallel_init(device: str) -> None:
-    """Head of ``bootstrap.init_parallel_runtime`` (upstream layout): bind this
+    """Head of ``bootstrap.init_parallel_runtime``: bind this
     rank's VMM region before any communicator exists."""
     if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
         return
@@ -236,7 +168,7 @@ def after_parallel_init() -> None:
 
 
 def after_runner_distributed_init(is_draft_worker: bool) -> None:
-    """End of ``ModelRunner.init_torch_distributed`` (upstream layout). Draft
+    """End of ``ModelRunner.init_torch_distributed``. Draft
     workers reuse the target's groups and never reach init_parallel_runtime;
     only the target runner closes the window."""
     if (
@@ -382,13 +314,12 @@ def _begin_graph_layout(model, mode) -> None:
     rt.log_alloc_offset("before_logits_gatherer")
     bootstrap_logits_gatherer(model)
     rt.log_alloc_offset("after_logits_gatherer")
-    # 3. The DeepEP buffer (both modes, DeepEP-family backends): NVSHMEM
-    #    runtime + symmetric heap, otherwise created inside the first captured
-    #    forward, where deep_ep_cpp.Buffer(...) aborts.
-    if _ep_lazy_init_needed():
-        rt.log_alloc_offset("before_deepep_bootstrap")
-        bootstrap_deepep_buffer(model)
-        rt.log_alloc_offset("after_deepep_bootstrap")
+    # 3. The DeepEP-family buffer (both modes; a no-op for other all-to-all
+    #    backends): NVSHMEM runtime + symmetric heap, otherwise created inside
+    #    the first captured forward, where deep_ep_cpp.Buffer(...) aborts.
+    rt.log_alloc_offset("before_deepep_bootstrap")
+    bootstrap_deepep_buffer(model)
+    rt.log_alloc_offset("after_deepep_bootstrap")
     # 4. SAVE only, every model: the two one-time runtime initializations
     #    capture rejects (inductor's lazy init, DeepGEMM's runtime init), with
     #    the allocation region suspended so their transient tensors never move
@@ -473,26 +404,15 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
         # ``graph.reset()`` on each.
         return graph, out
 
-    # SAVE: capture directly; the shape's first forward happens inside the
-    # capture. Upstream's two warm-up forwards are not run: their activations
-    # would leave freed segments in the default pool that LOAD (no forward)
-    # cannot reproduce, drifting the cursor away from each saved
-    # ``start_base_addr``. JIT / lazy init inside the captured forward is
-    # recorded as alloc events. torch >= 2.14's dynamo refuses to compile
-    # while a stream is capturing, so dynamo is pinned off in the scheduler
-    # processes (TORCHDYNAMO_DISABLE=1, plugin.ENV_PINS): SGLang's compiled
-    # helpers then run as plain Python.
+    # SAVE: capture directly, no warm-up forwards (their freed activations
+    # would leave cached segments LOAD cannot reproduce). Dynamo is pinned off
+    # (plugin.ENV_PINS), as it refuses to trace inside a capture.
     from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
 
-    from foundry.integration.sglang.graph_ops import (
-        capture_graph,
-        create_device_graph,
-        save_graph,
-    )
+    from foundry.integration.sglang.graph_ops import capture_graph, save_graph
 
-    graph = create_device_graph()
     with graph_pool_capture_scope():
-        out = capture_graph(graph, pool, stream, forward_fn)
+        graph, out = capture_graph(pool, stream, forward_fn)
     save_graph(graph, out, shape_key, prefill_req_slots=req_slots)
     return graph, out
 
@@ -700,44 +620,6 @@ def _patch_init_parallel_runtime(bootstrap) -> None:
     cls.init_torch_distributed = patched_runner_init
 
 
-def _patch_init_torch_distributed() -> None:
-    """Fork base: ModelRunner.init_torch_distributed still creates the process
-    groups (and measures pre-model-load memory)."""
-    from sglang.srt.model_executor import model_runner as mr
-
-    cls = mr.ModelRunner
-    orig = cls.init_torch_distributed
-
-    @functools.wraps(orig)
-    def patched(self, *args, **kwargs):
-        if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
-            return orig(self, *args, **kwargs)
-        _before_distributed_init(
-            self.server_args,
-            self.device,
-            self.gpu_id,
-            _workspace_ranks(self.ps),
-        )
-        result = orig(self, *args, **kwargs)
-        _after_runner_distributed_init()
-        return result
-
-    cls.init_torch_distributed = patched
-
-
-def _early_graph_builds_enabled() -> bool:
-    # Off by default: it does not work for graphs with memcpy/memset nodes.
-    # cuGraphAddMemcpyNode validates its addresses when the node is added, and
-    # at setup the buffers the decode graphs copy into (the graph runner's
-    # static inputs, the KV pool) do not exist yet: Qwen3.5-122B-FP8 EP8 fails
-    # with "cuGraphAddMemcpyNode FAILED for node 1604 with error 1". The
-    # graph build therefore has to follow the engine's allocations, i.e. the
-    # capture point, and instantiation (the bulk of the restore) cannot be
-    # overlapped with model initialization this way. Kept as an opt-in for
-    # graph sets without such nodes.
-    return os.environ.get("FOUNDRY_SGLANG_EARLY_GRAPH_BUILDS", "0") == "1"
-
-
 def _patch_alloc_memory_pool() -> None:
     """Plugin route for begin/record_memory_pool_overrides and
     before/after_alloc_memory_pool."""
@@ -881,34 +763,20 @@ def _patch_spawn_sites() -> None:
 
     if engine_mod is not None:
         engine_cls = engine_mod.Engine
-        raw = engine_cls.__dict__.get("_launch_scheduler_processes")
-        if isinstance(raw, classmethod):
-            # Upstream calls it as ``cls._launch_scheduler_processes(...)`` and
-            # subclasses override it (RayEngine): keep it a classmethod so a
-            # subclass inheriting it still receives its own ``cls``.
-            orig_launch = raw.__func__
+        # Upstream calls it as ``cls._launch_scheduler_processes(...)`` and
+        # subclasses override it (RayEngine): keep it a classmethod so a
+        # subclass inheriting it still receives its own ``cls``.
+        orig_launch = engine_cls.__dict__["_launch_scheduler_processes"].__func__
 
-            @functools.wraps(orig_launch)
-            def patched_launch(cls, *args, **kwargs):
-                if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-                    server_args = args[0] if args else kwargs.get("server_args")
-                    _check_resolved_graph_config(server_args)
-                    rt.setup_ld_preload_env(server_args)
-                return orig_launch(cls, *args, **kwargs)
+        @functools.wraps(orig_launch)
+        def patched_launch(cls, *args, **kwargs):
+            if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
+                server_args = args[0] if args else kwargs.get("server_args")
+                _check_resolved_graph_config(server_args)
+                rt.setup_ld_preload_env(server_args)
+            return orig_launch(cls, *args, **kwargs)
 
-            engine_cls._launch_scheduler_processes = classmethod(patched_launch)
-        elif raw is not None:
-            orig_method = raw
-
-            @functools.wraps(orig_method)
-            def patched_method(self, *args, **kwargs):
-                if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-                    server_args = args[0] if args else kwargs.get("server_args")
-                    _check_resolved_graph_config(server_args)
-                    rt.setup_ld_preload_env(server_args)
-                return orig_method(self, *args, **kwargs)
-
-            engine_cls._launch_scheduler_processes = patched_method
+        engine_cls._launch_scheduler_processes = classmethod(patched_launch)
 
     try:
         from sglang.srt.managers import data_parallel_controller as dpc
@@ -930,9 +798,8 @@ def _patch_spawn_sites() -> None:
 def _check_resolved_graph_config(server_args) -> None:
     """Launcher, before any scheduler is spawned: the record must have been
     resolved with Foundry's graph pins (decode ``full``, prefill ``full`` or
-    ``disabled``). They are declared by a resolution step (the in-tree
-    ``handle_graph_extension`` on the fork base, the plugin's resolution hooks
-    otherwise); a record resolved before the plugin loaded would otherwise
+    ``disabled``). They are declared by the plugin's resolution hooks; a
+    record resolved before the plugin loaded would otherwise
     start without them and SAVE / LOAD would disagree with the archive."""
     if server_args is None:
         return

@@ -2,8 +2,7 @@
 
 Every runtime patch `foundry.integration.sglang.hooks.install(cfg_path)` installs. It runs in each process that loads
 the plugin (the launcher and every scheduler; `foundry.integration.sglang.plugin.activate`, reached from the entry
-point `foundry_sglang_plugin:load` when `FOUNDRY_GRAPH_EXTENSION_CONFIG` is set). The superseded in-tree route calls
-it through `install_hooks(server_args)`. The server-args pins (decode `full`, prefill `full` / `disabled`, profiling
+point `foundry_sglang_plugin:load` when `FOUNDRY_GRAPH_EXTENSION_CONFIG` is set). The server-args pins (decode `full`, prefill `full` / `disabled`, profiling
 and FlashInfer autotune off) are not patches: the plugin registers them as resolution hooks on three whitelisted
 steps (`apply_inkling_prefill_cuda_graph_default`, `handle_cuda_graph_config`, `handle_other_validations`); see
 `plugin.py`.
@@ -12,8 +11,8 @@ steps (`apply_inkling_prefill_cuda_graph_default`, `handle_cuda_graph_config`, `
 
 | # | patched symbol | SAVE | LOAD |
 |---|---|---|---|
-| 1 | `sglang.srt.distributed.bootstrap.init_parallel_runtime` (main; called from `Scheduler.__init__` before any `ModelRunner`) or `ModelRunner.init_torch_distributed` (fork base) | `set_device(gpu_id)`, then `setup_graph_extension` reserves the rank's VMM region before any process group exists | same, plus the binary restore (`load_cuda_modules_and_libraries`) and the exec-memory prewarm thread |
-| 1b | `ModelRunner.init_torch_distributed` (end; target runner only, main layout) | `skip_to_scratch_boundary()`: weights start at `scratch_space_size` | same |
+| 1 | `sglang.srt.distributed.bootstrap.init_parallel_runtime` (called from `Scheduler.__init__` before any `ModelRunner`) | `set_device(gpu_id)`, then `setup_graph_extension` reserves the rank's VMM region before any process group exists | same, plus the binary restore (`load_cuda_modules_and_libraries`) and the exec-memory prewarm thread |
+| 1b | `ModelRunner.init_torch_distributed` (end; target runner only) | `skip_to_scratch_boundary()`: weights start at `scratch_space_size` | same |
 | 2 | `KVCacheConfigurator._resolve_memory_pool_config` | run upstream, record the context overrides it issued (e.g. the Mamba/GDN state-pool size) | skip profiling: `gc.collect()` + `empty_cache()` (mirrors SAVE's side effects), return the saved `MemoryPoolConfig`, replay the overrides |
 | 2b | `ModelRunner.alloc_memory_pool` | write `warmup_state.json` (pool config + overrides) | pass-through with offset logging |
 | 3 | `FullCudaGraphBackend.capture_one` | capture into a `foundry.CUDAGraph` (no warmup forwards), `save_graph` | both runners: hand back the next archived graph for this shape (`restore_next_decode_graph` / `restore_next_prefill_graph`, order checked against the archive); its allocator events replay here (`finish_one_graph_load`); `forward_fn` is not run. `hooks.capture_one` takes the shape, `forward_fn`, the pool and the stream (the prefill request-slot count comes from the enclosing `capture_scope("prefill", ...)`) and returns `(graph, output)`; the caller stores them (the plugin's wrapper here, SGLang's backend on the dependency route) |
@@ -21,7 +20,7 @@ steps (`apply_inkling_prefill_cuda_graph_default`, `handle_cuda_graph_config`, `
 | 3c | `PrefillCudaGraphRunner.capture` | full backend only; bootstraps if it runs first | same as 3b for the prefill graphs: `start_prefill_graph_restore`, upstream loop with 3 swapping each capture (order and shape checked), `finish_prefill_graph_restore` |
 | 3d | `DecodeCudaGraphRunner._resolve_shared_read_ends` | - | `POST_REPLAY` fence for restored graphs (they carry no in-graph shared-read marker; see [`known-issues.md`](known-issues.md#event-record-nodes-todo-2026-10-02)) |
 | 4 | `Engine._launch_scheduler_processes` (kept a classmethod) | check the resolved graph config, `setup_ld_preload_env(server_args)` (hook lib, NVSHMEM host lib, optional udev shim; re-asserts the plugin's environment pins, see [`overview.md`](overview.md#what-the-plugin-pins-and-why)) before spawning | same |
-| 4b | `DataParallelController.launch_tensor_parallel_group` | `setup_ld_preload_env()` (fork-base layout) | same |
+| 4b | `DataParallelController.launch_tensor_parallel_group` | `setup_ld_preload_env()` | same |
 
 Every patch is wrap-and-call and returns to upstream when the mode is `NONE`; no patch replaces an upstream loop on
 either mode. Kernel warmup needs no patch: `BaseRunner.warmup()` runs no model forward and executes at the same
@@ -39,7 +38,7 @@ bring-up sets the device itself, but patch 1 runs before it, so rank > 0 would r
 with an async illegal memory access. Patch 1 therefore calls `set_device(gpu_id)` first.
 
 **LOAD starts every decode graph build in one call.** `start_decode_graph_restore` calls
-`start_graph_builds(all_paths)` once before the loop (or takes over the builds started at setup); the manifest's
+`start_graph_builds(all_paths)` once before the loop; the manifest's
 template / on-demand linking needs all graphs in one build. Per-graph builds leave on-demand graphs without a
 `shared_exec` and replay aborts with `Called CUDAGraph::replay without a preceding successful capture or load`. The
 builds are finished one per shape inside the loop (`finish_one_graph_load`, from patch 3). `finish_decode_graph_restore`

@@ -2,7 +2,7 @@
 
 Foundry persists SGLang's decode (and optionally prefill) CUDA graphs to disk on SAVE and restores them on LOAD, skipping graph capture, kernel warmup, and the per-batch-size attention metadata setup costs.
 
-Foundry runs as an **SGLang plugin**: installing the `foundry-core` package registers the entry point `foundry = "foundry_sglang_plugin:load"` in group `sglang.srt.plugins`, and `FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>` in the launcher's environment switches it on. No SGLang change is needed (validated on upstream main `fa090f7755`, fork branch `foundry-plugin`). The plugin wraps three whitelisted resolution steps to pin the graph settings and installs the runtime patches in [`hooks.md`](hooks.md) in the launcher and in every scheduler process. The earlier in-tree route (fork flag `--foundry-graph-extension-config-path`, [`direct-edits.md`](direct-edits.md)) is superseded.
+Foundry runs as an **SGLang plugin**: installing the `foundry-core` package registers the entry point `foundry = "foundry_sglang_plugin:load"` in group `sglang.srt.plugins`, and `FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>` in the launcher's environment switches it on. No SGLang change is needed (validated on upstream main `fa090f7755`, fork branch `foundry-plugin`). The plugin wraps three whitelisted resolution steps to pin the graph settings and installs the runtime patches in [`hooks.md`](hooks.md) in the launcher and in every scheduler process.
 
 **Dependency route.** An SGLang that declares Foundry as an optional dependency (`sglang[foundry]`, fork branch
 `foundry-dep`) calls `foundry.integration.sglang.api` from its own call sites instead of being patched:
@@ -42,8 +42,7 @@ C++ fix binding the CUDA context on the graph-build pool workers.
 
 **Per-rank device binding (DP/TP/EP).** Foundry's `set_allocation_region` binds the
 VMM region to the CUDA device current at call time. Upstream sets the device
-*inside* the distributed bring-up (`bootstrap.init_parallel_runtime` on main,
-`ModelRunner.init_torch_distributed` on the fork base), which the integration wraps and front-runs, so
+*inside* the distributed bring-up (`bootstrap.init_parallel_runtime`), which the integration wraps and front-runs, so
 the hook explicitly calls `set_device(self.gpu_id)` before reserving the region —
 otherwise rank > 0 reserves on `cuda:0` and faults. See [`hooks.md`](hooks.md) (patch 1).
 The DP serve script lives at `recipe/sglang/serve_qwen3-1.7b_dp.sh`
@@ -171,7 +170,6 @@ LOAD:
 ## Doc set
 
 - [`overview.md`](overview.md) — this file
-- [`direct-edits.md`](direct-edits.md) — the superseded in-tree route's edits to `sglang/` (not needed with the plugin)
 - [`hooks.md`](hooks.md) — every monkey-patch foundry installs and what it does on SAVE / LOAD
 - [`memory-lifecycle.md`](memory-lifecycle.md) — VMM region setup, the SAVE↔LOAD allocation parity contract, and the `final_alloc_offset` watermark
 - [`save-load-workflow.md`](save-load-workflow.md) — serve scripts, TOML schema, expected logs, validation checks
