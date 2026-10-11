@@ -125,7 +125,7 @@ SAVE (success):
 [Foundry] SGLang hooks installing: mode=save workspace=foundry_archive_qwen_1.7b
 [Foundry] SGLang hooks installed
 Foundry SGLang integration activated from .../save_qwen_1.7b.toml
-[Foundry] SGLang rank=0 (tp_rank=0 pp_rank=0 dp_rank=None replica=0 attention_dp=False) workspace_dir=foundry_archive_qwen_1.7b/rank_0
+[Foundry] SGLang rank=0 workspace_dir=foundry_archive_qwen_1.7b/rank_0
 [Foundry] SGLang graph extension setup completed in 0.x s
 [Foundry] SGLang skipped allocator to scratch boundary 1073741824
 [Foundry] SGLang reused saved memory pool config       ← only on LOAD

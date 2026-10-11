@@ -68,7 +68,9 @@ from the SAVE / LOAD code, which handles every event node this way.)
 Upstream's fallback for "`IN_REPLAY` declared, no marker" is `PRE_REPLAY`, which fences too early: the scheduler may
 overwrite buffers the graph is still about to read (upstream's own TODO in `_resolve_shared_read_ends` says
 `POST_REPLAY` is the sound one). Foundry's `shared_read_ends_override` (`integration/sglang/hooks.py`, called from
-`_resolve_shared_read_ends`; patch 3d in [`hooks.md`](hooks.md)) therefore returns `POST_REPLAY` on LOAD in that case.
+`_resolve_shared_read_ends`; patch 3d in [`hooks.md`](hooks.md)) therefore returns `POST_REPLAY` on LOAD in that case
+on the plugin route. On the dependency route upstream's own fallback is already `POST_REPLAY`, so no Foundry call is
+needed there.
 That is correct, but the scheduler's writes for batch N+1 now wait for the whole forward of batch N, so the overlap the
 marker buys is lost. The loss was not measurable in our bs 1-128 TPOT runs; it may matter for small-batch, CPU-bound
 serving, where the scheduler's next-batch preparation is a large share of the step (not measured).
@@ -76,8 +78,8 @@ serving, where the scheduler's next-batch preparation is a large share of the st
 **TODO (next phase).** Give events a stable identity across the archive instead of a per-graph index: SAVE records,
 per event node, an id for the host event (shared by every graph that records it) and, where the integration registers
 one, which host object it is. LOAD creates one event per id, adds the nodes with it, and hands the event back to the
-integration (SGLang: set `runner.in_graph_metadata_prep_done`). Then `shared_read_ends_override` and its SGLang call
-site in `_resolve_shared_read_ends` can go, and upstream's own `IN_REPLAY` path runs unchanged. The generic mechanism
+integration (SGLang: set `runner.in_graph_metadata_prep_done`). Then the plugin route's `shared_read_ends_override`
+patch can go, and upstream's own `IN_REPLAY` path runs unchanged. The generic mechanism
 is "graph nodes that reference host objects": events now, conditional handles and child-graph handles later.
 
 ## SAVE spends ~30 s in `Init torch distributed` (and ~20 s more elsewhere) copying over-read fatbins (FIXED, 2026-09-25)
