@@ -474,6 +474,16 @@ ENV_PINS: tuple[EnvPin, ...] = (
         "eager allocations would borrow free graph-pool extents whose addresses the restored "
         "graphs reference",
     ),
+    # Read by torch.compile when it decorates (sglang applies it at import),
+    # so it must be in the environment before the scheduler imports sglang;
+    # the scheduler also sets torch._dynamo.config.disable
+    # (hooks.before_parallel_init), which dynamo reads per frame.
+    EnvPin(
+        "TORCHDYNAMO_DISABLE",
+        "1",
+        "SAVE runs each shape's first forward inside the capture and torch >= 2.14's dynamo "
+        "refuses to compile while a stream is capturing; sglang's compiled helpers run eagerly",
+    ),
 )
 
 # NCCL_CUMEM_ENABLE=0 unless the MoE all-to-all is DeepEP v2, whose NCCL

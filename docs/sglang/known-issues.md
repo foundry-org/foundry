@@ -101,59 +101,6 @@ natively, the pre-capture bootstrap on SAVE/LOAD). Restore time is unaffected. C
 `LD_PRELOAD` shim that removes it: [../bare-host-verbs-udev-wait.md](../bare-host-verbs-udev-wait.md)
 (`tools/host/no_cdev_wait.c`).
 
-## SAVE fails cold: inductor autotunes a fresh Triton kernel inside the capture window (LIMITATION, 2026-09-24)
-
-**Symptom.** GLM-5.3-Flash EP8 (dummy weights) as the FIRST engine ever run for that model in a fresh container:
-SAVE's first captured forward fails with `torch.AcceleratorError: CUDA error: operation not permitted when
-stream is capturing`, raised from `torch/cuda/__init__.py synchronize` under
-`triton_heuristics.autotune_to_one_config -> benchmark_all_configs -> benchmarking.benchmark_gpu`, reached
-from the DSA indexer's `@torch.compile` function. The same row passes when plain sglang (or any engine that
-ran the model) preceded it in the same container.
-
-**Cause.** SAVE compiles inside capture by design (no eager forward). Codegen, kernel loads and DeepGEMM JIT
-are capture-safe; inductor's Triton autotuning is not: a freshly compiled kernel with several candidate
-configs is benchmarked on its first run and the benchmark synchronizes the device. With a warm inductor cache
-(`autotune_local_cache`, under sglang's `SGLANG_CACHE_DIR/inductor`) the best config is loaded and nothing is
-benchmarked. A second, now-fixed cause hid behind the same row: `bootstrap_lazy_runtimes` warmed inductor's
-device-keyed pattern initializers in one loop that aborted on `post_grad.lazy_init`'s "Duplicate pattern"
-(its patterns are global, the trivial compile had registered them), so the remaining device keys were never
-warmed and `_sfdp_init` ran inside capture ("Cannot copy between CPU and CUDA tensors during CUDA graph
-capture"). Each key is now warmed on its own, joint-graph initializers only.
-
-**Status.** Requirement, not a bug we can remove: on a machine (cache dir) that has never run the model, run
-plain sglang WITH the same decode-graph set once before SAVE (`serve_*.sh <cfg>` without a mode, or
-`--warm`), or ship the inductor/Triton cache directory with the archive. SAVE now installs a guard that
-replaces the cryptic capture error with a message naming this remedy. An eager run (`--disable-cuda-graph`)
-is not a substitute, verified on GLM-5.3-Flash: the compiled function then sees plain tensors instead of the
-views of the static batch buffers it sees under capture, dynamo's guards differ
-(`L['x']._base.size()[0] == L['x'].size()[0]`, duck-sized `q_scale`/`x` equality), and the inductor artifacts
-differ (24 new artifacts from the eager sweep, 64 more from SAVE's own compiles, still autotuning). Plain
-sglang's pre-capture warmup forwards use the capture-mode inputs, so their artifacts are the ones SAVE loads.
-Disabling pointwise autotuning (`torch._inductor.config.triton.autotune_pointwise=False`) would also avoid it
-but changes the kernels SAVE captures relative to native sglang, so it is not the default.
-
-## SAVE capture fails when a first torch.compile inside the capture window copies a CPU constant to the device (OPEN, 2026-09-23)
-
-**Symptom.** Inkling-Small (bf16, EP8, dummy weights) on 8xH200: the native sglang graph engine captures all
-decode graphs, Foundry SAVE fails in the first captured forward:
-`hooks.py patched_capture_one -> graph_ops.capture_graph -> run_once -> inkling.py:571 -> dense_mlp.py:81
-swiglu_contiguous -> torch._inductor compile_fx` with
-`RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph capture unless the CPU tensor is pinned`.
-
-**Cause.** SAVE runs no eager forward (upstream's pre-capture warmup forwards are suppressed so their
-allocations do not enter the layout), so the first call of every `torch.compile`d function happens inside the
-capture window by design. Inductor's lazy runtime initialization is done beforehand (`bootstrap_lazy_runtimes`)
-and compiles that only generate and load kernels are capture-safe (Qwen3-30B-A3B-FP8 DeepGEMM JIT, gpt-oss's
-`swiglu_gpt_oss_sigmoid_alpha` compile). This compile additionally materializes a CPU constant on the device
-(a non-pinned host-to-device copy), which the capturing stream rejects. sglang's native path never sees it
-because its warmup forwards compile before capture.
-
-**Status.** Not fixed; the model is not servable on this sglang tree anyway (idle DP-attention rank fails in
-`inkling.py:940` on a zero-token batch). Candidates, none tested: pin the constant in sglang's
-`swiglu_contiguous` (or pass it as a Python scalar); make inductor's constant placement capture-safe upstream;
-as a last resort a SAVE-only compile trigger for the affected function under `allocation_region_suspended()`,
-which would have to be symmetric with LOAD (LOAD also compiles on first use) and is therefore not preferred.
-
 ## Restored EP graphs fault at the first decode on multicast-capable hosts (FIXED, 2026-09-23)
 
 **Symptom.** Qwen3-30B-A3B EP2 (DP attention + DeepEP low-latency + DeepGEMM) on an 8xH200 host:

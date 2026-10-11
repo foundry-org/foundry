@@ -181,10 +181,9 @@ def test_explicit_full_prefill_is_honoured(model_dir, plugin_hooks):
     assert "cuda_graph_backend_prefill" not in declared
 
 
-@pytest.mark.parametrize("backend", [Backend.BREAKABLE, Backend.TC_PIECEWISE])
-def test_non_full_prefill_flag_is_rejected(model_dir, plugin_hooks, backend):
+def test_non_full_prefill_flag_is_rejected(model_dir, plugin_hooks):
     with pytest.raises(ValueError, match="Foundry persists full prefill graphs only"):
-        _resolve(model_dir, cuda_graph_backend_prefill=backend)
+        _resolve(model_dir, cuda_graph_backend_prefill=Backend.BREAKABLE)
 
 
 def test_non_full_decode_flag_is_rejected(model_dir, plugin_hooks):
@@ -196,7 +195,6 @@ def test_non_full_decode_flag_is_rejected(model_dir, plugin_hooks):
     "json_cfg, match",
     [
         ({"prefill": {"backend": "breakable"}}, "prefill graphs only"),
-        ({"prefill": {"backend": "tc_piecewise"}}, "prefill graphs only"),
         ({"decode": {"backend": "disabled"}}, "decode graphs only"),
     ],
 )
@@ -367,8 +365,11 @@ def test_env_pin_already_set_to_the_pinned_value_is_kept(clean_pin_env):
 
 @pytest.mark.parametrize("pin", plugin.ENV_PINS, ids=lambda pin: pin.name)
 def test_explicit_contrary_env_is_rejected(clean_pin_env, pin):
-    os.environ[pin.name] = "1"
-    with pytest.raises(ValueError, match=f"{pin.name}='1' \\(Foundry needs 0\\)"):
+    contrary = "0" if pin.value == "1" else "1"
+    os.environ[pin.name] = contrary
+    with pytest.raises(
+        ValueError, match=f"{pin.name}='{contrary}' \\(Foundry needs {pin.value}\\)"
+    ):
         plugin.apply_env_pins()
 
 

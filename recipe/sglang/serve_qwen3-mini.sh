@@ -26,6 +26,7 @@ fi
 
 # --save/--load: export FOUNDRY_GRAPH_EXTENSION_CONFIG="$FOUNDRY_TOML" after the preflight; baseline: unset it.
 foundry_select "$1" "${FOUNDRY_TOML:-}"
+foundry_baseline_pins   # every mode: TORCHDYNAMO_DISABLE=1; baseline only: the plugin's env pins, see serve_common.sh
 
 # LD_PRELOAD of libcuda_hook.so is set by foundry's setup_ld_preload_env at
 # worker spawn time (path auto-detected from the foundry install). Baseline runs

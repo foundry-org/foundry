@@ -3,7 +3,7 @@
 # plugin helpers every serve_*.sh script uses (foundry_select, foundry_serve; see "Foundry plugin route" below).
 #
 # A model script sets MODEL_PATH (and optionally the per-model knobs below), then calls
-#     serve_main <cfg> [--save|--load|--warm]
+#     serve_main <cfg> [--save|--load]
 # where <cfg> names the parallel topology with the same vocabulary as the cold-start matrix
 # (experimental/matrix3/coldstart.sh), so every row here was run exactly like this:
 #   single            1 GPU
@@ -64,7 +64,7 @@ foundry_preflight() {
 }
 
 # foundry_select <mode> [toml]: --save / --load export FOUNDRY_GRAPH_EXTENSION_CONFIG (default: the recipe TOML for
-# the mode) and run the preflight. Any other mode (baseline, --warm) unsets it, so a stray export in the calling shell
+# the mode) and run the preflight. Any other mode (baseline) unsets it, so a stray export in the calling shell
 # cannot turn a baseline run into a SAVE.
 foundry_select() {
   local mode=$1 toml=${2:-}
@@ -132,12 +132,15 @@ foundry_serve() {
 # ---- Baseline parity with the plugin's pins ------------------------------------------------------------------------
 # On --save / --load the Foundry plugin pins every config that selects state it cannot replay (custom all-reduce off,
 # torch symm-mem all-reduce on, NCCL buffer registration / cuMem / NVLS off, the DeepGEMM precompile sweep off, ...;
-# table in docs/sglang/overview.md "What the plugin pins and why"), so no script passes them. A baseline or --warm run
+# table in docs/sglang/overview.md "What the plugin pins and why"), so no script passes them. A baseline run (no mode)
 # has no plugin: foundry_baseline_pins (after foundry_select) gives it the pinned values that change what it runs, so
 # it captures the same graph set and warms the same kernels as SAVE. The NCCL cuMem / NVLS pins are sglang's own
 # defaults when the variables are unset, and buffer registration does not change what a baseline computes.
 foundry_baseline_pins() {  # sets FOUNDRY_BASELINE_ARGS (empty with Foundry selected)
   FOUNDRY_BASELINE_ARGS=""
+  # SAVE captures each shape's first forward inside the capture and torch >= 2.14's dynamo refuses to trace there.
+  # Foundry pins it for SAVE/LOAD; the recipe exports it for every mode so the baseline run compiles the same kernels.
+  export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
   [[ -n "${FOUNDRY_GRAPH_EXTENSION_CONFIG:-}" ]] && return 0
   FOUNDRY_BASELINE_ARGS="--disable-custom-all-reduce --enable-torch-symm-mem"
   export SGLANG_JIT_DEEPGEMM_PRECOMPILE="${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-0}"
@@ -178,7 +181,7 @@ topology_args() {  # $1 cfg -> sets N, ARGS, GRAPHS
 }
 
 serve_main() {
-  local cfg=${1:?Usage: $0 <cfg> [--save|--load|--warm]} mode=${2:-}
+  local cfg=${1:?Usage: $0 <cfg> [--save|--load]} mode=${2:-}
   : "${MODEL_PATH:?MODEL_PATH must be set by the model script}"
   topology_args "$cfg" || exit 1
   local memfrac=${MEMFRAC:-}
@@ -192,17 +195,13 @@ serve_main() {
             # of every rank's LOAD (Qwen3.5-122B-FP8 EP8: 1.67 s -> 0.10 s with mmap, identical output). Measured with
             # the archive in the page cache; set FOUNDRY_MMAP_ARCHIVE=0 to read eagerly.
             export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
-    --warm)
-      # Cache warm-up, once per machine and model: plain SGLang with the SAME decode-graph set (identical to
-      # running without a mode). SAVE compiles inside the capture window on purpose (no eager forward); a
-      # freshly compiled inductor kernel is autotuned on first run and the benchmark synchronizes the device,
-      # which capture forbids. SGLang's own pre-capture warmup forwards compile and autotune every kernel with
-      # capture-mode inputs (views of the static batch buffers), so after this run the inductor / Triton /
-      # DeepGEMM caches under SGLANG_CACHE_DIR hold exactly the artifacts SAVE needs. An eager run
-      # (--disable-cuda-graph) compiles different artifacts and does not help.
-      echo "Cache warm-up: plain SGLang with the recipe's decode-graph set" ;;
-    "")     echo "Running without foundry (baseline SGLang, same decode-graph set)" ;;
-    *)      echo "Usage: $0 <cfg> [--save|--load|--warm]"; exit 1 ;;
+    "")
+      # Baseline, also the JIT-cache warm-up before the first SAVE (once per machine and model): plain SGLang with
+      # the same decode-graph set builds every kernel with capture-mode inputs in its pre-capture warmup forwards,
+      # so the caches under SGLANG_CACHE_DIR hold exactly the artifacts SAVE loads inside the capture window. An
+      # eager run (--disable-cuda-graph) builds different artifacts and does not help.
+      echo "Running without foundry (baseline SGLang, same decode-graph set)" ;;
+    *)      echo "Usage: $0 <cfg> [--save|--load]"; exit 1 ;;
   esac
   foundry_select "$mode"
   foundry_baseline_pins

@@ -197,11 +197,24 @@ def _patch_distributed_init() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _disable_dynamo() -> None:
+    """Scheduler process: besides the ``TORCHDYNAMO_DISABLE=1`` pin (read when
+    ``torch.compile`` decorates), set ``torch._dynamo.config.disable``, which
+    dynamo checks on every frame, so a helper decorated before the pin took
+    effect does not compile inside a capture either."""
+    import torch._dynamo
+
+    if not torch._dynamo.config.disable:
+        torch._dynamo.config.disable = True
+        logger.info("[Foundry] torch._dynamo.config.disable = True (TORCHDYNAMO_DISABLE=1 pin)")
+
+
 def before_parallel_init(device: str) -> None:
     """Head of ``bootstrap.init_parallel_runtime`` (upstream layout): bind this
     rank's VMM region before any communicator exists."""
     if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
         return
+    _disable_dynamo()
     from sglang.srt.runtime_context import get_device, get_parallel
 
     parallel = get_parallel()
@@ -465,7 +478,10 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
     # would leave freed segments in the default pool that LOAD (no forward)
     # cannot reproduce, drifting the cursor away from each saved
     # ``start_base_addr``. JIT / lazy init inside the captured forward is
-    # recorded as alloc events.
+    # recorded as alloc events. torch >= 2.14's dynamo refuses to compile
+    # while a stream is capturing, so dynamo is pinned off in the scheduler
+    # processes (TORCHDYNAMO_DISABLE=1, plugin.ENV_PINS): SGLang's compiled
+    # helpers then run as plain Python.
     from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
 
     from foundry.integration.sglang.graph_ops import (
