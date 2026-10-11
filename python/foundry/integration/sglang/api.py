@@ -16,8 +16,9 @@ both routes run the same code at the same sequence points.
 Compatibility: SGLang checks :data:`INTEGRATION_API_VERSION` at activation.
 The major number changes when a function below is removed or changes its
 signature or its call-site contract; the minor number when one is added.
-2.0 removed ``run_capture_loop`` (SAVE no longer runs warm-up forwards);
-SGLang's adapter requires 2.x.
+2.0 is the contract below: every call site passes values (the model, the
+draft flag, the pool config, the prefill request-slot count once per prefill
+capture scope), never a runner or backend object.
 
 Call sites (SGLang side, in process order):
 
@@ -38,7 +39,6 @@ scheduler / DP-controller spawn             :func:`configure_subprocess`
                                             :func:`after_alloc_memory_pool`
 decode / prefill runner ``capture``         :func:`capture_scope`
 ``FullCudaGraphBackend.capture_one``        :func:`capture_one`
-``_resolve_shared_read_ends``               :func:`shared_read_ends_override`
 ==========================================  ===================================
 
 Every function except :func:`activate` and :func:`is_active` requires an
@@ -65,10 +65,6 @@ _active: tuple[str, str | None] | None = None
 
 def is_active() -> bool:
     return _active is not None
-
-
-def mode() -> str | None:
-    return None if _active is None else _active[0]
 
 
 def activate(*, mode: str, config_path: str | None = None) -> None:
@@ -287,7 +283,8 @@ def capture_scope(phase: str, *, model: Any, req_slots: int | None = None):
     """Context manager around the body of ``DecodeCudaGraphRunner.capture``
     (``phase="decode"``) or ``PrefillCudaGraphRunner.capture``
     (``phase="prefill"``, with the runner's fixed request-slot count
-    ``req_slots``). ``model`` is the loaded model: the pre-capture bootstraps
+    ``req_slots``, recorded with every prefill graph captured or restored in
+    the scope). ``model`` is the loaded model: the pre-capture bootstraps
     walk its modules (logits gatherer, DeepEP buffer, NVSHMEM). SGLang's
     capture loop runs inside on both modes; the scope adds the bootstraps and
     the layout start (first runner), LOAD's preallocation and restore
@@ -298,37 +295,13 @@ def capture_scope(phase: str, *, model: Any, req_slots: int | None = None):
     return hooks.capture_scope(phase, model, req_slots)
 
 
-def capture_one(
-    shape_key: Any,
-    forward_fn,
-    *,
-    pool: Any,
-    stream: Any,
-    prefill_req_slots: int | None = None,
-    post_warmup_hook: Any = None,
-    tp_group: Any = None,
-):
-    """Replaces the body of ``FullCudaGraphBackend.capture_one`` and returns
-    ``(graph, output)`` for SGLang to store: SAVE captures the shape on
-    ``stream`` into ``pool`` without warm-up forwards (the first forward runs
-    inside the capture) and archives it; LOAD restores the archived graph and
-    runs no forward. ``prefill_req_slots`` is the prefill runner's fixed
-    request-slot count, None for a decode graph. ``post_warmup_hook`` /
-    ``tp_group`` (since 1.1) are accepted and unused since 2.0."""
+def capture_one(shape_key: Any, forward_fn, *, pool: Any, stream: Any):
+    """Replaces the body of ``FullCudaGraphBackend.capture_one`` (inside a
+    :func:`capture_scope`) and returns ``(graph, output)`` for SGLang to
+    store: SAVE captures the shape on ``stream`` into ``pool`` without warm-up
+    forwards and archives it; LOAD restores the archived graph and runs no
+    forward."""
     _require_active()
     from foundry.integration.sglang import hooks
 
-    del post_warmup_hook, tp_group
-    return hooks.capture_one(
-        shape_key, forward_fn, pool=pool, stream=stream, prefill_req_slots=prefill_req_slots
-    )
-
-
-def shared_read_ends_override(runner: Any, attn_backend: Any, forward_mode: Any):
-    """``DecodeCudaGraphRunner._resolve_shared_read_ends``: LOAD fences the
-    scheduler's shared-buffer writes after replay (POST_REPLAY) where upstream
-    would fall back to PRE_REPLAY. None keeps upstream's answer."""
-    _require_active()
-    from foundry.integration.sglang import hooks
-
-    return hooks.shared_read_ends_override(runner, attn_backend, forward_mode)
+    return hooks.capture_one(shape_key, forward_fn, pool=pool, stream=stream)

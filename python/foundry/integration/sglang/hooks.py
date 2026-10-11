@@ -349,14 +349,6 @@ def after_alloc_memory_pool(memory_pool_config, is_draft_worker: bool) -> None:
         rt.save_warmup_state(state)
 
 
-def _prefill_runner_cls():
-    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
-        PrefillCudaGraphRunner,
-    )
-
-    return PrefillCudaGraphRunner
-
-
 def _begin_graph_layout(model, mode) -> None:
     """Pre-capture bootstraps + layout start, once per process, at the first
     runner capture: the prefill runner's when prefill graphs are on (sglang
@@ -435,28 +427,22 @@ def _preallocate_once() -> None:
     state.preallocated = True
 
 
-def _prefill_req_slots(backend) -> int | None:
-    """Plugin route: the prefill runner's fixed request-slot count when
-    ``backend`` is that runner's, None for the decode runner's (on the
-    dependency route SGLang's backend passes it)."""
-    runner = backend._cuda_graph_runner
-    if isinstance(runner, _prefill_runner_cls()):
-        return runner._capture_req_slots
-    return None
+# The capture scope being run: (phase, prefill request-slot count or None).
+_scope: tuple[str, int | None] | None = None
 
 
-def capture_one(shape_key, forward_fn, *, pool, stream, prefill_req_slots=None):
+def capture_one(shape_key, forward_fn, *, pool, stream):
     """Replaces ``FullCudaGraphBackend.capture_one`` for one shape, SAVE or
-    LOAD; the runner's capture loop around it is SGLang's own. Returns
-    ``(graph, output)`` for the caller to store in the backend. Neither mode
-    runs upstream's warm-up forwards.
-
-    ``pool`` / ``stream``: the backend's graph pool and capture stream (SAVE).
-    ``prefill_req_slots``: the prefill runner's fixed request-slot count, None
-    for a decode graph."""
+    LOAD, inside :func:`capture_scope`; the runner's capture loop around it is
+    SGLang's own. Returns ``(graph, output)`` for the caller to store in the
+    backend. ``pool`` / ``stream``: the backend's graph pool and capture
+    stream (SAVE)."""
     mode = get_graph_extension_mode()
     if mode == CUDAGraphExtensionMode.NONE:
         raise RuntimeError("[Foundry] capture_one called without SAVE or LOAD")
+    if _scope is None:
+        raise RuntimeError("[Foundry] capture_one called outside capture_scope")
+    req_slots = _scope[1]
     if getattr(shape_key, "attention_variant", None) is not None:
         # ShapeKey.attention_variant (e.g. DSV4.1 candidate-indexer graphs on
         # SM100, the HIP DSA dual graph): several graphs per shape, which the
@@ -466,7 +452,6 @@ def capture_one(shape_key, forward_fn, *, pool, stream, prefill_req_slots=None):
             f"({shape_key.attention_variant!r}); Foundry save/load does not support "
             "graph variants"
         )
-    req_slots = prefill_req_slots
     if mode == CUDAGraphExtensionMode.LOAD:
         # LOAD, both runners: the upstream capture loop runs (see
         # capture_scope) and only the capture is replaced, by the archived
@@ -513,7 +498,7 @@ def capture_one(shape_key, forward_fn, *, pool, stream, prefill_req_slots=None):
 
 
 @contextlib.contextmanager
-def prefill_capture_scope(model, req_slots: int):
+def _prefill_capture_scope(model, req_slots: int):
     """Around ``PrefillCudaGraphRunner.capture`` (its body, SGLang's capture
     loop, runs inside on both modes). ``model``: the loaded model (the
     bootstraps walk its modules); ``req_slots``: the runner's fixed request-
@@ -564,7 +549,7 @@ def prefill_capture_scope(model, req_slots: int):
 
 
 @contextlib.contextmanager
-def decode_capture_scope(model):
+def _decode_capture_scope(model):
     """Around ``DecodeCudaGraphRunner.capture`` (its body, SGLang's capture
     loop, runs inside on both modes). ``model``: the loaded model (the
     bootstraps walk its modules). The decode backend is full and elastic-EP
@@ -631,16 +616,29 @@ def decode_capture_scope(model):
     rt.record_region_layout()
 
 
+@contextlib.contextmanager
 def capture_scope(phase: str, model, req_slots: int | None = None):
-    """Prefill or decode capture scope (dependency route): ``phase`` is
-    ``"prefill"`` (with the runner's ``req_slots``) or ``"decode"``."""
+    """Prefill or decode capture scope (both routes): ``phase`` is
+    ``"prefill"`` (with the runner's ``req_slots``, which every
+    :func:`capture_one` inside uses) or ``"decode"``."""
+    global _scope
     if phase == "prefill":
         if req_slots is None:
             raise ValueError("[Foundry] capture_scope('prefill') needs req_slots")
-        return prefill_capture_scope(model, req_slots)
-    if phase == "decode":
-        return decode_capture_scope(model)
-    raise ValueError(f"[Foundry] capture_scope: unknown phase {phase!r}")
+        inner = _prefill_capture_scope(model, req_slots)
+    elif phase == "decode":
+        req_slots = None
+        inner = _decode_capture_scope(model)
+    else:
+        raise ValueError(f"[Foundry] capture_scope: unknown phase {phase!r}")
+    if _scope is not None:
+        raise RuntimeError(f"[Foundry] capture_scope({phase!r}) inside capture_scope{_scope}")
+    _scope = (phase, req_slots)
+    try:
+        with inner:
+            yield
+    finally:
+        _scope = None
 
 
 def shared_read_ends_override(runner, attn_backend, forward_mode):
@@ -808,11 +806,7 @@ def _patch_cuda_graph_capture() -> None:
                 post_warmup_hook=post_warmup_hook,
             )
         graph, out = capture_one(
-            shape_key,
-            forward_fn,
-            pool=self._pool,
-            stream=self._capture_stream,
-            prefill_req_slots=_prefill_req_slots(self),
+            shape_key, forward_fn, pool=self._pool, stream=self._capture_stream
         )
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
@@ -825,13 +819,13 @@ def _patch_cuda_graph_capture() -> None:
                 f"got {self.prefill_backend_name!r}: use --cuda-graph-backend-prefill "
                 "full or disabled"
             )
-        with prefill_capture_scope(self.model_runner.model, self._capture_req_slots):
+        with capture_scope("prefill", self.model_runner.model, self._capture_req_slots):
             return orig_prefill_capture(self)
 
     @functools.wraps(orig_capture)
     def patched(self):
         reject_unsupported_decode_runner(self)
-        with decode_capture_scope(self.model_runner.model):
+        with capture_scope("decode", self.model_runner.model):
             return orig_capture(self)
 
     @functools.wraps(orig_resolve_ends)
