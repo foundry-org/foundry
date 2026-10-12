@@ -56,8 +56,8 @@ plugin_route_only = pytest.mark.skipif(sglang_has_adapter(), reason=PLUGIN_ONLY_
 def foundry_launch(base_env, mode=None, toml=None):
     """(env, extra server args) for a native (``mode=None``) or a Foundry SAVE /
     LOAD launch on the installed sglang's route. A Foundry launch first passes
-    the preflight the recipe scripts run (route-aware, ``--save`` / ``--load``);
-    a failure fails the test rather than letting the engine run natively."""
+    preflight (route-aware, ``--save`` / ``--load``); a failure fails the test
+    rather than letting the engine run natively."""
     env = {k: v for k, v in base_env.items() if k != CONFIG_ENV}
     if mode is None:
         return env, []

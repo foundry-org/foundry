@@ -65,7 +65,7 @@ _LOADED = re.compile(r"\[Foundry\] Loaded (\d+) SGLang graphs in ([0-9.]+)s")
 _SAVE_OFFSET = re.compile(r"\[Foundry\] SGLang final_alloc_offset=(\d+)")
 _LOAD_OFFSET = re.compile(r"\[Foundry\] SGLang alloc_offset\[after_load_all_graphs\]=(\d+)")
 
-# Identical on native, SAVE and LOAD (recipe/sglang/serve_common.sh): NCCL buffers through the plain allocator, and
+# Identical on native, SAVE and LOAD: NCCL buffers through the plain allocator, and
 # no rank-0-only DeepGEMM precompile inside the deterministic range.
 _COMMON_ENV = {
     "NCCL_CUMEM_ENABLE": "0",
