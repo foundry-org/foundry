@@ -1,6 +1,6 @@
 #!/bin/bash
 # Qwen3.5-35B-A3B (MoE hybrid). Usage: bash serve_qwen3.5-35ba3b.sh <tp2|tp4|ep2|ep4|ep8|tpep2|tpep4> [--save|--load]
-# Validated (2026-09-16, 8xH100), 256 decode graphs: tp/ep/tpep at 0.8; ep8 at 0.6. tpep8 not offered (LOAD OOM).
+# Validated (2026-09-16, 8xH100), 256 decode graphs: tp/ep/tpep at 0.8; ep8 at 0.6. Any size passes through.
 # No mode = plain SGLang. MAXBS / MEMFRAC / PORT / SGL_EXTRA_ARGS override.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFG=${1:?Usage: $0 <tpN|epN|tpepN> [--save|--load]}
@@ -15,14 +15,14 @@ esac
 MAXBS=${MAXBS:-256}
 GRAPHS=(--cuda-graph-max-bs-decode "$MAXBS" --disable-cuda-graph-padding --cuda-graph-backend-prefill disabled)
 case "$CFG" in
-  tp2|tp4) N=${CFG#tp}; TOPO=(--tp-size "$N"); MEMFRAC_DEFAULT=0.8 ;;
-  ep2|ep4|ep8) N=${CFG#ep}
+  tp[0-9]*) N=${CFG#tp}; TOPO=(--tp-size "$N"); MEMFRAC_DEFAULT=0.8 ;;
+  ep[0-9]*) N=${CFG#ep}
     TOPO=(--tp-size "$N" --dp-size "$N" --ep-size "$N" --enable-dp-attention
           --moe-a2a-backend deepep --deepep-mode low_latency --moe-runner-backend deep_gemm
           --chunked-prefill-size 256 --attention-backend fa3 --max-running-requests $((256 * N)))
     export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512 NVSHMEM_QP_DEPTH=2048
     if [[ "$CFG" == ep8 ]]; then MEMFRAC_DEFAULT=0.6; else MEMFRAC_DEFAULT=0.8; fi ;;
-  tpep2|tpep4) N=${CFG#tpep}
+  tpep[0-9]*) N=${CFG#tpep}
     TOPO=(--tp-size "$N" --ep-size "$N"
           --moe-a2a-backend deepep --deepep-mode low_latency --moe-runner-backend deep_gemm
           --chunked-prefill-size 256 --attention-backend fa3 --max-running-requests $((256 * N)))
@@ -30,7 +30,7 @@ case "$CFG" in
             --disable-cuda-graph-padding --cuda-graph-backend-prefill disabled)
     export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512 NVSHMEM_QP_DEPTH=2048
     MEMFRAC_DEFAULT=0.8 ;;
-  *) echo "unknown topology '$CFG' (tp2|tp4|ep2|ep4|ep8|tpep2|tpep4)"; exit 1 ;;
+  *) echo "unknown topology '$CFG' (tpN|epN|tpepN)"; exit 1 ;;
 esac
 export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
 export SGLANG_JIT_DEEPGEMM_PRECOMPILE="${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-0}"

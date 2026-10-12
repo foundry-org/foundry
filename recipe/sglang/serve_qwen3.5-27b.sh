@@ -14,9 +14,9 @@ case "${2:-}" in
 esac
 case "$CFG" in
   single)    N=1; TOPO=(--tp-size 1) ;;
-  dp2|dp4|dp8) N=${CFG#dp}; TOPO=(--tp-size 1 --dp-size "$N") ;;
-  tp2|tp4|tp8) N=${CFG#tp}; TOPO=(--tp-size "$N") ;;
-  *) echo "unknown topology '$CFG' (single|dp2|dp4|dp8|tp2|tp4|tp8)"; exit 1 ;;
+  dp[0-9]*) N=${CFG#dp}; TOPO=(--tp-size 1 --dp-size "$N") ;;
+  tp[0-9]*) N=${CFG#tp}; TOPO=(--tp-size "$N") ;;
+  *) echo "unknown topology '$CFG' (single|dpN|tpN)"; exit 1 ;;
 esac
 export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
 [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] && export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((N - 1)))

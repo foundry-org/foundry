@@ -40,7 +40,8 @@ recipe/sglang/
 ├── serve_qwen3.5-27b.sh            # Qwen3.5-27B          dense hybrid; single, dp2-8, tp2-8
 ├── serve_qwen3.5-35ba3b.sh         # Qwen3.5-35B-A3B      MoE hybrid; tp2/tp4, ep2-8, tpep2/tpep4
 ├── serve_qwen3.5-122ba10b.sh       # Qwen3.5-122B-A10B    MoE hybrid, FP8 (default) or bf16; ep4, tpep4, tp2ep4, ep8, tp4ep8
-└── serve_deepseek-v4-flash.sh      # DeepSeek-V4-Flash    sgl-project FP8 checkpoint; ep8 (DP attention + DeepEP)
+├── serve_deepseek-v4-flash.sh      # DeepSeek-V4-Flash    sgl-project FP8 checkpoint; epN (DP attention + DeepEP)
+└── serve_glm-5.3-flash.sh          # GLM-5.3-Flash (FP8)  epN (DP attention + DeepEP, DSA)
 ```
 
 Every script accepts the same trailing `--save` / `--load` flag. Scripts that scale
@@ -56,7 +57,8 @@ bash serve_qwen3-30ba3bfp8_ep_v2.sh    <ep_size>   [--save|--load]
 bash serve_qwen3.5-27b.sh              <cfg>       [--save|--load]     # see "Qwen3.5 and DeepSeek" below
 bash serve_qwen3.5-35ba3b.sh           <cfg>       [--save|--load]
 bash serve_qwen3.5-122ba10b.sh         <cfg>       [--save|--load]
-bash serve_deepseek-v4-flash.sh        ep8         [--save|--load]
+bash serve_deepseek-v4-flash.sh        <epN>       [--save|--load]     # ep4, ep8, ...: no GPU-count check in the script
+bash serve_glm-5.3-flash.sh            <epN>       [--save|--load]
 ```
 
 Without `--save`/`--load` a script runs plain SGLang (the baseline). `SGL_EXTRA_ARGS`
@@ -276,8 +278,10 @@ bash serve_qwen3.5-122ba10b.sh tp4ep8 --save                             # 8 GPU
 bash serve_qwen3.5-122ba10b.sh tp4ep8 --load
 
 rm -rf foundry_archive
-bash serve_deepseek-v4-flash.sh ep8 --save                               # 8 GPUs, sgl-project/DeepSeek-V4-Flash-FP8
-bash serve_deepseek-v4-flash.sh ep8 --load
+bash serve_deepseek-v4-flash.sh ep4 --save                               # 4 GPUs (ep8 on 8); sgl-project/DeepSeek-V4-Flash-FP8
+bash serve_deepseek-v4-flash.sh ep4 --load
+bash serve_glm-5.3-flash.sh ep4 --save                                    # 4 GPUs (ep8 on 8); zai-org/GLM-5.3-Flash
+bash serve_glm-5.3-flash.sh ep4 --load
 ```
 
 Measured on 8×H100 (2026-09-16/17, fork `6272eb04c5`, foundry `coldstart` `f0700cf`; time to `/health` from
@@ -322,8 +326,8 @@ Model notes:
 - **DeepSeek-V4-Flash.** On Hopper the stock checkpoint's FP4 experts are served TP-only by sglang; the all-FP8
   conversion `sgl-project/DeepSeek-V4-Flash-FP8` is the one that runs DP attention + DeepEP, and it is what the
   script uses. sglang's `dsv4` attention backend has a KV page of 256, and the DP-attention prefill chunk is divided
-  by `dp`, hence `--chunked-prefill-size 2048`. The attention-TP hybrids of this checkpoint fail in sglang's
-  weight loading (expert shard mismatch), so only `ep8` is offered. DeepSeek-V4.1-Flash is not in the fork's sglang
+  by `dp`, hence `--chunked-prefill-size 2048`. The script takes any `<epN>` (validated ep4 on 4xH200, ep8 on
+  8xH200) and passes it through; if a layout does not fit, sglang reports it. DeepSeek-V4.1-Flash is not in the fork's sglang
   tree. The script exports `SGLANG_DSV4_FP4_EXPERTS=0`: sglang assumes FP4 experts for DeepSeek-V4 unless it can
   probe a safetensors shard header, and without that probe (dummy weights) it builds FP4 experts that Hopper
   DeepGEMM rejects (`kPackedFP4 and (arch_major == 10 or 12)`). Validated on 8xH200 with dummy weights: SAVE 222 s,

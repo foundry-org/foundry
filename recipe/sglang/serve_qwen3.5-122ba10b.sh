@@ -1,10 +1,10 @@
 #!/bin/bash
-# Qwen3.5-122B-A10B (MoE hybrid), FP8 by default; SGL_MODEL=Qwen/Qwen3.5-122B-A10B for bf16 (8 GPUs only).
-# Usage: bash serve_qwen3.5-122ba10b.sh <ep4|tpep4|tp2ep4|ep8|tp4ep8> [--save|--load]
+# Qwen3.5-122B-A10B (MoE hybrid), FP8 by default; SGL_MODEL=Qwen/Qwen3.5-122B-A10B for bf16.
+# Usage: bash serve_qwen3.5-122ba10b.sh <epN|tpepN|tpAepN> [--save|--load]
 # Validated (2026-09-17, 8xH100): FP8 ep4/tpep4/tp2ep4 at 0.6; ep8 at 0.79 with MAXBS=64; tp4ep8 at 0.65.
 # --max-mamba-cache-size caps the GDN state pool (and thus graphs/rank); see README "Qwen3.5 and DeepSeek".
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CFG=${1:?Usage: $0 <ep4|tpep4|tp2ep4|ep8|tp4ep8> [--save|--load]}
+CFG=${1:?Usage: $0 <epN|tpepN|tpAepN> [--save|--load]}
 MODEL_PATH="${SGL_MODEL:-Qwen/Qwen3.5-122B-A10B-FP8}"
 PERSIST=()
 case "${2:-}" in
@@ -12,29 +12,29 @@ case "${2:-}" in
   --load) PERSIST=(--cuda-graph-persistence load --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml")
           export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
   "") ;;
-  *) echo "Usage: $0 <ep4|tpep4|tp2ep4|ep8|tp4ep8> [--save|--load]"; exit 1 ;;
+  *) echo "Usage: $0 <epN|tpepN|tpAepN> [--save|--load]"; exit 1 ;;
 esac
 if [[ "$CFG" == ep8 && "$MODEL_PATH" == *FP8* ]]; then MAXBS=${MAXBS:-64}; MAMBA=64; else MAMBA=256; fi
 MAXBS=${MAXBS:-256}
 GRAPHS=(--cuda-graph-max-bs-decode "$MAXBS" --disable-cuda-graph-padding --cuda-graph-backend-prefill disabled)
 case "$CFG" in
-  ep4|ep8) N=${CFG#ep}
+  ep[0-9]*) N=${CFG#ep}
     TOPO=(--tp-size "$N" --dp-size "$N" --ep-size "$N" --enable-dp-attention
           --moe-a2a-backend deepep --deepep-mode low_latency --moe-runner-backend deep_gemm
           --chunked-prefill-size 256 --attention-backend fa3 --max-running-requests $((256 * N))) ;;
-  tpep4) N=4
-    TOPO=(--tp-size 4 --ep-size 4
+  tpep[0-9]*) N=${CFG#tpep}
+    TOPO=(--tp-size "$N" --ep-size "$N"
           --moe-a2a-backend deepep --deepep-mode low_latency --moe-runner-backend deep_gemm
-          --chunked-prefill-size 256 --attention-backend fa3 --max-running-requests 1024)
-    GRAPHS=(--cuda-graph-max-bs-decode $((MAXBS * 4)) --cuda-graph-bs-decode $(seq -s' ' 4 4 $((MAXBS * 4)))
+          --chunked-prefill-size 256 --attention-backend fa3 --max-running-requests $((256 * N)))
+    GRAPHS=(--cuda-graph-max-bs-decode $((MAXBS * N)) --cuda-graph-bs-decode $(seq -s' ' "$N" "$N" $((MAXBS * N)))
             --disable-cuda-graph-padding --cuda-graph-backend-prefill disabled) ;;
-  tp2ep4|tp2ep8|tp4ep8) ATP=${CFG%%ep*}; ATP=${ATP#tp}; N=${CFG##*ep}
+  tp[0-9]*ep[0-9]*) ATP=${CFG%%ep*}; ATP=${ATP#tp}; N=${CFG##*ep}
     TOPO=(--tp-size "$N" --dp-size $((N / ATP)) --ep-size "$N" --enable-dp-attention
           --moe-a2a-backend deepep --deepep-mode low_latency --moe-runner-backend deep_gemm
           --chunked-prefill-size 256 --attention-backend fa3 --max-running-requests $((256 * N)))
     GRAPHS=(--cuda-graph-max-bs-decode $((MAXBS * ATP)) --cuda-graph-bs-decode $(seq -s' ' "$ATP" "$ATP" $((MAXBS * ATP)))
             --disable-cuda-graph-padding --cuda-graph-backend-prefill disabled) ;;
-  *) echo "unknown topology '$CFG' (ep4|tpep4|tp2ep4|ep8|tp4ep8)"; exit 1 ;;
+  *) echo "unknown topology '$CFG' (epN|tpepN|tpAepN)"; exit 1 ;;
 esac
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512 NVSHMEM_QP_DEPTH=2048
 case "$CFG" in
