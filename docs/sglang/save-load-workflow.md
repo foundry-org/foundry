@@ -10,13 +10,11 @@ HOST="0.0.0.0"
 PORT=12000
 MEM_FRACTION_STATIC=0.6
 
-# No LD_PRELOAD / PYTHONPATH here: foundry + sglang are pip-installed in one venv
-# (installing foundry registers its sglang plugin entry point; a PYTHONPATH checkout
-# does not), and foundry's setup_ld_preload_env auto-detects libcuda_hook.so and
-# LD_PRELOADs it into every worker at spawn time.
+# No LD_PRELOAD / PYTHONPATH here: sglang (with the Foundry adapter) and foundry
+# (sglang[foundry]) are pip-installed in one venv, and Foundry sets LD_PRELOAD
+# around every worker at spawn time (libcuda_hook.so auto-detected).
 
-# Foundry is an sglang plugin, switched on by this variable (no CLI flag).
-export FOUNDRY_GRAPH_EXTENSION_CONFIG="$FOUNDRY_TOML"
+# Foundry is switched on by sglang's own flags; the mode is the flag's, not the TOML's.
 sglang serve \
     --model-path "$MODEL_NAME" \
     --trust-remote-code \
@@ -25,36 +23,38 @@ sglang serve \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --disable-radix-cache \
     --attention-backend flashinfer \
-    --cuda-graph-max-bs-decode 512
+    --cuda-graph-max-bs-decode 512 \
+    --cuda-graph-persistence save \
+    --cuda-graph-persistence-config recipe/sglang/foundry.toml
 ```
 
-The recipe scripts wrap this: they export the variable for `--save` / `--load` only, run
-`python -m foundry.integration.sglang.preflight` first (sglang plugin surface, the `foundry`
-entry point, `SGLANG_PLUGINS`, the TOML and, on LOAD, the archive), and after `/health` check
-the engine log for `[Foundry] sglang plugin active` (and `[Foundry] Loaded N SGLang graphs` on
-LOAD). SGLang runs natively without an error when the entry point is not registered in the
-serving venv or `SGLANG_PLUGINS` omits `foundry`; see
-[`recipe/sglang/README.md`](../../recipe/sglang/README.md#foundry-plugin-activation-and-checks).
+The recipe scripts are exactly this shape: `--save` / `--load` appends the two
+`--cuda-graph-persistence` arguments above, no mode runs plain SGLang. If Foundry is not
+installed (or its integration API major mismatches), SGLang stops at startup with the
+reason instead of running natively; see
+[`recipe/sglang/README.md`](../../recipe/sglang/README.md#activation---cuda-graph-persistence).
 
-The command carries no collective or graph-memory flags: the plugin pins custom all-reduce off, torch symm-mem
-all-reduce on, the NCCL registration / cuMem / NVLS variables and the other unreplayable features itself, and stops
-the launch if one was set to the contrary ([`overview.md`](overview.md#what-the-plugin-pins-and-why)).
+On SAVE / LOAD, Foundry's resolution hooks pin the configs that select unreplayable state
+(NCCL registration / cuMem / NVLS, DeepGEMM precompile, and the rest) and stop the launch
+if one was set to the contrary ([`overview.md`](overview.md#what-the-plugin-pins-and-why));
+the scripts pass the collective flags (`--disable-custom-all-reduce --enable-torch-symm-mem`)
+in every mode so baseline, SAVE and LOAD capture the same graph set.
 
 `--cuda-graph-max-bs-decode 512` is the closest analogue to vLLM's `--max-num-seqs 512` — it drives `capture_bs` to span a similar range of decode batch sizes (52 batch sizes from 1 → 512).
 
 ## TOML configs
 
-`recipe/sglang/foundry_save.toml`:
+One shared `recipe/sglang/foundry.toml` for SAVE and LOAD (the mode comes from
+`--cuda-graph-persistence`; a `mode` key in the TOML is ignored on that route):
 
 ```toml
-mode = "save"
 base_addr = 0x600000000000
 region_size = "256GB"
 workspace_root = "foundry_archive"
 scratch_space_size = "1024MB"
 ```
 
-`foundry_load.toml` is identical except `mode = "load"`. See [`memory-lifecycle.md`](memory-lifecycle.md) for the field semantics.
+See [`memory-lifecycle.md`](memory-lifecycle.md) for the field semantics.
 
 ## Run sequence
 

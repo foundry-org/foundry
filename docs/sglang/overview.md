@@ -24,11 +24,11 @@ same code as the plugin's (`plugin.py`, `hooks.py`); only the messages name the 
 
 **Expert parallel (DeepEP).** The default EP recipe runs DP-attention + DeepEP for the
 MoE all-to-all (NVSHMEM, foundry-compatible); TP attention + EP (`serve_qwen3-30ba3b_ep_tpattn.sh`,
-the `tpepN` / `tpAepN` topologies of `serve_common.sh`) routes the attention all-reduce
+the `tpepN` / `tpAepN` topologies of the Qwen3.5 serve scripts) routes the attention all-reduce
 through torch symmetric memory. The serve script is `recipe/sglang/serve_qwen3-30ba3b_ep.sh
 <ep_size> [--save|--load]` with: `--enable-dp-attention --moe-a2a-backend deepep
 --deepep-mode low_latency --moe-runner-backend deep_gemm --attention-backend fa3`
-(custom all-reduce off and torch symm-mem on come from the plugin's pins). The EP kernels (`sgl-deep-ep`, `sgl-deep-gemm`, fa3 inside
+(the script passes custom all-reduce off and torch symm-mem on in every mode; Foundry pins the same values on SAVE / LOAD). The EP kernels (`sgl-deep-ep`, `sgl-deep-gemm`, fa3 inside
 `sglang-kernel`) come as wheels with the sglang install. `fa3` is used because the
 flashinfer ragged-prefill path has an off-by-one (`q.shape != qo_indptr`) under this
 config. DeepEP low-latency caps dispatch at
@@ -110,28 +110,29 @@ pip install foundry-core                                   # prebuilt wheel (see
 pushd foundry && pip install -e . --no-build-isolation && popd
 ```
 
-Install it into the venv that runs `sglang serve`. On the dependency route the same package comes in as `pip install "sglang[foundry]"`. The install registers the plugin entry point; a `PYTHONPATH` source checkout does not, and SGLang then runs natively without an error even with `FOUNDRY_GRAPH_EXTENSION_CONFIG` set (as it does when `SGLANG_PLUGINS` is set without `foundry`). Check with `python -m foundry.integration.sglang.preflight --toml <toml> --save|--load`, which the recipe scripts run before every SAVE / LOAD.
+Install it into the venv that runs `sglang serve`. On the dependency route the same package comes in as `pip install "sglang[foundry]"`. To check an install before serving, run `python -P -m foundry.integration.sglang.preflight --toml recipe/sglang/foundry.toml --save|--load` (the recipe scripts no longer run it; SGLang itself fails at startup when Foundry is missing or the integration API major mismatches).
 
 ### 2. Write a TOML config
 
 ```toml
-# recipe/sglang/foundry_save.toml
-mode = "save"
+# recipe/sglang/foundry.toml (shared by SAVE and LOAD; the mode comes from
+# --cuda-graph-persistence, a `mode` key here is ignored on that route)
 base_addr = 0x600000000000
 region_size = "256GB"
 workspace_root = "foundry_archive"
 scratch_space_size = "1024MB"
 ```
 
-The matching `foundry_load.toml` just changes `mode = "load"`. See [`memory-lifecycle.md`](memory-lifecycle.md) for what each field controls.
+See [`memory-lifecycle.md`](memory-lifecycle.md) for what each field controls.
 
 ### 3. Run SAVE, then LOAD
 
 ```bash
-# SAVE (the script exports FOUNDRY_GRAPH_EXTENSION_CONFIG=recipe/sglang/foundry_save.toml)
+# SAVE (the script appends --cuda-graph-persistence save
+#       --cuda-graph-persistence-config recipe/sglang/foundry.toml)
 rm -rf foundry_archive
 bash recipe/sglang/serve_qwen3-mini.sh --save
-# Wait for "[Foundry verify] plugin active in N process(es)", then SIGTERM the server.
+# Wait for "Application startup complete", then SIGTERM the server.
 
 # LOAD
 bash recipe/sglang/serve_qwen3-mini.sh --load
