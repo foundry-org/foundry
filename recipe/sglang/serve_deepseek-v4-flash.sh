@@ -1,23 +1,30 @@
 #!/bin/bash
-# DeepSeek-V4-Flash, expert parallel over 8 GPUs (DP attention + DeepEP low-latency + DeepGEMM).
+# DeepSeek-V4-Flash (sgl-project FP8 conversion), EP over 8 GPUs: DP-attention + DeepEP + DeepGEMM.
 # Usage: CUDA_VISIBLE_DEVICES=0-7 bash serve_deepseek-v4-flash.sh ep8 [--save|--load]
-# Validated (2026-09-17, 8xH100): ep8 at 0.7, 256 decode graphs per rank; capture 107 s -> restore 5.7 s, identical
-# greedy output and TPOT.
-#
-# Checkpoint: sgl-project/DeepSeek-V4-Flash-FP8 (all-FP8 conversion). The stock deepseek-ai checkpoint ships FP4
-# experts, which sglang serves TP-only on Hopper (no DeepEP/EP path), so it cannot use this topology on H100.
-# Attention: sglang's own DeepSeek-V4 backend (dsv4, KV page 256); under DP attention the prefill chunk is divided by
-# dp and must stay a multiple of the page, hence --chunked-prefill-size 2048 on 8 ranks.
-# The attention-TP hybrids (tp2ep4, tp4ep8) fail in sglang's weight loading for this checkpoint (expert shard
-# mismatch) and are not offered.
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/serve_common.sh"
-MODEL_PATH="${SGL_MODEL:-sgl-project/DeepSeek-V4-Flash-FP8}"
-# This conversion has FP8 experts. sglang's DeepSeek-V4 path assumes FP4 experts unless a probe of one safetensors
-# shard header says otherwise; when the probe cannot run (dummy weights, configs-only cache) FP4 stays on and
-# Hopper DeepGEMM rejects the FP4 operand. Declare the layout instead of relying on the probe.
+# Validated (2026-09-17, 8xH100): ep8 at 0.7, 256 decode graphs/rank. Only ep8 is offered
+# (attention-TP hybrids fail in sglang weight loading; stock FP4 checkpoint has no EP path on Hopper).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ "${1:-}" == ep8 ]] || { echo "Usage: $0 ep8 [--save|--load]"; exit 1; }
+PERSIST=()
+case "${2:-}" in
+  --save) PERSIST=(--cuda-graph-persistence save --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml") ;;
+  --load) PERSIST=(--cuda-graph-persistence load --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml")
+          export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
+  "") ;;
+  *) echo "Usage: $0 ep8 [--save|--load]"; exit 1 ;;
+esac
+export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE="${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-0}"
 export SGLANG_DSV4_FP4_EXPERTS="${SGLANG_DSV4_FP4_EXPERTS:-0}"
-EP_ATTN=""        # sglang picks the dsv4 backend
-EP_CHUNK=2048
-memfrac_default() { echo 0.7; }
-[[ "${1:-}" == ep8 ]] || { echo "Usage: $0 ep8 [--save|--load] (validated topology: ep8)"; exit 1; }
-serve_main "$@"
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512 NVSHMEM_QP_DEPTH=2048
+[[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] && export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+exec sglang serve \
+  --model-path "${SGL_MODEL:-sgl-project/DeepSeek-V4-Flash-FP8}" \
+  --trust-remote-code --host 0.0.0.0 --port "${PORT:-12000}" \
+  --disable-radix-cache --mem-fraction-static "${MEMFRAC:-0.7}" \
+  --tp-size 8 --dp-size 8 --ep-size 8 --enable-dp-attention \
+  --moe-a2a-backend deepep --deepep-mode low_latency --moe-runner-backend deep_gemm \
+  --chunked-prefill-size 2048 --max-running-requests 2048 \
+  --cuda-graph-max-bs-decode "${MAXBS:-256}" --disable-cuda-graph-padding --cuda-graph-backend-prefill disabled \
+  --disable-custom-all-reduce --enable-torch-symm-mem \
+  "${PERSIST[@]}" ${SGL_EXTRA_ARGS:-}

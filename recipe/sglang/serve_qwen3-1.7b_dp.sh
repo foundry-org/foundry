@@ -1,48 +1,23 @@
 #!/bin/bash
 # Qwen3-1.7B, data parallel (one full replica per DP rank).
 # Usage: CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-1.7b_dp.sh <dp_size> [--save|--load]
-# SGL_EXTRA_ARGS: extra `sglang serve` flags appended verbatim (e.g. \"--cuda-graph-backend-prefill disabled\").
-
+# No mode = plain SGLang. Archive: ./foundry_archive (foundry.toml).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/serve_common.sh"   # foundry_select / foundry_serve (plugin route + preflight)
-
 DP_SIZE=${1:?Usage: $0 <dp_size> [--save|--load]}
-MODEL_NAME="Qwen/Qwen3-1.7B"
-HOST="0.0.0.0"
-PORT=12000
-MEM_FRACTION_STATIC=0.6
-
-if [[ "$2" == "--save" ]]; then
-    FOUNDRY_TOML="${SCRIPT_DIR}/foundry_save.toml"
-    echo "Using foundry SAVE: ${FOUNDRY_TOML}"
-elif [[ "$2" == "--load" ]]; then
-    FOUNDRY_TOML="${SCRIPT_DIR}/foundry_load.toml"
-    echo "Using foundry LOAD: ${FOUNDRY_TOML}"
-elif [[ -n "$2" ]]; then
-    echo "Usage: $0 <dp_size> [--save|--load]"
-    exit 1
-else
-    echo "Running without foundry (baseline SGLang)"
-fi
-
-# --save/--load: export FOUNDRY_GRAPH_EXTENSION_CONFIG="$FOUNDRY_TOML" after the preflight; baseline: unset it.
-foundry_select "$2" "${FOUNDRY_TOML:-}"
-foundry_baseline_pins   # every mode: TORCHDYNAMO_DISABLE=1; baseline only: the plugin's collective pins, see serve_common.sh
-
-# LD_PRELOAD of libcuda_hook.so is set by foundry's setup_ld_preload_env at
-# worker spawn time (path auto-detected; propagated to the DP controller and
-# every rank's scheduler child). Assumes foundry + sglang are
-# pip-installed (see README) so both import without PYTHONPATH.
-
-foundry_serve "$2" sglang serve \
-    --model-path "$MODEL_NAME" \
-    --trust-remote-code \
-    --host "$HOST" --port "$PORT" \
-    --tp-size 1 \
-    --dp-size "$DP_SIZE" \
-    --mem-fraction-static "$MEM_FRACTION_STATIC" \
-    --disable-radix-cache \
-    --attention-backend flashinfer \
-    --cuda-graph-max-bs-decode 512 \
-    $FOUNDRY_BASELINE_ARGS \
-    ${SGL_EXTRA_ARGS:-}
+PERSIST=()
+case "${2:-}" in
+  --save) PERSIST=(--cuda-graph-persistence save --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml") ;;
+  --load) PERSIST=(--cuda-graph-persistence load --cuda-graph-persistence-config "$SCRIPT_DIR/foundry.toml")
+          export FOUNDRY_MMAP_ARCHIVE="${FOUNDRY_MMAP_ARCHIVE:-1}" ;;
+  "") ;;
+  *) echo "Usage: $0 <dp_size> [--save|--load]"; exit 1 ;;
+esac
+export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
+[[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] && export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((DP_SIZE - 1)))
+exec sglang serve \
+  --model-path "${SGL_MODEL:-Qwen/Qwen3-1.7B}" \
+  --trust-remote-code --host 0.0.0.0 --port "${PORT:-12000}" \
+  --tp-size 1 --dp-size "$DP_SIZE" --mem-fraction-static 0.6 --disable-radix-cache \
+  --attention-backend flashinfer --cuda-graph-max-bs-decode 512 \
+  --disable-custom-all-reduce --enable-torch-symm-mem \
+  "${PERSIST[@]}" ${SGL_EXTRA_ARGS:-}

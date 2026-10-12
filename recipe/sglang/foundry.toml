@@ -1,4 +1,5 @@
-mode = "save"
+# Shared Foundry config for every recipe in this directory.
+# The mode comes from --cuda-graph-persistence {save,load}; a `mode` key here is ignored.
 base_addr = 0x600000000000
 region_size = "256GB"
 workspace_root = "foundry_archive"
@@ -7,10 +8,6 @@ scratch_space_size = "1024MB"
 # torch-bundled nvidia-nvshmem wheel (like it auto-detects libcuda_hook.so), so
 # leave this unset. Set it only to override that with a custom NVSHMEM build:
 # nvshmem_host_path = "/abs/path/to/libnvshmem_host.so.3"
-
-# Bare host (no container) where /dev/infiniband/uverbs* exist but open() is
-# denied: DeepEP's first NVSHMEM init waits 5 s per HCA for udev (~40 s per
-# engine). Point this at the preload shim built from tools/host/no_cdev_wait.c
-# (`make -C tools/host`) and Foundry adds it to LD_PRELOAD next to libcuda_hook.so.
-# See docs/bare-host-verbs-udev-wait.md. Leave unset in containers / with usable HCAs.
+# Bare host (no container) with unusable /dev/infiniband/uverbs*: see
+# docs/bare-host-verbs-udev-wait.md, then set:
 # verbs_udev_wait_shim_path = "/abs/path/to/libno_cdev_wait.so"
