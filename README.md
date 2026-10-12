@@ -93,7 +93,7 @@ windows). Every SGLang configuration is validated with the full decode-graph set
 (batch sizes 1..256) for restore time, per-token latency and greedy-output
 equality against unmodified SGLang; see [`recipe/sglang/README.md`](recipe/sglang/README.md#validation).
 
-The adapted SGLang fork is published at [`foundry-org/sglang`](https://github.com/foundry-org/sglang), branch `foundry` (current head `6272eb04c5` = upstream `main` 03ea13a545 + one integration commit; the v0.0.3 pairing `f1d688e52` is kept as `foundry-0.0.3`, the 0.0.2-era integration on `foundry-0.0.2`). The vLLM and TensorRT-LLM forks will follow at `foundry-org/vllm` and `foundry-org/TensorRT-LLM`.
+The adapted SGLang fork is published at [`foundry-org/sglang`](https://github.com/foundry-org/sglang), branch `foundry-dep`: SGLang declares Foundry as an optional dependency (`sglang[foundry]`) and calls it through its in-tree adapter when `--cuda-graph-persistence` is set. See the [SGLang recipe](recipe/sglang/README.md) for the supported versions.
 
 ### Performance
 
@@ -147,7 +147,7 @@ pip install "foundry-core>=0.1.0rc2,<0.2" --extra-index-url https://foundry-org.
 ```
 
 The wheel ships `foundry/ops.*.so` and `foundry/libcuda_hook.so` (the hook
-SGLang/vLLM preload) and registers the SGLang plugin entry point. No Boost or
+SGLang/vLLM preload around their workers). No Boost or
 other C++ runtime dependency is needed. Every wheel is also attached to the
 [GitHub Release](https://github.com/foundry-org/foundry/releases).
 
@@ -187,155 +187,14 @@ With the flag on, every LOAD also logs a per-graph check that the restored
 edge records (PDL programmatic edges) survived insertion; see
 [`docs/pdl-edge-batching.md`](docs/pdl-edge-batching.md).
 
-## Quick Start
+## Usage
 
-### Graph Capture and Save
-
-Foundry requires LD_PRELOAD to intercept CUDA driver calls. The graph capture and save must run in a subprocess with the hook library preloaded.
-
-```python
-import foundry as fdry
-import torch
-
-torch.cuda.init()
-device = torch.device('cuda:0')
-torch.set_default_device(device)
-
-# Set up VMM allocation region for deterministic memory addresses
-BASE_ADDR = 0x400000000000
-region_size = fdry.parse_size('1GB')
-fdry.set_allocation_region(BASE_ADDR, region_size)
-
-# Allocate input tensors
-input_a = torch.full((100, 100), 2.0, device=device)
-input_b = torch.full((100, 100), 3.0, device=device)
-
-# Warm up the model
-model = MyModel()
-model(input_a, input_b)
-torch.cuda.synchronize()
-
-# Capture CUDA graph
-graph = fdry.CUDAGraph()
-with fdry.graph(graph):
-    result = model(input_a, input_b)
-
-# Replay and verify
-graph.replay()
-torch.cuda.synchronize()
-
-# Save graph with output tensors
-# Produces BOTH graph.json and graph.cugraph (optimized binary format)
-graph.save('graph.json', output_tensors=result)
-
-fdry.stop_allocation_region()
-```
-
-### Graph Load and Replay
-
-Loading a saved graph also requires LD_PRELOAD and must use the same allocation region base address.
-
-```python
-import foundry as fdry
-import torch
-
-torch.cuda.init()
-device = torch.device('cuda:0')
-torch.set_default_device(device)
-
-# Load CUDA modules and libraries from archive
-fdry.load_cuda_modules_and_libraries('hook_archive')
-
-# Set up the same allocation region as capture
-BASE_ADDR = 0x400000000000
-region_size = fdry.parse_size('1GB')
-fdry.set_allocation_region(BASE_ADDR, region_size)
-
-# Allocate input tensors (can have different values)
-input_a = torch.full((100, 100), 5.0, device=device)
-input_b = torch.full((100, 100), 3.0, device=device)
-
-# Load and replay the graph (NOTE: auto-loads .cugraph binary when available)
-graph, output_tensor = fdry.CUDAGraph.load('graph.json')
-graph.replay()
-torch.cuda.synchronize()
-
-# output_tensor now contains the result
-fdry.stop_allocation_region()
-```
-
-### Async Graph Loading
-
-Load graphs asynchronously with background template building. Graphs with the same topology share a single `CUgraphExec` template — only node parameters are updated before each launch (on-demand replay). Two finish APIs are available:
-
-- `finish_graph_loads(pending)` — bulk, waits for all templates then returns the full list. Simplest call shape.
-- `finish_one_graph_load(pending, index)` — per-graph; first call waits on background build completion, later calls just finalize. Use this when you want to interleave finalization with other work (the foundry vLLM integration uses it to walk the same VMM cursor trajectory on LOAD that SAVE recorded).
-
-```python
-import foundry as fdry
-
-# Phase 1: parse .cugraph binaries + build topology groups + templates in background
-pending = fdry.CUDAGraph.start_graph_builds(
-    ["graph_0.json", "graph_1.json", ...], num_threads=24
-)
-
-# Background threads now race against whatever the caller does next.
-# In practice we found that overlapping with model weight loading is
-# net-negative (driver contention), so the vLLM integration kicks off
-# start_graph_builds *after* weight load and lets it overlap with the
-# cheaper post-load init phases instead.
-
-# Bulk finish:
-results = fdry.CUDAGraph.finish_graph_loads(pending)
-for graph, output in results:
-    graph.replay()
-
-# OR per-graph finish (interleavable):
-# for i in range(num_graphs):
-#     graph, output = fdry.CUDAGraph.finish_one_graph_load(pending, i)
-#     graph.replay()
-```
-
-### Graph Manifest and Topology Groups
-
-After capturing all graphs, call `save_graph_manifest()` to group graphs by topology and assign templates. On-demand (non-template) graphs strip dependencies to reduce file size.
-
-```python
-import foundry as fdry
-
-# After all graphs are captured and saved
-fdry.save_graph_manifest('hook_archive')
-```
-
-### Memory Preallocation for Fast Graph Reload
-
-The preallocation API physically allocates memory upfront, enabling subsequent allocations to use a fast path (pointer bump only, no VMM driver calls).
-
-```python
-import foundry as fdry
-
-# With preallocation - allocations within 8GB use fast path
-with fdry.allocation_region(0x500000000000, '16GB', prealloc_size='8GB'):
-    graph, outputs = fdry.CUDAGraph.load('model.json')
-    graph.replay()
-```
-
-| Function | Description |
-|----------|-------------|
-| `set_allocation_region(base, size)` | Set VMM allocation region for deterministic memory addresses |
-| `stop_allocation_region()` | Stop the allocation region |
-| `resume_allocation_region()` | Re-enable a previously stopped allocation region |
-| `allocation_region(base, size, prealloc_size=None)` | Context manager to set up VMM allocation region with optional preallocation |
-| `preallocate_region(size)` | Manually preallocate memory inside an allocation region |
-| `free_preallocated_region()` | Free manually preallocated memory |
-| `get_current_alloc_offset()` / `set_current_alloc_offset(offset)` | Read or fast-forward the in-region cursor |
-| `parse_size(size)` | Parse a size string (`"1GB"`, `"16MB"`, …) to bytes |
-| `load_cuda_modules_and_libraries(archive_dir)` | Load CUDA modules and libraries for graph loading |
-| `save_graph_manifest(archive_dir)` | Write graph_manifest.json with topology groups and template assignments |
-| `CUDAGraph.start_graph_builds(paths, num_threads)` | Kick off background template build for a list of saved graphs |
-| `CUDAGraph.finish_graph_loads(pending)` | Wait for all builds and return `[(graph, output), ...]` |
-| `CUDAGraph.finish_one_graph_load(pending, i)` | Finalize one graph by index; interleavable with other work |
-| `init_nvshmem_for_loaded_modules()` | After `prepare_communication_buffer_for_model` has bootstrapped NVSHMEM, finalize `nvshmemx_cumodule_init` for each module queued by `load_cuda_modules_and_libraries` |
+Foundry is used through an inference engine, not by calling its Python API
+directly. For SGLang, install `sglang[foundry]` and start the server with
+`--cuda-graph-persistence save` once, then `--cuda-graph-persistence load`;
+ready-to-run scripts per model and topology are in the
+[SGLang recipe](recipe/sglang/README.md). For vLLM, see the
+[vLLM recipe](recipe/vllm/README.md).
 
 ## Testing
 
