@@ -469,10 +469,12 @@ higher concurrency too; in those cells the two plain-SGLang runs disagree with e
 other by the same amount (batch composition changes accumulation order), so the
 restored graphs sit inside SGLang's own run-to-run noise.
 
-With the recipes' default graph sets (20–52 decode graphs) capture is only a few
+That table was measured with the earlier padded graph sets (20–52 decode graphs), where capture is only a few
 seconds, so time-to-health is dominated by weight loading and the differences above
-are small; with all 256 decode graphs (`--cuda-graph-max-bs-decode 256 --disable-cuda-graph-padding`)
-restore saves 25–50 s per engine start (see the top-level README's Performance table).
+are small. Every script except `serve_qwen3-mini.sh` now captures all 256 decode graphs per rank by default
+(`--cuda-graph-max-bs-decode 256 --disable-cuda-graph-padding`, `MAXBS` overrides; GLM-5.3-Flash 128, 122B FP8 ep8 64; on
+the TP-attention EP rows the sizes are multiples of the attention TP size), where restore saves 25–50 s per engine
+start (see the top-level README's Performance table).
 
 ## Prefill CUDA graphs (experimental)
 
