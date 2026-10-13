@@ -195,16 +195,14 @@ struct CUDAGraph {
   // Apply this graph's node params/attrs onto the shared template CUgraph.
   void apply_on_demand_updates();
 
-  // Give this graph an exec to launch: the shared exec if it is the template
-  // (call at load, before any member rewrites the shared graph) or in share
-  // mode, otherwise a fresh cuGraphInstantiate of the shared graph carrying
-  // this graph's params (called lazily by replay).
-  void materialize_on_demand_exec();
+  // Make this graph launch the shared exec: the template (call at load, before
+  // any member rewrites the shared graph) and, in share mode, every member.
+  void bind_shared_exec();
 
-  // The two halves of a member's materialize_on_demand_exec, for the LOAD
-  // pipeline: the builder thread rewrites the shared graph to this member
-  // (apply_on_demand_updates, timed into g_member_update_us), the instantiate
-  // thread then instantiates the member's dedicated exec from it.
+  // An eager member's exec, in two halves for the LOAD pipeline: the builder
+  // thread rewrites the shared graph to this member (apply_on_demand_updates,
+  // timed into g_member_update_us), the instantiate thread then instantiates
+  // the member's dedicated exec from it.
   void rewrite_shared_graph_for_member();
   void instantiate_member_exec();
 

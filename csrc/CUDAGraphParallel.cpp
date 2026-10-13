@@ -986,12 +986,11 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
 //
 // A member of a topology group never builds its own CUgraph. Its node params
 // are pre-decoded here (CPU only, runs in parallel with the template builds)
-// and later, in materialize_on_demand_exec(), written onto the group's shared
-// builder graph with cuGraph*NodeSetParams, from which the member instantiates
-// a DEDICATED exec (~5 ms per ~1000-node graph). Every member is instantiated
-// at load by default (Phase 2c); FOUNDRY_LAZY_GRAPH_EXEC=1 defers it to the
-// first replay. FOUNDRY_ENABLE_EXEC_SHARE=1 instead keeps one exec per template
-// and switches it to a member with cuGraphExecUpdate at replay.
+// and later written onto the group's shared builder graph with
+// cuGraph*NodeSetParams (apply_on_demand_updates). Eager (default): in Phase 2c,
+// from which the member instantiates a DEDICATED exec (~5 ms per ~1000-node
+// graph). FOUNDRY_ENABLE_EXEC_SHARE=1: at replay, before cuGraphExecUpdate of
+// the template's exec, which every member launches.
 //
 // Savings vs full build_graph_from_parsed:
 //   - No cuGraphCreate / cuGraphAdd*Node / cuGraphAddDependencies per member
@@ -2562,8 +2561,6 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       auto ms_since = [](clk::time_point a) {
         return std::chrono::duration<double, std::milli>(clk::now() - a).count();
       };
-      const char* lazy_env = std::getenv("FOUNDRY_LAZY_GRAPH_EXEC");
-      const bool lazy_graph_exec = lazy_env && lazy_env[0] == '1';
       const bool share_mode = exec_share::enabled();
       if (share_mode)
         exec_share::log_mode_once();
@@ -2754,7 +2751,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
             }
             double inst_ms = ms_since(t_i);
             // Bind the template to the shared exec before any member rewrites the graph.
-            graph->materialize_on_demand_exec();
+            graph->bind_shared_exec();
             {
               std::lock_guard<std::mutex> lock(stats_mu);
               tmpl_inst_ms += inst_ms;
@@ -2806,7 +2803,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
                                                  static_cast<int>(tmpl_idx));
             }
             result.graph->on_demand_data_->graph_name = name;
-            result.graph->materialize_on_demand_exec();
+            result.graph->bind_shared_exec();
             double tmpl_ms = ms_since(t_tmpl);
             BuildTiming b = last_build_timing();
             {
@@ -2834,7 +2831,6 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       // linked to its group's shared exec, rewrites the builder graph once the previous
       // instantiate of it has returned, and is instantiated on the instantiate thread
       // (~5-10 ms per ~1000-1600-node graph) so no replay ever stalls.
-      // FOUNDRY_LAZY_GRAPH_EXEC=1 defers the rewrite + instantiate to the first replay.
       // Share mode: members are only linked; they launch the template's exec.
       std::vector<std::vector<size_t>> group_members;
       std::unordered_map<size_t, size_t> group_pos;
@@ -2864,11 +2860,9 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         CUDAGraph* member = all_parsed[i].graph.get();
         CUDAGraph::link_on_demand_shared_exec(*member, shared_execs.at(g));
         if (share_mode) {
-          member->materialize_on_demand_exec();  // aliases the template's exec
+          member->bind_shared_exec();
           continue;
         }
-        if (lazy_graph_exec)
-          continue;
         member->rewrite_shared_graph_for_member();
         {
           std::lock_guard<std::mutex> lock(group_mu);
@@ -2928,11 +2922,12 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
 // SAVE mode.
 // ============================================================================
 
-// Per-entry finish. Idempotent on build_complete_ wait (shared_future).
+// Per-entry finish. shared_future::get is repeatable and rethrows a Phase 2
+// failure on every call (wait() dropped it and let unbuilt graphs reach replay).
 GraphLoadResult finish_one_graph_load_impl(std::shared_ptr<PendingGraphLoads> pending, size_t index,
                                            ReconstructTensorFn reconstruct_fn) {
   if (pending->build_complete_.valid()) {
-    pending->build_complete_.wait();
+    pending->build_complete_.get();
   }
 
   if (index >= pending->entries.size()) {

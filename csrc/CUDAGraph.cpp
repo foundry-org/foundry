@@ -854,26 +854,18 @@ CUDAGraph::OnDemandData::~OnDemandData() {
   }
 }
 
-void CUDAGraph::materialize_on_demand_exec() {
+void CUDAGraph::bind_shared_exec() {
   TORCH_CHECK(on_demand_data_ && on_demand_data_->shared_exec,
-              "materialize_on_demand_exec: graph is not linked to a shared exec");
+              "bind_shared_exec: graph is not linked to a shared exec");
   auto& shared = on_demand_data_->shared_exec;
-  if (on_demand_data_->own_exec) {
-    return;
-  }
-  if (shared->share || shared->current_params_id == on_demand_data_->graph_id) {
-    // Template (the shared exec was instantiated with these params), or share
-    // mode: replay switches the shared exec to this graph before launch.
-    on_demand_data_->own_exec = shared->exec;
-    on_demand_data_->owns_exec = false;
-    return;
-  }
-  // Member: rewrite the shared graph's node params to this graph and
-  // instantiate a dedicated exec. Execs are snapshots, so the template's exec
-  // and earlier members' execs are untouched; the shared graph is a builder.
-  // ~5 ms for a ~1000-node graph; totals are printed with the Phase 2 line.
-  rewrite_shared_graph_for_member();
-  instantiate_member_exec();
+  // Template (the shared exec was instantiated with these params), or share
+  // mode: replay switches the shared exec to this graph before launch. An
+  // eager member owns the exec Phase 2 instantiated for it instead.
+  TORCH_CHECK(shared->share || shared->current_params_id == on_demand_data_->graph_id,
+              "bind_shared_exec: eager member ", on_demand_data_->graph_name,
+              " cannot launch the template's exec");
+  on_demand_data_->own_exec = shared->exec;
+  on_demand_data_->owns_exec = false;
 }
 
 void CUDAGraph::rewrite_shared_graph_for_member() {
@@ -945,9 +937,8 @@ void CUDAGraph::replay() {
         shared.valid = true;
       }
     }
-    if (!on_demand_data_->own_exec) {
-      materialize_on_demand_exec();
-    }
+    TORCH_CHECK(on_demand_data_->own_exec, "replay: ", on_demand_data_->graph_name,
+                " has no exec (LOAD Phase 2 did not finish)");
     for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
 #if FOUNDRY_TORCH_PER_CAPTURE_RNG
       generator_state->replay_prologue(capture_id_, wholegraph_increments);
