@@ -35,6 +35,9 @@
 #include "hook.h"
 #include "BinaryGraphFormat.h"
 #include "GraphDependencies.h"
+#include "ExecShare.h"
+#include <array>
+#include <map>
 
 namespace {
 
@@ -987,8 +990,8 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
 // builder graph with cuGraph*NodeSetParams, from which the member instantiates
 // a DEDICATED exec (~5 ms per ~1000-node graph). Every member is instantiated
 // at load by default (Phase 2c); FOUNDRY_LAZY_GRAPH_EXEC=1 defers it to the
-// first replay. Nothing calls cuGraphExecUpdate: an exec updated in place
-// launches every node slower for the rest of its life.
+// first replay. FOUNDRY_ENABLE_EXEC_SHARE=1 instead keeps one exec per template
+// and switches it to a member with cuGraphExecUpdate at replay.
 //
 // Savings vs full build_graph_from_parsed:
 //   - No cuGraphCreate / cuGraphAdd*Node / cuGraphAddDependencies per member
@@ -1865,6 +1868,31 @@ void CUDAGraph::link_on_demand_shared_exec(CUDAGraph& graph,
               "On-demand mismatch: graph has ", graph.on_demand_data_->updates.size(),
               " updates but template has ", shared_exec->ordered_nodes.size());
 
+  // Share mode: cuGraphExecUpdate does not carry node attributes, so a member
+  // must launch the template's cluster shape.
+  if (shared_exec->share) {
+    for (size_t i = 0; i < graph.on_demand_data_->updates.size(); ++i) {
+      const auto& update = graph.on_demand_data_->updates[i];
+      if (update.type != OnDemandNodeUpdate::Kernel)
+        continue;
+      CUkernelNodeAttrValue cluster{}, preferred{};
+      C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeGetAttribute(
+          shared_exec->ordered_nodes[i], CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &cluster));
+      C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeGetAttribute(
+          shared_exec->ordered_nodes[i], CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION,
+          &preferred));
+      const auto& attrs = update.kernel_attrs;
+      TORCH_CHECK(cluster.clusterDim.x == attrs.clusterDimX &&
+                      cluster.clusterDim.y == attrs.clusterDimY &&
+                      cluster.clusterDim.z == attrs.clusterDimZ &&
+                      preferred.preferredClusterDim.x == attrs.preferredClusterDimX &&
+                      preferred.preferredClusterDim.y == attrs.preferredClusterDimY &&
+                      preferred.preferredClusterDim.z == attrs.preferredClusterDimZ,
+                  "exec share: cluster dimensions differ from the template for graph ",
+                  graph.on_demand_data_->graph_name, " node ", i);
+    }
+  }
+
   graph.on_demand_data_->shared_exec = shared_exec;
 }
 
@@ -2118,6 +2146,8 @@ bool join_exec_pool_prewarm() {
 }  // namespace
 
 void CUDAGraph::start_exec_pool_prewarm(const std::vector<std::string>& json_paths) {
+  if (exec_share::enabled())
+    return;  // Share mode instantiates only the template execs: nothing to prewarm.
   // Ablation knob: FOUNDRY_EXEC_POOL_PREWARM=0 skips the prewarm; Phase 2 then grows the
   // driver's exec pool itself (join_exec_pool_prewarm reports "not used").
   const char* prewarm_env = std::getenv("FOUNDRY_EXEC_POOL_PREWARM");
@@ -2534,6 +2564,9 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       };
       const char* lazy_env = std::getenv("FOUNDRY_LAZY_GRAPH_EXEC");
       const bool lazy_graph_exec = lazy_env && lazy_env[0] == '1';
+      const bool share_mode = exec_share::enabled();
+      if (share_mode)
+        exec_share::log_mode_once();
       // Ablation knob: FOUNDRY_PHASE2_PIPELINE=0 runs every instantiate inline on this (build)
       // thread instead of on the instantiate thread, so builds and instantiates no longer
       // overlap (the pre-pipeline behaviour); the prep pool is unchanged.
@@ -2547,6 +2580,62 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         return bin_files[idx].valid() &&
                (bin_files[idx].header.flags & binary_format::FLAG_COMPLETE_KERNEL_ATTRS);
       };
+
+      if (share_mode) {
+        // The saved topology key omits edges, and cuGraphExecUpdate needs the member's DAG
+        // to equal the template's. Refine each group by its ordered node types and full
+        // dependency table (from the .cugraph binaries; stripped member JSON is not needed).
+        auto dag = [&](size_t idx) {
+          const auto& bin = bin_files[idx];
+          TORCH_CHECK(binary_template(idx) && bin.header.version >= 2,
+                      "exec share needs complete binary archives (.cugraph v2+); re-SAVE graph ",
+                      idx);
+          std::unordered_map<uint32_t, uint32_t> ids;
+          for (uint32_t n = 0; n < bin.header.num_nodes; ++n)
+            ids.emplace(bin.node_table()[n].node_id, n);
+          TORCH_CHECK(bin.header.num_dependencies == 0 ||
+                          (bin.header.flags & binary_format::FLAG_HAS_DEPENDENCIES),
+                      "exec share: graph ", idx, " has no dependency table; re-SAVE");
+          std::vector<std::array<uint32_t, 5>> result;
+          const auto* deps = bin.section_ptr<binary_format::BinDependency>(
+              binary_format::SECTION_DEPENDENCY_TABLE);
+          for (uint32_t n = 0; n < bin.header.num_dependencies; ++n)
+            result.push_back({ids.at(deps[n].from_id), ids.at(deps[n].to_id), deps[n].from_port,
+                              deps[n].to_port, deps[n].edge_type});
+          std::sort(result.begin(), result.end());
+          return result;
+        };
+        const size_t coarse_count = topology_groups.size();
+        std::unordered_map<std::string, std::vector<size_t>> refined_groups;
+        std::fill(template_for.begin(), template_for.end(), SIZE_MAX);
+        for (const auto& [key, indices] : topology_groups) {
+          if (indices.size() == 1) {  // nothing shares its exec
+            refined_groups.emplace(std::to_string(indices[0]), indices);
+            continue;
+          }
+          using Signature = std::pair<std::vector<uint32_t>, std::vector<std::array<uint32_t, 5>>>;
+          // Ordered keys compare the full evidence, without hash collisions.
+          std::map<Signature, std::vector<size_t>> partitions;
+          for (size_t idx : indices) {
+            auto edges = dag(idx);
+            const auto& bin = bin_files[idx];
+            std::vector<uint32_t> types;
+            types.reserve(bin.header.num_nodes);
+            for (uint32_t n = 0; n < bin.header.num_nodes; ++n)
+              types.push_back(bin.node_table()[n].type);
+            partitions[{std::move(types), std::move(edges)}].push_back(idx);
+          }
+          for (auto& [signature, members] : partitions) {
+            const size_t tmpl = members.front();
+            for (size_t j = 1; j < members.size(); ++j)
+              template_for[members[j]] = tmpl;
+            refined_groups.emplace(std::to_string(tmpl), std::move(members));
+          }
+        }
+        topology_groups = std::move(refined_groups);
+        fprintf(stderr, "[foundry] exec share: %zu saved groups -> %zu templates (DAG refined)\n",
+                coarse_count, topology_groups.size());
+      }
 
       std::vector<size_t> tmpl_order;
       tmpl_order.reserve(topology_groups.size());
@@ -2631,6 +2720,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         auto shared = std::make_shared<CUDAGraph::SharedGraphExec>();
         shared->ctx = main_ctx;
         shared->current_params_id = static_cast<int>(tmpl_idx);
+        shared->share = share_mode;
         shared_execs[tmpl_idx] = shared;
         {
           std::lock_guard<std::mutex> lock(group_mu);
@@ -2656,8 +2746,12 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
           submit([=, &set_free, &stats_mu, &tmpl_inst_ms, &ms_since]() {
             double queued = ms_since(t_enq);
             auto t_i = clk::now();
-            shared->exec = reinterpret_cast<CUgraphExec>(
-                CUDAGraph::instantiate_graph_exec(reinterpret_cast<cudaGraph_t>(shared->graph)));
+            if (share_mode) {
+              CUDAGraph::instantiate_shared_template(*shared);
+            } else {
+              shared->exec = reinterpret_cast<CUgraphExec>(
+                  CUDAGraph::instantiate_graph_exec(reinterpret_cast<cudaGraph_t>(shared->graph)));
+            }
             double inst_ms = ms_since(t_i);
             // Bind the template to the shared exec before any member rewrites the graph.
             graph->materialize_on_demand_exec();
@@ -2741,6 +2835,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       // instantiate of it has returned, and is instantiated on the instantiate thread
       // (~5-10 ms per ~1000-1600-node graph) so no replay ever stalls.
       // FOUNDRY_LAZY_GRAPH_EXEC=1 defers the rewrite + instantiate to the first replay.
+      // Share mode: members are only linked; they launch the template's exec.
       std::vector<std::vector<size_t>> group_members;
       std::unordered_map<size_t, size_t> group_pos;
       for (size_t idx : tmpl_order) {
@@ -2759,6 +2854,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
           if (round < gm.size())
             member_order.push_back(gm[round]);
 
+      size_t member_execs = 0;
       for (size_t i : member_order) {
         size_t g = template_for[i];
         auto t_w = clk::now();
@@ -2767,6 +2863,10 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         member_wait_ms += ms_since(t_w);
         CUDAGraph* member = all_parsed[i].graph.get();
         CUDAGraph::link_on_demand_shared_exec(*member, shared_execs.at(g));
+        if (share_mode) {
+          member->materialize_on_demand_exec();  // aliases the template's exec
+          continue;
+        }
         if (lazy_graph_exec)
           continue;
         member->rewrite_shared_graph_for_member();
@@ -2774,6 +2874,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
           std::lock_guard<std::mutex> lock(group_mu);
           group_busy[g] = true;
         }
+        member_execs++;
         submit([member, g, &set_free]() {
           member->instantiate_member_exec();
           set_free(g);
@@ -2790,12 +2891,13 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
               .count();
       fprintf(stderr,
               "[foundry] Phase 2: %zu templates + %zu on-demand = %zu graphs built in %.1f ms "
-              "(members: param/attr rewrite %.1f ms, instantiate %.1f ms, %llu attribute calls), "
+              "(members: %zu execs instantiated, param/attr rewrite %.1f ms, instantiate %.1f ms, "
+              "%llu attribute calls), "
               "pipeline: template builds %.1f ms, template instantiates %.1f ms, build thread "
               "waited %.1f ms for a free builder graph, instantiate thread busy %.1f ms / idle "
               "%.1f ms, exec pool prewarm %s, device memory taken during the instantiates %.0f "
               "MB; Phase 2 start %.3f (epoch s)\n",
-              topology_groups.size(), num - topology_groups.size(), num, phase2_ms,
+              topology_groups.size(), num - topology_groups.size(), num, phase2_ms, member_execs,
               CUDAGraph::g_member_update_us.load() / 1000.0,
               CUDAGraph::g_member_inst_us.load() / 1000.0,
               (unsigned long long)CUDAGraph::g_member_attr_calls.load(), tmpl_build_ms,

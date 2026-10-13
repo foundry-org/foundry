@@ -170,6 +170,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           },
           py::arg("generator"))
       .def("replay", &foundry::CUDAGraph::replay, py::call_guard<py::gil_scoped_release>())
+      .def("exec_share_stats", &foundry::CUDAGraph::exec_share_stats)
       .def("reset", &foundry::CUDAGraph::reset, py::call_guard<py::gil_scoped_release>())
       .def("pool", &foundry::CUDAGraph::pool, py::call_guard<py::gil_scoped_release>())
       .def("debug_dump", &foundry::CUDAGraph::debug_dump, py::call_guard<py::gil_scoped_release>())

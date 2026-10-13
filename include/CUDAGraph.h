@@ -15,6 +15,7 @@
 #include <memory>
 #include <atomic>
 #include <variant>
+#include <mutex>
 
 namespace at {
 
@@ -85,6 +86,7 @@ struct CUDAGraph {
   void capture_end();
   void instantiate();
   void replay();
+  std::string exec_share_stats() const;
   void reset();
   MempoolId_t pool();
   void enable_debug_mode();
@@ -109,10 +111,10 @@ struct CUDAGraph {
     std::vector<std::string> node_types;     // type of each node
   };
 
-  // Pre-decoded node params for on-demand exec update at replay time.
-  // Instead of building a separate CUgraph+CUgraphExec per batch size,
-  // graphs in the same topology group share one exec and update its
-  // node params before each launch via cuGraphExecKernelNodeSetParams.
+  // Pre-decoded node params of one graph of a topology group, written onto the
+  // group's builder CUgraph with cuGraph*NodeSetParams: at LOAD before the
+  // member's own instantiate (eager), or at replay before cuGraphExecUpdate of
+  // the template's exec (FOUNDRY_ENABLE_EXEC_SHARE=1).
   struct OnDemandNodeUpdate {
     enum NodeType { Kernel, Memset, Memcpy, EventRecord, EventWait, Empty };
     NodeType type = Empty;
@@ -164,6 +166,14 @@ struct CUDAGraph {
     std::vector<CUgraphNode> ordered_nodes;
     CUcontext ctx = nullptr;
     int current_params_id = -1;
+    // Share mode (FOUNDRY_ENABLE_EXEC_SHARE=1): every member launches this exec,
+    // switched to it at replay. valid turns false after a failed switch; the exec
+    // must not launch again. replay_mutex serializes a switch through its launch.
+    bool share = false;
+    bool valid = true;
+    std::mutex replay_mutex;
+    uint64_t updates = 0;
+    uint64_t rewrite_ns = 0, update_ns = 0, upload_ns = 0;
 
     ~SharedGraphExec();
   };
@@ -174,9 +184,8 @@ struct CUDAGraph {
     std::string graph_name;  // e.g. filename for debug messages
     std::vector<OnDemandNodeUpdate> updates;
     // Exec this graph launches. The template aliases the shared exec (bound at
-    // load); each on-demand member gets its own exec instantiated on its first
-    // replay (materialize_on_demand_exec). Nothing calls cuGraphExecUpdate:
-    // an exec updated in place launches every node measurably slower.
+    // load). Eager: each member owns an exec instantiated in Phase 2. Share: every
+    // member aliases the shared exec and replay switches it to the member.
     CUgraphExec own_exec = nullptr;
     bool owns_exec = false;
 
@@ -187,9 +196,9 @@ struct CUDAGraph {
   void apply_on_demand_updates();
 
   // Give this graph an exec to launch: the shared exec if it is the template
-  // (call at load, before any member rewrites the shared graph), otherwise a
-  // fresh cuGraphInstantiate of the shared graph carrying this graph's params
-  // (called lazily by replay).
+  // (call at load, before any member rewrites the shared graph) or in share
+  // mode, otherwise a fresh cuGraphInstantiate of the shared graph carrying
+  // this graph's params (called lazily by replay).
   void materialize_on_demand_exec();
 
   // The two halves of a member's materialize_on_demand_exec, for the LOAD
@@ -201,6 +210,8 @@ struct CUDAGraph {
 
   // Instantiate with the flags instantiate() uses for a captured graph.
   static cudaGraphExec_t instantiate_graph_exec(cudaGraph_t graph);
+  // Share mode: instantiate the template's exec and upload it before any update.
+  static void instantiate_shared_template(SharedGraphExec& shared);
 
   // LOAD Phase 2, binary archives: build the template's CUgraph from its
   // .cugraph node table, dependency table and prepared on-demand data
@@ -216,7 +227,8 @@ struct CUDAGraph {
                                                  GraphTemplate* out_template = nullptr);
 
   // Prepare on-demand replay data: parse node params from JSON without
-  // building a CUgraph. At replay time, the shared exec is updated.
+  // building a CUgraph; Phase 2 writes them onto the builder graph (see
+  // OnDemandNodeUpdate).
   // shared_exec can be nullptr — call link_on_demand_shared_exec() later.
   static void prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
                                       std::shared_ptr<SharedGraphExec> shared_exec, int graph_id);

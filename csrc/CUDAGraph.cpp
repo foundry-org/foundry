@@ -861,8 +861,9 @@ void CUDAGraph::materialize_on_demand_exec() {
   if (on_demand_data_->own_exec) {
     return;
   }
-  if (shared->current_params_id == on_demand_data_->graph_id) {
-    // Template: the shared exec was instantiated with these params.
+  if (shared->share || shared->current_params_id == on_demand_data_->graph_id) {
+    // Template (the shared exec was instantiated with these params), or share
+    // mode: replay switches the shared exec to this graph before launch.
     on_demand_data_->own_exec = shared->exec;
     on_demand_data_->owns_exec = false;
     return;
@@ -904,15 +905,49 @@ void CUDAGraph::instantiate_member_exec() {
 }
 
 void CUDAGraph::replay() {
-  // On-demand replay: the template launches the shared exec; a member gets its
-  // own exec instantiated on first replay (one-time cost per batch size).
-  // Nothing calls cuGraphExecUpdate: an exec updated in place launches every
-  // node slower for the rest of its life.
+  // Eager: every graph launches its own exec (the template's is the shared one).
+  // Share (FOUNDRY_ENABLE_EXEC_SHARE=1): a replay of another member than the
+  // last one rewrites the builder graph to this member, updates the shared exec
+  // from it (cuGraphExecUpdate) and uploads it; a repeat of the same member
+  // launches directly. No stream or device synchronization.
   if (on_demand_data_) {
+    c10::OptionalDeviceGuard device_guard{c10::Device(c10::kCUDA, capture_dev_)};
+    auto& shared = *on_demand_data_->shared_exec;
+    std::unique_lock<std::mutex> replay_lock(shared.replay_mutex, std::defer_lock);
+    if (shared.share) {
+      // Held through the launch submission: one member's params on the exec at a time.
+      replay_lock.lock();
+      TORCH_CHECK(shared.valid, "exec share: an earlier switch of this template's exec failed (",
+                  on_demand_data_->graph_name, ")");
+      if (shared.current_params_id != on_demand_data_->graph_id) {
+        using clk = std::chrono::steady_clock;
+        auto ns_since = [](clk::time_point t) {
+          return static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t).count());
+        };
+        shared.valid = false;
+        auto t = clk::now();
+        apply_on_demand_updates();
+        shared.rewrite_ns += ns_since(t);
+        t = clk::now();
+        CUgraphExecUpdateResultInfo info{};
+        CUresult rc = cuGraphExecUpdate_v2(shared.exec, shared.graph, &info);
+        shared.update_ns += ns_since(t);
+        TORCH_CHECK(rc == CUDA_SUCCESS && info.result == CU_GRAPH_EXEC_UPDATE_SUCCESS,
+                    "exec share: cuGraphExecUpdate failed for ", on_demand_data_->graph_name,
+                    " (CUresult ", static_cast<int>(rc), ", update result ",
+                    static_cast<int>(info.result), ")");
+        t = clk::now();
+        C10_CUDA_DRIVER_CHECK(cuGraphUpload(shared.exec, at::cuda::getCurrentCUDAStream()));
+        shared.upload_ns += ns_since(t);
+        shared.current_params_id = on_demand_data_->graph_id;
+        shared.updates++;
+        shared.valid = true;
+      }
+    }
     if (!on_demand_data_->own_exec) {
       materialize_on_demand_exec();
     }
-    c10::OptionalDeviceGuard device_guard{c10::Device(c10::kCUDA, capture_dev_)};
     for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
 #if FOUNDRY_TORCH_PER_CAPTURE_RNG
       generator_state->replay_prologue(capture_id_, wholegraph_increments);
@@ -1004,6 +1039,34 @@ CUDAGraph::SharedGraphExec::~SharedGraphExec() {
   if (graph) {
     C10_CUDA_CHECK_WARN(cudaGraphDestroy(reinterpret_cast<cudaGraph_t>(graph)));
   }
+}
+
+void CUDAGraph::instantiate_shared_template(SharedGraphExec& shared) {
+  shared.exec = reinterpret_cast<CUgraphExec>(
+      instantiate_graph_exec(reinterpret_cast<cudaGraph_t>(shared.graph)));
+  // Upload before the first update: an update ahead of an exec's first upload
+  // demotes every changed node (docs/exec-update-penalty.md).
+  C10_CUDA_DRIVER_CHECK(cuGraphUpload(shared.exec, nullptr));
+}
+
+std::string CUDAGraph::exec_share_stats() const {
+  boost::json::object out;
+  if (on_demand_data_ && on_demand_data_->shared_exec) {
+    auto& shared = *on_demand_data_->shared_exec;
+    std::lock_guard<std::mutex> lock(shared.replay_mutex);
+    out["enabled"] = shared.share;
+    out["valid"] = shared.valid;
+    out["exec"] = reinterpret_cast<uintptr_t>(shared.exec);
+    out["graph_id"] = on_demand_data_->graph_id;
+    out["current_graph_id"] = shared.current_params_id;
+    out["updates"] = shared.updates;
+    out["rewrite_ns"] = shared.rewrite_ns;
+    out["update_ns"] = shared.update_ns;
+    out["upload_ns"] = shared.upload_ns;
+  } else {
+    out["enabled"] = false;
+  }
+  return boost::json::serialize(out);
 }
 
 void CUDAGraph::transfer_to_shared_exec(std::shared_ptr<SharedGraphExec> shared,
