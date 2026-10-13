@@ -2580,8 +2580,9 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
 
       if (share_mode) {
         // The saved topology key omits edges, and cuGraphExecUpdate needs the member's DAG
-        // to equal the template's. Refine each group by its ordered node types and full
-        // dependency table (from the .cugraph binaries; stripped member JSON is not needed).
+        // to equal the template's. Refine each group by its ordered nodes (type, kernel binary)
+        // and full dependency table (from the .cugraph binaries; stripped member
+        // JSON is not needed). Eager mode keeps the saved groups.
         auto dag = [&](size_t idx) {
           const auto& bin = bin_files[idx];
           TORCH_CHECK(binary_template(idx) && bin.header.version >= 2,
@@ -2610,17 +2611,29 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
             refined_groups.emplace(std::to_string(indices[0]), indices);
             continue;
           }
-          using Signature = std::pair<std::vector<uint32_t>, std::vector<std::array<uint32_t, 5>>>;
+          // Per node: type, and for a kernel node the hash of the binary (module / library) its
+          // function comes from. cuGraphExecUpdate carries a switch to another function of the
+          // same binary, but not to another binary of the same-named function (a different
+          // Triton specialization updated "successfully" and launched wrong), so such members
+          // get their own template. Cluster dims are already in the saved topology key.
+          using NodeKey = std::pair<uint32_t, uint64_t>;
+          using Signature = std::pair<std::vector<NodeKey>, std::vector<std::array<uint32_t, 5>>>;
           // Ordered keys compare the full evidence, without hash collisions.
           std::map<Signature, std::vector<size_t>> partitions;
           for (size_t idx : indices) {
             auto edges = dag(idx);
             const auto& bin = bin_files[idx];
-            std::vector<uint32_t> types;
-            types.reserve(bin.header.num_nodes);
-            for (uint32_t n = 0; n < bin.header.num_nodes; ++n)
-              types.push_back(bin.node_table()[n].type);
-            partitions[{std::move(types), std::move(edges)}].push_back(idx);
+            std::vector<NodeKey> nodes;
+            nodes.reserve(bin.header.num_nodes);
+            for (uint32_t n = 0; n < bin.header.num_nodes; ++n) {
+              const auto& e = bin.node_table()[n];
+              // Copies: the node table is packed, its fields cannot bind to references.
+              const uint32_t type = e.type;
+              const uint64_t binary_hash =
+                  type == binary_format::NODE_KERNEL ? uint64_t{e.kernel.binary_hash} : 0;
+              nodes.emplace_back(type, binary_hash);
+            }
+            partitions[{std::move(nodes), std::move(edges)}].push_back(idx);
           }
           for (auto& [signature, members] : partitions) {
             const size_t tmpl = members.front();
@@ -2630,7 +2643,9 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
           }
         }
         topology_groups = std::move(refined_groups);
-        fprintf(stderr, "[foundry] exec share: %zu saved groups -> %zu templates (DAG refined)\n",
+        fprintf(stderr,
+                "[foundry] exec share: %zu saved groups -> %zu templates (refined by DAG and "
+                "kernel binaries)\n",
                 coarse_count, topology_groups.size());
       }
 
