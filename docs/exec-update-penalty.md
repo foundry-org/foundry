@@ -101,7 +101,9 @@ the one-step-ahead scheduler.
 
 ## Design
 
-Foundry LOAD keeps one exec per template and switches members with
-`cuGraphExecUpdate` plus the descriptor repair; a same-member replay launches
-directly. Memory is one exec per template rather than one per member, and
-every member replays at the speed of a captured graph.
+- Eager (default): every member gets its own exec in LOAD Phase 2; no exec is ever updated, so no replay pays section 3.
+- Share (`FOUNDRY_ENABLE_EXEC_SHARE=1`): one exec per template, uploaded right after instantiate; a member switch is
+  rewrite, `cuGraphExecUpdate_v2`, upload (section 2, without the repair); a same-member replay launches directly.
+- Share mode does not repair the prefetch plan itself: switched execs replay with the section 3 penalty on an unrepaired
+  driver.
+- Modes, knobs and the LOAD pipeline: [`graph-templates.md`](graph-templates.md#exec-modes).

@@ -75,40 +75,29 @@ templating still saves 0.2-1.1 s.
 
 ## Exec modes
 
-A member replays either from its own exec or from its template's exec. Both
-modes share the templates, the pipeline and the builder graphs; only how a
-member's parameters reach an exec differs, and both replay at the speed of a
-natively captured graph (TPOT within noise, PDL edges preserved per
-[`pdl-edge-batching.md`](pdl-edge-batching.md)). They are selected per LOAD
-and can be switched freely between runs of the same archive.
+A member replays either from its own exec (eager, default) or from its
+template's exec (share, `FOUNDRY_ENABLE_EXEC_SHARE=1`). Both modes share the
+templates, the pipeline and the builder graphs. They are selected per LOAD and
+can be switched freely between runs of the same archive.
 
-**Dedicated execs** (default). Each member's parameters are written onto the
-builder graph and a new exec is instantiated from it
-(`materialize_on_demand_exec`, ~5 ms per ~1000-node graph). Execs are
-snapshots, so the template's exec and earlier members' execs are untouched. A
-replay is one `cudaGraphLaunch` of the member's own exec; there is no update
-on the replay path. Memory is one exec per graph, as in native capture.
-*Eager* (default) materializes every member during Phase 2, so the first
-request at any batch size pays nothing extra: 256 execs cost ~1.1 s and ~1 GB
-of exec memory more than lazy. *Lazy* (`FOUNDRY_LAZY_GRAPH_EXEC=1`) defers each
-member's rewrite + instantiate to its first replay (~6 ms once per batch size;
-the first decode wave at a new size sees one ITL spike, e.g. 19 ms vs 9 ms max
-ITL at bs 8).
+**Eager** (default). In Phase 2 each member's parameters are written onto the
+builder graph and a new exec is instantiated from it (~5 ms per ~1000-node
+graph), plus the exec-pool prewarm. Execs are snapshots, so the template's
+exec and earlier members' execs are untouched. A replay is one
+`cudaGraphLaunch` of the member's own exec and runs at the speed of a natively
+captured graph (TPOT within noise, PDL edges preserved per
+[`pdl-edge-batching.md`](pdl-edge-batching.md)). Memory is one exec per graph,
+as in native capture: 256 execs cost ~1.1 s of Phase 2 and ~1 GB of exec memory.
 
-**Shared exec with `cuGraphExecUpdate`** (`FOUNDRY_QMD_REPAIR=1`). One exec
-per template; a replay of a different member than the previous step rewrites
-the builder graph's parameters, updates the template's exec, repairs the
-updated descriptors and uploads, all on the host and overlapped with the
-in-flight forward by the one-step-ahead scheduler; a replay of the same member
-launches directly. Memory is one exec per template instead of one per member.
-The update used to leave an exec permanently slower; the cause (the driver
-clears the constant-prefetch plan on update) and the repair that restores it
-are in [`exec-update-penalty.md`](exec-update-penalty.md).
-
-Choose dedicated execs when exec memory is not a constraint (the common case:
-~3 KB per node, ~1 GB for 256 decode graphs) and the lowest possible switch
-latency matters; choose the shared exec when hundreds of members per template
-would otherwise hold exec memory the KV cache could use.
+**Share** (`FOUNDRY_ENABLE_EXEC_SHARE=1`). Phase 2 instantiates and uploads
+the template execs only: no prewarm, no member exec. Groups are first refined
+by their full dependency table, and a member whose cluster dims differ from its
+template is rejected. A replay of a different member than the previous one
+rewrites the builder graph's parameters, `cuGraphExecUpdate`s the template's
+exec and uploads it (host only, no synchronization); a replay of the same
+member launches directly. Memory is one exec per template. An updated exec
+replays slower unless the driver's update path is repaired
+([`exec-update-penalty.md`](exec-update-penalty.md), section 3).
 
 ### Exec-pool prewarm: cost
 
@@ -137,7 +126,7 @@ nvidia-smi per-process memory) plus 3 earlier pairs:
 - **Abandoned** when Phase 2's instantiate thread starts before it finished:
   it stops after its current graph, destroys what it made, and Phase 2 runs as
   without it. A failure only costs speed.
-- **No knob:** always on for an SGLang LOAD (decode and prefill graphs);
+- **No knob:** always on for an eager SGLang LOAD (decode and prefill graphs);
   graphs without a valid `.cugraph` are skipped.
 
 ## Cluster launches
@@ -163,8 +152,7 @@ the driver. Test: `tests/test_cluster_optin.py` (driver-level, no archive).
 | Knob | Where | Effect |
 |---|---|---|
 | `graph_templates = true/false` | SAVE TOML | group graphs into templates (default) or store every graph in full |
-| `FOUNDRY_LAZY_GRAPH_EXEC=1` | LOAD env | dedicated execs, instantiated at first replay instead of during Phase 2 |
-| `FOUNDRY_QMD_REPAIR=1` | LOAD env | shared exec per template, members switched with `cuGraphExecUpdate` + descriptor repair |
+| `FOUNDRY_ENABLE_EXEC_SHARE=1` | LOAD env | share mode: template execs only (no prewarm, no member exec), members switched with `cuGraphExecUpdate` at replay; unset/0 = eager |
 | `FOUNDRY_EXEC_POOL_PREWARM=0` | LOAD env | ablation: skip the exec-pool prewarm (Phase 2 grows the driver's exec pool itself) |
 | `FOUNDRY_PHASE2_PIPELINE=0` | LOAD env | ablation: no build/instantiate overlap, every instantiate runs inline on the build thread (the prep pool stays) |
 | `TORCHDYNAMO_DISABLE=1` | SGLang SAVE / LOAD env | SAVE runs each shape's first forward inside the capture and torch >= 2.14's dynamo refuses to trace there; pinned by Foundry on SAVE / LOAD, exported by the recipes in every mode |
