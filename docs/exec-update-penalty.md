@@ -103,7 +103,10 @@ the one-step-ahead scheduler.
 
 - Eager (default): every member gets its own exec in LOAD Phase 2; no exec is ever updated, so no replay pays section 3.
 - Share (`FOUNDRY_ENABLE_EXEC_SHARE=1`): one exec per template, uploaded right after instantiate; a member switch is
-  rewrite, `cuGraphExecUpdate_v2`, upload (section 2, without the repair); a same-member replay launches directly.
-- Share mode does not repair the prefetch plan itself: switched execs replay with the section 3 penalty on an unrepaired
-  driver.
+  rewrite, `cuGraphExecUpdate_v2`, upload (section 2; repair: next item); a same-member replay launches directly.
+- Repair seam: `cgp_exec_register_begin/expect/end`, `cgp_exec_update`, `cgp_exec_forget` are weak symbols
+  (`include/CgpWeak.h`). With cudagraph-patch in `LD_PRELOAD` they resolve: each template exec is registered (with its census) around its
+  instantiate and switched with `cgp_exec_update`. Otherwise they are null and the switch is the plain
+  `cuGraphExecUpdate_v2` (section 3 penalty). LOAD logs `[foundry] exec share: patched route (cgp)` or
+  `[foundry] exec share: real cuGraphExecUpdate`.
 - Modes, knobs and the LOAD pipeline: [`graph-templates.md`](graph-templates.md#exec-modes).

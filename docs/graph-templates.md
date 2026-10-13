@@ -155,7 +155,7 @@ the driver. Test: `tests/test_cluster_optin.py` (driver-level, no archive).
 | Knob | Where | Effect |
 |---|---|---|
 | `graph_templates = true/false` | SAVE TOML | group graphs into templates (default) or store every graph in full |
-| `FOUNDRY_ENABLE_EXEC_SHARE=1` | LOAD env | share mode: template execs only (no prewarm, no member exec), members switched with `cuGraphExecUpdate` at replay; unset/0 = eager |
+| `FOUNDRY_ENABLE_EXEC_SHARE=1` | LOAD env | share mode: template execs only (no prewarm, no member exec), members switched with `cuGraphExecUpdate` at replay (cudagraph-patch's `cgp_exec_update` when it is preloaded); unset/0 = eager |
 | `FOUNDRY_EXEC_POOL_PREWARM=0` | LOAD env | ablation: skip the exec-pool prewarm (Phase 2 grows the driver's exec pool itself) |
 | `FOUNDRY_PHASE2_PIPELINE=0` | LOAD env | ablation: no build/instantiate overlap, every instantiate runs inline on the build thread (the prep pool stays) |
 | `TORCHDYNAMO_DISABLE=1` | SGLang SAVE / LOAD env | SAVE runs each shape's first forward inside the capture and torch >= 2.14's dynamo refuses to trace there; pinned by Foundry on SAVE / LOAD, exported by the recipes in every mode |

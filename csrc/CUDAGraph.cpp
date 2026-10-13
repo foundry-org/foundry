@@ -33,6 +33,7 @@
 #include "hook.h"
 #include "BinaryGraphFormat.h"
 #include "GraphDependencies.h"
+#include "ExecShare.h"
 
 #include <torch/version.h>
 
@@ -923,12 +924,23 @@ void CUDAGraph::replay() {
         shared.rewrite_ns += ns_since(t);
         t = clk::now();
         CUgraphExecUpdateResultInfo info{};
-        CUresult rc = cuGraphExecUpdate_v2(shared.exec, shared.graph, &info);
-        shared.update_ns += ns_since(t);
-        TORCH_CHECK(rc == CUDA_SUCCESS && info.result == CU_GRAPH_EXEC_UPDATE_SUCCESS,
-                    "exec share: cuGraphExecUpdate failed for ", on_demand_data_->graph_name,
-                    " (CUresult ", static_cast<int>(rc), ", update result ",
-                    static_cast<int>(info.result), ")");
+        if (cgp_exec_update) {
+          // cudagraph-patch: prepare + cuGraphExecUpdate_v2 + finish on a registered exec.
+          // Until the patch passes unregistered / inert cases through to the real update,
+          // any nonzero return means the exec was not (correctly) updated.
+          const int rc = cgp_exec_update(shared.exec, shared.graph, &info);
+          shared.update_ns += ns_since(t);
+          TORCH_CHECK(rc == 0 && info.result == CU_GRAPH_EXEC_UPDATE_SUCCESS,
+                      "exec share: cgp_exec_update failed for ", on_demand_data_->graph_name,
+                      " (rc ", rc, ", update result ", static_cast<int>(info.result), ")");
+        } else {
+          CUresult rc = cuGraphExecUpdate_v2(shared.exec, shared.graph, &info);
+          shared.update_ns += ns_since(t);
+          TORCH_CHECK(rc == CUDA_SUCCESS && info.result == CU_GRAPH_EXEC_UPDATE_SUCCESS,
+                      "exec share: cuGraphExecUpdate failed for ", on_demand_data_->graph_name,
+                      " (CUresult ", static_cast<int>(rc), ", update result ",
+                      static_cast<int>(info.result), ")");
+        }
         t = clk::now();
         C10_CUDA_DRIVER_CHECK(cuGraphUpload(shared.exec, at::cuda::getCurrentCUDAStream()));
         shared.upload_ns += ns_since(t);
@@ -1025,6 +1037,8 @@ cudaGraphExec_t CUDAGraph::raw_cuda_graph_exec() {
 
 CUDAGraph::SharedGraphExec::~SharedGraphExec() {
   if (exec) {
+    if (share && cgp_exec_forget)
+      cgp_exec_forget(exec);  // an exec it never registered returns CGP_E_UNKNOWN_EXEC
     C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(exec)));
   }
   if (graph) {
@@ -1033,8 +1047,64 @@ CUDAGraph::SharedGraphExec::~SharedGraphExec() {
 }
 
 void CUDAGraph::instantiate_shared_template(SharedGraphExec& shared) {
-  shared.exec = reinterpret_cast<CUgraphExec>(
-      instantiate_graph_exec(reinterpret_cast<cudaGraph_t>(shared.graph)));
+  if (!cgp_exec_register_begin || !cgp_exec_register_end) {
+    shared.exec = reinterpret_cast<CUgraphExec>(
+        instantiate_graph_exec(reinterpret_cast<cudaGraph_t>(shared.graph)));
+  } else {
+    // cudagraph-patch records the exec's descriptors during this instantiate (same thread).
+    // Census of the public graph for cgp_exec_register_expect: CUfunction per kernel
+    // node, memcpy nodes, programmatic (PDL) edges.
+    std::vector<void*> functions;
+    unsigned memcpy_nodes = 0;
+    for (CUgraphNode node : shared.ordered_nodes) {
+      CUgraphNodeType type;
+      C10_CUDA_DRIVER_CHECK(cuGraphNodeGetType(node, &type));
+      if (type == CU_GRAPH_NODE_TYPE_KERNEL) {
+        CUDA_KERNEL_NODE_PARAMS params{};
+        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeGetParams(node, &params));
+        if (!params.func && params.kern)
+          C10_CUDA_DRIVER_CHECK(cuKernelGetFunction(&params.func, params.kern));
+        TORCH_CHECK(params.func, "exec share: cannot resolve a kernel node's CUfunction");
+        functions.push_back(reinterpret_cast<void*>(params.func));
+      } else {
+        memcpy_nodes += type == CU_GRAPH_NODE_TYPE_MEMCPY;
+      }
+    }
+    size_t count = 0;
+    C10_CUDA_DRIVER_CHECK(cuGraphGetEdges_v2(shared.graph, nullptr, nullptr, nullptr, &count));
+    std::vector<CUgraphNode> from(count), to(count);
+    std::vector<CUgraphEdgeData> edges(count);
+    C10_CUDA_DRIVER_CHECK(
+        cuGraphGetEdges_v2(shared.graph, from.data(), to.data(), edges.data(), &count));
+    unsigned pdl_edges = 0;
+    for (const auto& edge : edges)
+      pdl_edges += edge.type == CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC;
+    const unsigned kernels = static_cast<unsigned>(functions.size());
+    int rc = cgp_exec_register_begin();
+    if (rc)
+      fprintf(stderr, "[foundry] exec share: cgp_exec_register_begin failed (%d)\n", rc);
+    try {
+      if (cgp_exec_register_expect) {
+        cgp_census_t census{};
+        census.struct_size = sizeof(census);
+        census.functions = functions.data();
+        census.function_count = kernels;
+        census.pdl_edges = pdl_edges;
+        census.memcpy_nodes = memcpy_nodes;
+        rc = cgp_exec_register_expect(&census);
+        if (rc)
+          fprintf(stderr, "[foundry] exec share: cgp_exec_register_expect failed (%d)\n", rc);
+      }
+      shared.exec = reinterpret_cast<CUgraphExec>(
+          instantiate_graph_exec(reinterpret_cast<cudaGraph_t>(shared.graph)));
+    } catch (...) {
+      cgp_exec_register_end(nullptr, 0);  // cancels the scope
+      throw;
+    }
+    rc = cgp_exec_register_end(shared.exec, kernels);
+    if (rc)  // the first switch of this exec then fails at cgp_exec_update
+      fprintf(stderr, "[foundry] exec share: cgp_exec_register_end failed (%d)\n", rc);
+  }
   // Upload before the first update: an update ahead of an exec's first upload
   // demotes every changed node (docs/exec-update-penalty.md).
   C10_CUDA_DRIVER_CHECK(cuGraphUpload(shared.exec, nullptr));
@@ -1046,6 +1116,7 @@ std::string CUDAGraph::exec_share_stats() const {
     auto& shared = *on_demand_data_->shared_exec;
     std::lock_guard<std::mutex> lock(shared.replay_mutex);
     out["enabled"] = shared.share;
+    out["route"] = exec_share::patched_route() ? "cgp" : "cuGraphExecUpdate";
     out["valid"] = shared.valid;
     out["exec"] = reinterpret_cast<uintptr_t>(shared.exec);
     out["graph_id"] = on_demand_data_->graph_id;

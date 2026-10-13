@@ -11,6 +11,8 @@
 #include <cstring>
 #include <mutex>
 
+#include "CgpWeak.h"
+
 namespace foundry::exec_share {
 
 inline bool enabled() {
@@ -18,13 +20,17 @@ inline bool enabled() {
   return env && std::strcmp(env, "1") == 0;
 }
 
+// The member-switch route, from the weak cgp_* pointers (CgpWeak.h).
+inline bool patched_route() {
+  return cgp_exec_update != nullptr;
+}
+
 // Once per process, at the first share-mode Phase 2.
 inline void log_mode_once() {
   static std::once_flag once;
   std::call_once(once, [] {
-    fprintf(stderr,
-            "[foundry] exec share: template execs only, members switched by "
-            "cuGraphExecUpdate\n");
+    fprintf(stderr, patched_route() ? "[foundry] exec share: patched route (cgp)\n"
+                                    : "[foundry] exec share: real cuGraphExecUpdate\n");
   });
 }
 

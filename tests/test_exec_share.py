@@ -10,13 +10,16 @@ processes, eager (default) and share (FOUNDRY_ENABLE_EXEC_SHARE=1), replay the
 sizes in alternation, which in share mode switches the template's exec on
 every replay, and must match the SAVE outputs bit for bit. Share mode must log
 its mode line, instantiate no member exec and start no exec-pool prewarm.
-Per-replay times of a switch vs a repeat are printed, not asserted.
+Per-replay times of a switch vs a repeat are printed, not asserted. The route
+line must say cudagraph-patch when cgp_exec_update resolves in this process
+(LD_PRELOAD, inherited by the LOAD processes), the real update otherwise.
 
 A second workload (needs Triton) launches one Triton kernel with two BLOCK
 specializations: same function name and DAG, different binary. Share mode
 must split the saved group into one template per binary.
 """
 
+import ctypes
 import importlib.util
 import json
 import os
@@ -47,6 +50,14 @@ pytestmark = [
     pytest.mark.skipif(not _HAS_OPS, reason="foundry.ops not built/installed"),
     pytest.mark.filterwarnings("ignore:TORCH_CUDA_ARCH_LIST is not set"),
 ]
+
+# Weak cgp_* symbols bind in the LOAD processes only when the patch is preloaded,
+# and they inherit this process's LD_PRELOAD.
+_HAS_CGP = hasattr(ctypes.CDLL(None), "cgp_exec_update")
+ROUTE_LINE = {
+    True: "[foundry] exec share: patched route (cgp)",
+    False: "[foundry] exec share: real cuGraphExecUpdate",
+}
 
 BASE_ADDR = 0x4F0000000000
 REGION_SIZE_STR = "1GB"
@@ -291,6 +302,22 @@ def test_share_splits_kernel_binaries(runs):
     # Same names and DAG, two binaries of _affine_kernel: one template per binary.
     assert (saved, templates) == (1, 2)
     assert _phase2(share)[:2] == (2, len(SIZES) - 2)
+
+
+@pytest.mark.skipif(_HAS_CGP, reason="cudagraph-patch preloaded")
+def test_share_route_real(runs):
+    _, _, share = runs
+    assert ROUTE_LINE[False] in share
+    assert all(s["route"] == "cuGraphExecUpdate" for s in _stats(share)["execs"])
+
+
+@pytest.mark.skipif(
+    not _HAS_CGP, reason="cudagraph-patch not preloaded (cgp_exec_update unresolved)"
+)
+def test_share_route_patched(runs):
+    _, _, share = runs
+    assert ROUTE_LINE[True] in share
+    assert all(s["route"] == "cgp" for s in _stats(share)["execs"])
 
 
 def test_outputs_identical_between_modes(runs):

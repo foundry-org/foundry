@@ -208,7 +208,8 @@ struct CUDAGraph {
 
   // Instantiate with the flags instantiate() uses for a captured graph.
   static cudaGraphExec_t instantiate_graph_exec(cudaGraph_t graph);
-  // Share mode: instantiate the template's exec and upload it before any update.
+  // Share mode: instantiate the template's exec (registered with cudagraph-patch
+  // when its weak cgp_* symbols resolved) and upload it before any update.
   static void instantiate_shared_template(SharedGraphExec& shared);
 
   // LOAD Phase 2, binary archives: build the template's CUgraph from its
