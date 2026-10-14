@@ -65,7 +65,8 @@ against a fresh exec of the same mutated graph, H200):
   re-upload do not recover it; only a fresh instantiate does.
 - The cost is on the GPU timeline, about 0.1 us per demoted node per replay,
   linear in the dirty-node count (365/365 nodes: +13%) and independent of
-  kernel duration. Execs of at most 128 nodes are exempt.
+  kernel duration. On execs of at most 128 nodes the microbench showed no cost, but only because its
+  constants stayed cache-resident; several such execs replaying in turn pay it too.
 - Production decode graphs (365+ nodes, grids unique per batch size) sit in
   the full-penalty regime.
 
@@ -78,8 +79,7 @@ driver's generic descriptor builder, which rewrites a node's QMD on
 `cuGraphExecUpdate`, keeps the addresses and sizes but clears exactly those
 bits (CB5 `VALID` on the normal chain, CB0 `PREFETCH` on the PDL chain), and
 nothing recomputes the plan after an update. The demoted nodes are the ones
-replaying without prefetch; the 128-node exemption is where the plan is not
-built in the first place.
+replaying without prefetch; small execs hide it only while their constants stay cached.
 
 Fix: restore the plan after every update. At LOAD each template's pristine
 exec is inventoried once: for every kernel node, the QMD's prefetch state and

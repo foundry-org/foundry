@@ -76,8 +76,8 @@ windows) support.
 
 - **Restored-graph TPOT at parity with native capture.** Two root causes fixed:
   `cuGraphExecUpdate` on a shared template exec left it permanently slower
-  (now every on-demand member gets its own `cudaGraphInstantiate`, eager by
-  default, `FOUNDRY_LAZY_GRAPH_EXEC=1` to defer), and libcuda 580–610 applying
+  (now every on-demand member gets its own `cudaGraphInstantiate` in LOAD
+  Phase 2; `FOUNDRY_ENABLE_EXEC_SHARE=1` shares one exec per template), and libcuda 580–610 applying
   `edge_data[0]` to every edge of a bulk `cuGraphAddDependencies_v2` call,
   which silently dropped all programmatic-dependent-launch (PDL) edges of a
   rebuilt graph (now inserted per homogeneous edge record,

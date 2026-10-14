@@ -18,8 +18,9 @@ typedef struct cgp_census {
   unsigned function_count;
   unsigned pdl_edges;            /* programmatic dependency edges in the graph */
   unsigned memcpy_nodes;         /* public memcpy nodes (0 is a valid, explicit value) */
-  const unsigned* helper_counts; /* optional allowlist of acceptable internal helper counts */
-  unsigned helper_count_n;       /* 0: use CUDAGRAPH_PATCH_HELPERS or the default rule */
+  const unsigned* helper_counts; /* retired (ABI 1 layout kept); the patch classifies helpers by
+                                    driver identity */
+  unsigned helper_count_n;       /* retired, leave 0 */
   unsigned flags;                /* cgp_census_flags */
 } cgp_census_t;
 
