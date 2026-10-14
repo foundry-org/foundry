@@ -13,8 +13,7 @@ case "${2:-}" in
   "") ;;
   *) echo "Usage: $0 <ep_size> [--save|--load]"; exit 1 ;;
 esac
-export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
-export SGLANG_JIT_DEEPGEMM_PRECOMPILE="${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-0}"
+source "$SCRIPT_DIR/set_env.sh"
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
 [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] && export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((EP_SIZE - 1)))
 exec sglang serve \

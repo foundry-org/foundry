@@ -72,9 +72,12 @@ removed upstream, so they no longer run on the 0.0.2-era fork branch as-is.
 A single SAVE pass is enough — SGLang has no startup profile-forward, so there is no
 non-determinism that requires a two-pass save (unlike the vLLM recipe).
 
-**Run every engine with `TORCHDYNAMO_DISABLE=1` (the scripts export it; set it yourself when
-launching sglang by hand).** With it unset, SAVE fails at the first `@torch.compile` helper inside
-the capture window on torch >= 2.14.
+**Run every engine with the common environment of [`set_env.sh`](set_env.sh)** (the scripts
+source it; `source recipe/sglang/set_env.sh` yourself when launching sglang by hand):
+`TORCHDYNAMO_DISABLE=1` (with it unset, SAVE fails at the first `@torch.compile` helper inside the
+capture window on torch >= 2.14), `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`, and `NVSHMEM_DISABLE_NCCL=1`
+(NVSHMEM's per-team NCCL communicators cost ~2.4 s in every DeepEP bootstrap, native and LOAD alike,
+and the low-latency kernels never use them).
 
 **Warm the JIT caches once per machine and model before the first SAVE:** run the recipe
 once without `--save`/`--load`, wait for `/health`, stop it.
@@ -131,7 +134,7 @@ unsupported features (speculative decoding, LoRA, PD multiplexing, elastic-EP re
 non-full graph backends) are rejected. Full table:
 [`docs/sglang/overview.md`](../../docs/sglang/overview.md#what-the-plugin-pins-and-why).
 The scripts pass the collective flags (`--disable-custom-all-reduce --enable-torch-symm-mem`)
-and `TORCHDYNAMO_DISABLE=1` in every mode, so baseline, SAVE and LOAD capture the same
+and source `set_env.sh` in every mode, so baseline, SAVE and LOAD capture the same
 graph set; everything else they set is model/topology, not Foundry policy:
 
 - the decode graph set (`--cuda-graph-max-bs-decode`, `--cuda-graph-bs-decode`,

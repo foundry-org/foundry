@@ -32,8 +32,7 @@ case "$CFG" in
     MEMFRAC_DEFAULT=0.8 ;;
   *) echo "unknown topology '$CFG' (tpN|epN|tpepN)"; exit 1 ;;
 esac
-export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
-export SGLANG_JIT_DEEPGEMM_PRECOMPILE="${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-0}"
+source "$SCRIPT_DIR/set_env.sh"
 [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] && export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((N - 1)))
 exec sglang serve \
   --model-path "${SGL_MODEL:-Qwen/Qwen3.5-35B-A3B}" \

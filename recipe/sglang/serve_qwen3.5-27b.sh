@@ -18,7 +18,7 @@ case "$CFG" in
   tp[0-9]*) N=${CFG#tp}; TOPO=(--tp-size "$N") ;;
   *) echo "unknown topology '$CFG' (single|dpN|tpN)"; exit 1 ;;
 esac
-export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
+source "$SCRIPT_DIR/set_env.sh"
 [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] && export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((N - 1)))
 exec sglang serve \
   --model-path "${SGL_MODEL:-Qwen/Qwen3.5-27B}" \

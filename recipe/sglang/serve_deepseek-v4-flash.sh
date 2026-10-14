@@ -14,8 +14,7 @@ case "${2:-}" in
   "") ;;
   *) echo "Usage: $0 <epN> [--save|--load]"; exit 1 ;;
 esac
-export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
-export SGLANG_JIT_DEEPGEMM_PRECOMPILE="${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-0}"
+source "$SCRIPT_DIR/set_env.sh"
 # FP8 experts; without a probe-able checkpoint sglang would assume FP4, which Hopper DeepGEMM rejects.
 export SGLANG_DSV4_FP4_EXPERTS="${SGLANG_DSV4_FP4_EXPERTS:-0}"
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512 NVSHMEM_QP_DEPTH=2048

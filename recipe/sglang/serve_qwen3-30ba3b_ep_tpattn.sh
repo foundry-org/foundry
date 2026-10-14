@@ -14,8 +14,7 @@ case "${2:-}" in
   "") ;;
   *) echo "Usage: $0 <ep_size> [--save|--load]"; exit 1 ;;
 esac
-export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
-export SGLANG_JIT_DEEPGEMM_PRECOMPILE="${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-0}"
+source "$SCRIPT_DIR/set_env.sh"
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
 MAXBS=${MAXBS:-256}; ATP=$EP_SIZE
 GRAPHS=(--cuda-graph-max-bs-decode $((MAXBS * ATP)) --cuda-graph-bs-decode $(seq -s' ' "$ATP" "$ATP" $((MAXBS * ATP)))

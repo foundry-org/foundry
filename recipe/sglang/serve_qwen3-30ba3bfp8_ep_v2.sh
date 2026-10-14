@@ -1,6 +1,7 @@
 #!/bin/bash
-# Qwen3-30B-A3B-FP8, expert parallel over DeepEP v2 (NCCL symmetric windows + GIN).
-# Needs nvidia-nccl-cu13 >= 2.30.7 and a driver accepting its cu13.3 fatbins (see README).
+# Qwen3-30B-A3B-FP8, expert parallel over DeepEP v2 (NCCL symmetric windows), NVLink-only direct mode
+# (set_env.sh exports EP_DISABLE_GIN=1: the GIN mode hangs in the first warm-up forward). Needs
+# nvidia-nccl-cu13 >= 2.30.7, a driver accepting its cu13.3 fatbins (see README) and `cuobjdump` on PATH.
 # Usage: CUDA_VISIBLE_DEVICES=0,1 bash serve_qwen3-30ba3bfp8_ep_v2.sh <ep_size> [--save|--load]
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EP_SIZE=${1:?Usage: $0 <ep_size> [--save|--load]}
@@ -12,8 +13,7 @@ case "${2:-}" in
   "") ;;
   *) echo "Usage: $0 <ep_size> [--save|--load]"; exit 1 ;;
 esac
-export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
-export SGLANG_JIT_DEEPGEMM_PRECOMPILE="${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-0}"
+source "$SCRIPT_DIR/set_env.sh"
 CUDA_GRAPH_MAX_BS=${CUDA_GRAPH_MAX_BS:-256}   # decode graphs for every bs 1..256 per rank, no padding
 export SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-$(( CUDA_GRAPH_MAX_BS > 128 ? CUDA_GRAPH_MAX_BS : 128 ))}
 [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] && export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((EP_SIZE - 1)))

@@ -11,7 +11,7 @@ case "${1:-}" in
   "") ;;
   *) echo "Usage: $0 [--save|--load]"; exit 1 ;;
 esac
-export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
+source "$SCRIPT_DIR/set_env.sh"
 exec sglang serve \
   --model-path "${SGL_MODEL:-Qwen/Qwen3-1.7B}" \
   --trust-remote-code --host 0.0.0.0 --port "${PORT:-12000}" \

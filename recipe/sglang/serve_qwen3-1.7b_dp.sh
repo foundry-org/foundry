@@ -13,7 +13,7 @@ case "${2:-}" in
   "") ;;
   *) echo "Usage: $0 <dp_size> [--save|--load]"; exit 1 ;;
 esac
-export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
+source "$SCRIPT_DIR/set_env.sh"
 [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] && export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((DP_SIZE - 1)))
 exec sglang serve \
   --model-path "${SGL_MODEL:-Qwen/Qwen3-1.7B}" \

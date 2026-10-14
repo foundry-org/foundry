@@ -42,8 +42,7 @@ case "$CFG" in
   tp4ep8) MEMFRAC_DEFAULT=0.65 ;;
   *) MEMFRAC_DEFAULT=0.6 ;;
 esac
-export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
-export SGLANG_JIT_DEEPGEMM_PRECOMPILE="${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-0}"
+source "$SCRIPT_DIR/set_env.sh"
 [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] && export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((N - 1)))
 exec sglang serve \
   --model-path "$MODEL_PATH" \
