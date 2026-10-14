@@ -429,6 +429,15 @@ ENV_PINS: tuple[EnvPin, ...] = (
         "NVLS multicast buffers are mapped with driver flags Foundry's VMM region does not "
         "carry and are registered outside the recorded region",
     ),
+    # NVSHMEM builds one NCCL communicator per team (5 on a 4-rank node, ~0.4 s
+    # each) while DeepEP creates its buffer; the low-latency kernels never use
+    # them, and the pin changes no allocation, so existing archives stay valid.
+    EnvPin(
+        "NVSHMEM_DISABLE_NCCL",
+        "1",
+        "NVSHMEM's per-team NCCL communicators cost ~2.4 s in the DeepEP bootstrap and are "
+        "unused by the low-latency kernels",
+    ),
     EnvPin(
         "SGLANG_JIT_DEEPGEMM_PRECOMPILE",
         "0",
