@@ -13,6 +13,7 @@ import functools
 import gc
 import logging
 import os
+import threading
 import time
 from dataclasses import asdict
 
@@ -80,6 +81,37 @@ def install(cfg_path: str | None) -> None:
     logger.info("[Foundry] SGLang hooks installed")
 
 
+def _resolve_triton_key():
+    """Triton's process-wide cache key function (``functools.lru_cache``d):
+    ``triton.runtime.cache`` on current Triton, ``triton.compiler.compiler``
+    on older releases."""
+    try:
+        from triton.runtime.cache import triton_key
+    except ImportError:
+        from triton.compiler.compiler import triton_key
+    return triton_key
+
+
+def _prewarm_triton_key() -> None:
+    try:
+        _resolve_triton_key()()
+    except Exception as e:  # noqa: BLE001 - a prewarm must never fail the rank
+        logger.debug("[Foundry] SGLang triton_key prewarm skipped: %r", e)
+
+
+def _start_triton_key_prewarm() -> None:
+    """Compute Triton's cache key (sha256 of libtriton and the triton.language
+    sources, ~0.45 s, cached for the process) on a daemon thread, so it
+    overlaps the weight load instead of landing on the first Triton launch
+    inside the capture loop. hashlib releases the GIL on large buffers.
+    Nothing waits for it: a later caller either hits the cache or computes
+    the key itself, as without the prewarm."""
+    threading.Thread(
+        target=_prewarm_triton_key, name="foundry-triton-key-prewarm", daemon=True
+    ).start()
+    logger.info("[Foundry] SGLang triton_key prewarm started")
+
+
 def _before_distributed_init(server_args, device: str, gpu_id: int, ranks) -> None:
     """Bind this rank's VMM region before any communicator exists. Same
     sequence point on SAVE and LOAD: the head of the process-group bring-up
@@ -97,6 +129,8 @@ def _before_distributed_init(server_args, device: str, gpu_id: int, ranks) -> No
         import torch
 
         torch.get_device_module(device).set_device(gpu_id)
+
+    _start_triton_key_prewarm()
 
     tp_rank, pp_rank, dp_rank = ranks
     rt.setup_graph_extension(server_args, tp_rank=tp_rank, pp_rank=pp_rank, dp_rank=dp_rank)

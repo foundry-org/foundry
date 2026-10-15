@@ -104,6 +104,15 @@ def test_distributed_bring_up_site():
         assert "self.ps" in inspect.getsource(ModelRunner.__init__)
 
 
+def test_triton_key_is_cached_process_wide():
+    """The triton_key prewarm thread only helps if the main thread's later
+    call hits the same lru_cache."""
+    pytest.importorskip("triton")
+    from foundry.integration.sglang.hooks import _resolve_triton_key
+
+    assert hasattr(_resolve_triton_key(), "cache_info")
+
+
 def test_engine_launch_is_a_classmethod():
     from sglang.srt.entrypoints.engine import Engine
 
