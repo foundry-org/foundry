@@ -282,9 +282,17 @@ def test_share_route_real(runs):
 @pytest.mark.skipif(
     not _HAS_CGP, reason="cudagraph-patch not preloaded (cgp_exec_update unresolved)"
 )
+@pytest.mark.skipif(
+    os.environ.get("CUDAGRAPH_PATCH") != "1",
+    reason="CUDAGRAPH_PATCH=1 not set: the preloaded patch passes every update through",
+)
 def test_share_route_patched(runs):
+    """The patch must be active, not merely resolvable: with LD_PRELOAD alone it logs
+    'patch inactive' and passes every update to the driver."""
     _, _, share = runs
     assert ROUTE_LINE[True] in share
+    assert "patch inactive" not in share
+    assert "installed execupdate_prefetch profile" in share
     assert all(s["route"] == "cgp" for s in _stats(share)["execs"])
 
 

@@ -10,8 +10,8 @@ Runs on whichever route the installed sglang has (_sglang_helpers.foundry_launch
 environment variable otherwise.
 
 Needs sglang, a CUDA GPU and the model's config (HF cache or network).
-Model override: FOUNDRY_E2E_MODEL (default: sglang's
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST, meta-llama/Llama-3.2-1B-Instruct).
+Model override: FOUNDRY_E2E_MODEL (default Qwen/Qwen3-1.7B: ungated; sglang's
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST is the gated meta-llama/Llama-3.2-1B-Instruct).
 
     pytest tests/sgl/e2e/test_save_load_1gpu.py -m slow -v -s
 """
@@ -26,14 +26,11 @@ torch = pytest.importorskip("torch")
 
 from _sglang_helpers import ACTIVE as _ACTIVE  # noqa: E402
 from _sglang_helpers import foundry_toml, serve  # noqa: E402
-from sglang.test.test_utils import (  # noqa: E402
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-)
+from sglang.test.test_utils import DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
-_MODEL = os.environ.get("FOUNDRY_E2E_MODEL", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+_MODEL = os.environ.get("FOUNDRY_E2E_MODEL", "Qwen/Qwen3-1.7B")
 _DECODE_BS = ["1", "2", "4", "8"]
 _ARGS = [
     "--load-format",
