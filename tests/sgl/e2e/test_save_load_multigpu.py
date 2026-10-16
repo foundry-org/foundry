@@ -122,6 +122,7 @@ def _decode_step(n, maxbs):
 def _case(case_id, model, gpus, args, graphs, *, memfrac, weights, env=None, marks=()):
     return pytest.param(
         {
+            "id": case_id,
             "model": model,
             "gpus": gpus,
             "args": [*args, *graphs, "--mem-fraction-static", str(memfrac)],
