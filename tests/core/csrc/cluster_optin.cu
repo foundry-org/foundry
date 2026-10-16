@@ -6,7 +6,7 @@
 // added, instantiated and launched from a function that never got the capture process's
 // cudaFuncSetAttribute(NonPortableClusterSizeAllowed). No model, no archive.
 //
-//   nvcc -std=c++17 -arch=sm_90 -I include tests/cluster_optin.cu -lcuda -o cluster_optin
+//   nvcc -std=c++17 -arch=sm_90 -I include tests/core/csrc/cluster_optin.cu -lcuda -o cluster_optin
 //   ./cluster_optin    # exit 0 = every case passes, 3 = device cannot run 16-block clusters
 #include "ClusterOptIn.h"
 

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Restored kernel nodes of non-portable (16-block) cluster kernels must be addable.
 
-Compiles tests/cluster_optin.cu against include/ClusterOptIn.h (the helper every LOAD
+Compiles tests/core/csrc/cluster_optin.cu against include/ClusterOptIn.h (the helper every LOAD
 path uses to add kernel nodes) and runs it: compiled and launch-attribute 16-block
 clusters are added, instantiated and launched from functions that never got the
 capture process's NonPortableClusterSizeAllowed opt-in; portable clusters are untouched.
@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_non_portable_cluster_nodes(tmp_path):
@@ -33,7 +33,7 @@ def test_non_portable_cluster_nodes(tmp_path):
             f"-arch=sm_{major}{minor}",
             "-I",
             str(ROOT / "include"),
-            str(ROOT / "tests/cluster_optin.cu"),
+            str(ROOT / "tests/core/csrc/cluster_optin.cu"),
             "-lcuda",
             "-o",
             str(exe),

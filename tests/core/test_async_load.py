@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
+"""Async LOAD (1 GPU): SAVE 12 graphs of a stacked MLP, then LOAD them with
+start_graph_builds(num_threads=6), CPU foreground work while Phase 2 builds,
+finish_graph_loads, and replays checked against eager.
+
+    pytest tests/core/test_async_load.py -q -s
+"""
+
 import os
-import shutil
-import subprocess
 import sys
 import time
-from pathlib import Path
 
-import pytest
 import torch
+from _helpers import run_phase
 
 BASE_ADDR = 0x2F0000000000
 REGION_SIZE_STR = "2GB"
-ARCHIVE_DIR = "test_archive"
 HOOK_ARCHIVE_DIR = "hook_archive"
 
 NUM_GRAPHS = 12
@@ -20,22 +23,6 @@ BATCH_SIZES = [8, 16, 32, 64, 128, 256, 512, 1024, 8, 16, 32, 64]
 HIDDEN_DIM = 1024
 MLP_DIM = 4096
 NUM_MLP_LAYERS = 4  # Stack multiple layers per graph for more kernel nodes
-
-
-def _get_hook_so_path():
-    import importlib.util
-
-    spec = importlib.util.find_spec("foundry.ops")
-    if not spec or not spec.origin:
-        raise RuntimeError("foundry.ops not found; ensure setup.py develop/pip install completed")
-
-    ops_so_path = Path(spec.origin).resolve()
-    hook_so_path = ops_so_path.parent / "libcuda_hook.so"
-
-    if not hook_so_path.exists():
-        raise RuntimeError(f"libcuda_hook.so not found at {hook_so_path}")
-
-    return str(hook_so_path)
 
 
 def init_cublas():
@@ -74,8 +61,8 @@ def _simulate_foreground_work():
 
     Uses CPU-bound work to keep the main thread busy without allocating GPU
     memory (which would advance the VMM pointer and break SAVE/LOAD address
-    matching). In real vLLM, the overlapped work is model weight loading
-    which does allocate GPU memory — but that's matched between SAVE and LOAD.
+    matching). In an engine the overlapped work is weight loading, which does
+    allocate GPU memory, identically in SAVE and LOAD.
     """
     import numpy as np
 
@@ -93,7 +80,7 @@ def _simulate_foreground_work():
     print(f"  [FG] Foreground work done in {elapsed * 1000:.1f}ms")
 
 
-def _run_saving_run():
+def _run_saving_run(archive):
     """Capture and save multiple graphs with different batch sizes."""
     import foundry as fdry
 
@@ -102,8 +89,6 @@ def _run_saving_run():
     torch.cuda.init()
     device = torch.device("cuda:0")
     torch.set_default_device(device)
-
-    os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
     region_size = fdry.parse_size(REGION_SIZE_STR)
     fdry.set_allocation_region(BASE_ADDR, region_size)
@@ -134,7 +119,7 @@ def _run_saving_run():
         torch.cuda.synchronize()
         torch.testing.assert_close(output.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3)
 
-        graph_json = os.path.join(ARCHIVE_DIR, f"graph_{i}.json")
+        graph_json = os.path.join(archive, f"graph_{i}.json")
         graph.save(graph_json, output_tensors=output)
         print(f"[SAVE] Saved graph_{i}.json (batch_size={bs}, output shape={output.shape})")
 
@@ -142,7 +127,7 @@ def _run_saving_run():
     print("[SAVE] Saving run completed")
 
 
-def _run_loading_run():
+def _run_loading_run(archive):
     """Load graphs asynchronously and verify correctness."""
     import foundry as fdry
 
@@ -151,9 +136,6 @@ def _run_loading_run():
     torch.cuda.init()
     device = torch.device("cuda:0")
     torch.set_default_device(device)
-
-    if not os.path.exists(ARCHIVE_DIR):
-        raise RuntimeError(f"Archive directory {ARCHIVE_DIR} not found")
 
     fdry.load_cuda_modules_and_libraries(HOOK_ARCHIVE_DIR)
     print(f"[LOAD] CUDA modules loaded from {HOOK_ARCHIVE_DIR}")
@@ -172,7 +154,7 @@ def _run_loading_run():
         init_cublas()
     print("[LOAD] cuBLAS initialized")
 
-    graph_paths = [os.path.join(ARCHIVE_DIR, f"graph_{i}.json") for i in range(NUM_GRAPHS)]
+    graph_paths = [os.path.join(archive, f"graph_{i}.json") for i in range(NUM_GRAPHS)]
 
     # --- Phase 1: start_graph_builds (returns immediately) ---
     num_threads = 6
@@ -226,50 +208,12 @@ def _run_loading_run():
     print("[LOAD] Loading run completed")
 
 
-def _cleanup_archive():
-    if os.path.exists(ARCHIVE_DIR):
-        shutil.rmtree(ARCHIVE_DIR)
-    if os.path.exists(HOOK_ARCHIVE_DIR):
-        shutil.rmtree(HOOK_ARCHIVE_DIR)
-
-
-def _spawn_with_preload(launch_mode):
-    so_path = _get_hook_so_path()
-    env = os.environ.copy()
-    if env.get("LD_PRELOAD"):
-        env["LD_PRELOAD"] = f"{so_path}:{env['LD_PRELOAD']}"
-    else:
-        env["LD_PRELOAD"] = so_path
-    env["TORCH_CUBLASLT_UNIFIED_WORKSPACE"] = "1"
-
-    cmd = [sys.executable, str(Path(__file__).resolve()), f"--{launch_mode}"]
-    subprocess.check_call(cmd, env=env)
-
-
-@pytest.mark.filterwarnings("ignore:TORCH_CUDA_ARCH_LIST is not set")
-def test_async_graph_load():
-    """Test async CUDA graph loading with foreground work overlap."""
-    print("\n[TEST] Starting test_async_graph_load")
-
-    _cleanup_archive()
-
-    print(f"[TEST] Step 1: Saving run (capture {NUM_GRAPHS} graphs, {NUM_MLP_LAYERS} layers each)")
-    _spawn_with_preload("saving-run")
-
-    print("[TEST] Step 2: Loading run (async load + foreground overlap + verify)")
-    _spawn_with_preload("loading-run")
-
-    _cleanup_archive()
-
-    print("[TEST] test_async_graph_load PASSED")
+def test_async_graph_load(workdir):
+    """Async CUDA graph loading with foreground work overlap."""
+    run_phase(__file__, "save", workdir)
+    assert (workdir / HOOK_ARCHIVE_DIR).is_dir(), "SAVE did not pack hook_archive"
+    run_phase(__file__, "load", workdir)
 
 
 if __name__ == "__main__":
-    if "--saving-run" in sys.argv:
-        _run_saving_run()
-    elif "--loading-run" in sys.argv:
-        _run_loading_run()
-    elif "--cleanup" in sys.argv:
-        _cleanup_archive()
-    else:
-        test_async_graph_load()
+    {"--save": _run_saving_run, "--load": _run_loading_run}[sys.argv[1]](sys.argv[2])

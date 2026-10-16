@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Eager vs exec-share LOAD (1 GPU, no vLLM/SGLang).
 
-Usage: pytest tests/test_exec_share.py -q -s
+Usage: pytest tests/core/test_exec_share.py -q -s
+With cudagraph-patch preloaded (the patched-route case; the real-route case then skips):
+    eval "$(cudagraph-patch env)" && pytest tests/core/test_exec_share.py -q -s
 
 SAVE captures one elementwise chain (>128 kernel nodes) at several batch sizes:
 same kernels and DAG, different grids, so one template plus members. Two LOAD
@@ -20,18 +22,16 @@ must split the saved group into one template per binary.
 """
 
 import ctypes
-import importlib.util
 import json
 import os
 import re
 import statistics
-import subprocess
 import sys
 import time
-from pathlib import Path
 
 import pytest
 import torch
+from _helpers import load_reference, prefix_region, run_phase, save_reference
 
 try:
     import triton
@@ -40,16 +40,6 @@ try:
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
-
-_spec = importlib.util.find_spec("foundry")
-_HAS_OPS = _spec is not None and any(
-    next(Path(p).glob("ops*.so"), None) for p in (_spec.submodule_search_locations or [])
-)
-pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 1 GPU"),
-    pytest.mark.skipif(not _HAS_OPS, reason="foundry.ops not built/installed"),
-    pytest.mark.filterwarnings("ignore:TORCH_CUDA_ARCH_LIST is not set"),
-]
 
 # Weak cgp_* symbols bind in the LOAD processes only when the patch is preloaded,
 # and they inherit this process's LD_PRELOAD.
@@ -114,15 +104,10 @@ def _workload_body():
     return _body_triton if os.environ.get(WORKLOAD_ENV) == "triton" else _body
 
 
-def _prefix(fdry):
+def _prefix():
     """Identical in SAVE and LOAD: the VMM cursor and the caching allocator."""
-    torch.cuda.init()
-    torch.cuda.set_device(0)
-    fdry.set_allocation_region(BASE_ADDR, fdry.parse_size(REGION_SIZE_STR))
-    g = torch.Generator().manual_seed(0)
+    g, stream = prefix_region(BASE_ADDR, REGION_SIZE_STR)
     x = torch.randn(max(SIZES), HIDDEN, generator=g).cuda()
-    stream = torch.cuda.Stream()
-    fdry.graph.default_capture_stream = stream
     body = _workload_body()
     with torch.cuda.stream(stream):
         for n in SIZES if body is _body_triton else SIZES[:1]:
@@ -139,7 +124,7 @@ def _graph_paths(archive):
 def _run_save(archive):
     import foundry as fdry
 
-    x = _prefix(fdry)
+    x = _prefix()
     body = _workload_body()
     graphs, outs = [], []
     for path, n in zip(_graph_paths(archive), SIZES):
@@ -153,7 +138,7 @@ def _run_save(archive):
         graphs.append(graph)
         outs.append(out.cpu().clone())
     fdry.save_graph_manifest(archive)
-    torch.save({"outs": outs, "input_ptr": x.data_ptr()}, os.path.join(archive, "save.pt"))
+    save_reference(archive, outs, [x])
     fdry.stop_allocation_region()
 
 
@@ -177,9 +162,8 @@ def _run_load(archive):
 
     mode = "share" if os.environ.get(SHARE_ENV) == "1" else "eager"
     fdry.load_cuda_modules_and_libraries("hook_archive")
-    x = _prefix(fdry)
-    ref = torch.load(os.path.join(archive, "save.pt"))
-    assert x.data_ptr() == ref["input_ptr"], "VMM layout diverged from SAVE"
+    x = _prefix()
+    ref_outs = load_reference(archive, [x])
 
     paths = _graph_paths(archive)
     fdry.CUDAGraph.start_exec_pool_prewarm(paths)  # as SGLang LOAD does; no-op in share mode
@@ -193,7 +177,7 @@ def _run_load(archive):
         graphs[i].replay()
         torch.cuda.synchronize()
         got = outs[i].cpu().clone()
-        assert torch.equal(got, ref["outs"][i]), f"{mode}: graph {i} (rows {SIZES[i]}) != SAVE"
+        assert torch.equal(got, ref_outs[i]), f"{mode}: graph {i} (rows {SIZES[i]}) != SAVE"
         replays.append(got)
     torch.save(replays, os.path.join(archive, f"load_{mode}.pt"))
 
@@ -218,27 +202,11 @@ def _run_load(archive):
 
 
 def _spawn(cmd_mode, workdir, share=False, workload="elementwise"):
-    """SAVE/LOAD subprocess with the hook preloaded (cwd: ./hook_archive lives there).
-    Returns the combined stdout/stderr."""
-    from _helpers import hook_so_path
-
-    env = os.environ.copy()
-    env.pop(SHARE_ENV, None)
+    """SAVE/LOAD child; returns its combined stdout/stderr."""
+    env = {WORKLOAD_ENV: workload}
     if share:
         env[SHARE_ENV] = "1"
-    env[WORKLOAD_ENV] = workload
-    preload = env.get("LD_PRELOAD")
-    env["LD_PRELOAD"] = f"{hook_so_path()}:{preload}" if preload else hook_so_path()
-    env["TORCH_CUBLASLT_UNIFIED_WORKSPACE"] = "1"
-    archive = workdir / "archive"
-    archive.mkdir(exist_ok=True)
-    cmd = [sys.executable, str(Path(__file__).resolve()), f"--{cmd_mode}", str(archive)]
-    proc = subprocess.run(
-        cmd, env=env, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
-    print(proc.stdout)
-    assert proc.returncode == 0, f"{cmd_mode} (share={share}) failed"
-    return proc.stdout
+    return run_phase(__file__, cmd_mode, workdir, env=env)
 
 
 def _phase2(log):

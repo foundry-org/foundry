@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Restored graphs must keep mixed default/programmatic (PDL) edge records.
 
-Compiles tests/graph_dependencies.cu against include/GraphDependencies.h and
+Compiles tests/core/csrc/graph_dependencies.cu against include/GraphDependencies.h and
 runs it twice: grouped insertion (what foundry does) must preserve every edge
 record; the raw single-call variant only reports whether the installed driver
 broadcasts edge_data[0] (libcuda 580-610 do), which is why the grouping exists.
@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(scope="module")
@@ -34,7 +34,7 @@ def reproducer(tmp_path_factory):
             f"-arch=sm_{major}{minor}",
             "-I",
             str(ROOT / "include"),
-            str(ROOT / "tests/graph_dependencies.cu"),
+            str(ROOT / "tests/core/csrc/graph_dependencies.cu"),
             "-lcuda",
             "-o",
             str(exe),

@@ -4,7 +4,8 @@
 // Driver-level regression for foundry::add_graph_dependencies: mixed default /
 // programmatic (PDL) edge records must survive insertion. No model, no archive.
 //
-//   nvcc -std=c++17 -arch=sm_90 -I include tests/graph_dependencies.cu -lcuda -o graph_dependencies
+//   nvcc -std=c++17 -arch=sm_90 -I include \
+//     tests/core/csrc/graph_dependencies.cu -lcuda -o graph_dependencies
 //   ./graph_dependencies          # grouped insertion (foundry); exit 0 = every record preserved
 //   ./graph_dependencies --raw    # one bulk cuGraphAddDependencies_v2 call; exit 1 = driver
 //   broadcasts edge_data[0]
