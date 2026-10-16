@@ -79,7 +79,7 @@ cd foundry
 git checkout bump
 uv pip install -e . --no-build-isolation
 uv pip install pytest
-pytest tests/
+pytest tests/unit tests/core
 cd ..
 ```
 

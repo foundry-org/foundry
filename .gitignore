@@ -363,7 +363,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-tests/deepep_matrix_work/
 deepep_fabric_archive/
 hook_archive/
 

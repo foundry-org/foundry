@@ -148,7 +148,7 @@ launch. `include/ClusterOptIn.h` sets it (once per handle) whenever the merged
 cluster exceeds 8 blocks; the attribute is not stored because the dims imply
 it, so archives saved before this need no migration. If the recorded dims miss
 a compiled cluster, the add retries once after reading the compiled dims from
-the driver. Test: `tests/test_cluster_optin.py` (driver-level, no archive).
+the driver. Test: `tests/core/test_cluster_optin.py` (driver-level, no archive).
 
 ## Knobs
 

@@ -63,11 +63,11 @@ disguised as a cosmetic cleanup. Two layers protect against this:
 1. `pyproject.toml::[tool.ruff.lint].unfixable = ["F401", "F841"]` — ruff
    reports unused imports but does not auto-remove them. You still see the
    warning; you decide whether to delete or to add `__all__`.
-2. `tests/test_imports.py` — a smoke test that imports every public Foundry
+2. `tests/unit/test_imports.py` — a smoke test that imports every public Foundry
    API. Run it after any pre-commit-driven cleanup:
 
    ```bash
-   pytest tests/test_imports.py -q
+   pytest tests/unit/test_imports.py -q
    ```
 
    If it fails, an import got dropped. Add the missing name to the source
@@ -94,6 +94,10 @@ disguised as a cosmetic cleanup. Two layers protect against this:
 ```bash
 pytest tests/
 ```
+
+Unit and single-GPU tiers run by default; engine launches and multi-GPU tiers are opt-in
+(`pytest tests/unit` on a host without a GPU, `-m slow` for the SGLang engine tests,
+`-m "slow and multigpu"` for the 2-GPU ones). See [tests/README.md](tests/README.md).
 
 C++ side test build comes from CMake; see `CMakeLists.txt` and `README.md`.
 

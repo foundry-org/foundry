@@ -15,7 +15,7 @@ query right after that call returned zero programmatic edges.
 
 **Cause.** libcuda applies `edge_data[0]` to every edge of a bulk
 `cuGraphAddDependencies_v2` call instead of reading one record per edge.
-Verified with `tests/graph_dependencies.cu --raw` on the 580.126.20 host driver
+Verified with `tests/core/csrc/graph_dependencies.cu --raw` on the 580.126.20 host driver
 and on the 595.91.07 and 610.57.04 forward-compat libraries: a mixed array
 whose first record is default yields all-default edges; one whose first record
 is PDL yields all-PDL edges; uniform arrays are preserved. A rebuilt graph
@@ -51,6 +51,6 @@ insertion and flags a mismatch. Results, restored vs unmodified sglang
 | ep2, DeepEP low-latency | +4% | -0.0 / -0.0 / +0.1 / +0.6% |
 | v2ep2, DeepEP v2 (NCCL) | +6.4% | +0.0 / +0.0 / +0.2 / +0.2% |
 
-**Checking a new driver.** `pytest tests/test_graph_dependencies.py -s` compiles
+**Checking a new driver.** `pytest tests/core/test_graph_dependencies.py -s` compiles
 the reproducer; the second test prints whether the raw single call still
 broadcasts. The grouped path is correct either way.

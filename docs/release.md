@@ -142,7 +142,7 @@ create releases (the default for a repository).
    pip install foundry-core==0.1.0rc2 --extra-index-url https://foundry-org.github.io/foundry/whl/cu130/torch2.13/
    pip show foundry-core | grep Version      # 0.1.0rc2+cu130.torch2.13
    # in each venv, on 1 GPU from a foundry checkout: SAVE -> LOAD round trip (RNG, cuBLAS, pool)
-   pytest tests/test_torch_compat.py -q -s
+   pytest tests/core/test_save_load.py -k compat -q -s
    ```
 
 A PyPI version can never be re-uploaded. If a published release is broken,

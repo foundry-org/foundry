@@ -204,6 +204,10 @@ Run the test suite:
 pytest tests/
 ```
 
+Unit and single-GPU tiers run by default; engine launches and multi-GPU tiers are opt-in
+(`pytest tests/unit` on a host without a GPU, `-m slow` for the SGLang engine tests,
+`-m "slow and multigpu"` for the 2-GPU ones). See [tests/README.md](tests/README.md).
+
 ## Setting up clangd
 
 ```

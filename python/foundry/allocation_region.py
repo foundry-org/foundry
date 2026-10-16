@@ -61,7 +61,8 @@ def parse_size(size: int | str) -> int:
 # THIS CONTEXT MANAGER IS NOT RECOMMENDED
 # NOTE: If you are using torch or other libraries that has internal memory pool,
 # this context manager will not work as expected.
-# See tests/test_stop_resume.py for how to guarantee start/stop of the allocation region.
+# See tests/core/test_allocation_region.py (stop/resume) for how to guarantee start/stop
+# of the allocation region.
 @contextmanager
 def allocation_region(base: int | str, size: int | str, prealloc_size: int | str | None = None):
     """

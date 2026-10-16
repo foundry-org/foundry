@@ -13,7 +13,7 @@ each cause, how it was found and what fixed it, so the replay design in
 | every batch-size switch synchronized the device and rewrote the whole exec | replay path | update only on a member change, overlapped with the in-flight forward; same-member replays launch directly |
 | `cuGraphExecUpdate` cleared the exec's constant-prefetch plan | CUDA driver's update path | the prefetch bits are restored on the updated descriptors after every update |
 
-Bench for the last two: `tests/bench_exec_update.py`.
+Bench for the last two: `tools/bench/bench_exec_update.py`.
 
 ## 1. PDL edges were rebuilt as full dependencies
 

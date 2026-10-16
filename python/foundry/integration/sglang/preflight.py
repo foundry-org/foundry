@@ -26,8 +26,8 @@ installed package::
 It prints one ``[Foundry preflight] ok: ...`` line per check, or a single
 ``[Foundry preflight] FAILED: <reason>`` line on stderr and exits 1. Relative
 ``workspace_root`` values resolve against the current directory (``--cwd``),
-the directory ``sglang serve`` will run in. The recipe scripts
-(``recipe/sglang/serve_common.sh``) and the end-to-end test call it.
+the directory ``sglang serve`` will run in. The end-to-end tests call it;
+recipe/sglang/README.md shows how to run it by hand.
 """
 
 from __future__ import annotations
@@ -93,7 +93,7 @@ def check_sglang_origin(sglang_mod, cwd: Path | None = None) -> str | None:
     cwd = (cwd or Path.cwd()).resolve()
     hint = (
         "run the preflight from another directory or with PYTHONSAFEPATH=1 (python -P), "
-        "as recipe/sglang/serve_common.sh does"
+        "as recipe/sglang/README.md shows"
     )
     file = getattr(sglang_mod, "__file__", None)
     if file is None:
