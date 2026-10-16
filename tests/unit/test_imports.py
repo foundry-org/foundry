@@ -22,13 +22,18 @@ PUBLIC_MODULES = [
     "foundry.ops",
     "foundry.graph",
     "foundry.allocation_region",
-    # SGLang integration
+    # SGLang integration (no sglang import at module top)
     "foundry.integration.sglang",
+    "foundry.integration.sglang.api",
+    "foundry.integration.sglang.archive_check",
     "foundry.integration.sglang.config",
-    "foundry.integration.sglang.hooks",
-    "foundry.integration.sglang.runtime",
+    "foundry.integration.sglang.flashinfer_cute_cache",
     "foundry.integration.sglang.graph_ops",
+    "foundry.integration.sglang.hooks",
+    "foundry.integration.sglang.nvtx",
     "foundry.integration.sglang.plugin",
+    "foundry.integration.sglang.preflight",
+    "foundry.integration.sglang.runtime",
     # sglang plugin entry point (pyproject [project.entry-points."sglang.srt.plugins"])
     "foundry_sglang_plugin",
 ]
@@ -43,9 +48,8 @@ VLLM_MODULES = [
 ]
 
 # Names that have historically been ruff --fix victims because they live in
-# re-export modules. If any of these stop importing, the integration breaks
-# silently — the serve script "looks fine", logs no [foundry] / [HOOK] lines,
-# and vLLM runs without graph-extension hooks. See tools/pre_commit/ notes.
+# re-export modules. If any of these stop importing, every integration that
+# reaches them through `foundry` fails at import or at its first use.
 PUBLIC_NAMES_FROM_FOUNDRY = [
     "CUDAGraph",
     "allocation_region",
@@ -95,12 +99,3 @@ def test_vllm_integration_public_api():
     mod = importlib.import_module("foundry.integration.vllm")
     for name in ("install_hooks", "CUDAGraphExtensionMode", "get_graph_extension_mode"):
         assert hasattr(mod, name), f"foundry.integration.vllm.{name} not exported"
-
-
-def test_sglang_integration_submodules_importable():
-    # SGLang side currently exposes its API via submodules rather than
-    # re-exports on `foundry.integration.sglang`. Just verify each submodule
-    # imports cleanly — a ruff --fix that stripped a critical import would
-    # break this.
-    for sub in ("config", "hooks", "runtime", "graph_ops"):
-        importlib.import_module(f"foundry.integration.sglang.{sub}")

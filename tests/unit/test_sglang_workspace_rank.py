@@ -7,7 +7,7 @@ The DP controller passes ``dp_rank`` = replica without attention DP, and
 after sglang #41818 (``--attn-dp-size``). The archive numbering must not
 depend on the layout. Plain namespaces, no sglang or GPU needed.
 
-    pytest tests/integration/sglang/test_sglang_workspace_rank.py -v
+    pytest tests/unit/test_sglang_workspace_rank.py -v
 """
 
 from types import SimpleNamespace

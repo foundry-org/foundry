@@ -3,7 +3,7 @@
 """The FlashInfer CuTe-DSL ``.o`` cache patch (flashinfer_cute_cache.py) on
 fake flashinfer / cutlass modules. No GPU.
 
-    pytest tests/integration/sglang/test_sglang_flashinfer_cute_cache.py -v
+    pytest tests/unit/test_sglang_flashinfer_cute_cache.py -v
 """
 
 import sys
