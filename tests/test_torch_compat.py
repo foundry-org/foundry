@@ -121,11 +121,11 @@ def _run_load(archive):
 def _spawn(mode, workdir):
     """SAVE/LOAD subprocess with the hook preloaded, env as test_load_cublas_ws.
     cwd is the workdir: the hook packs/reads ./hook_archive."""
-    from test_load_cublas_ws import _get_hook_so_path
+    from _helpers import hook_so_path
 
     env = os.environ.copy()
     preload = env.get("LD_PRELOAD")
-    env["LD_PRELOAD"] = f"{_get_hook_so_path()}:{preload}" if preload else _get_hook_so_path()
+    env["LD_PRELOAD"] = f"{hook_so_path()}:{preload}" if preload else hook_so_path()
     env["TORCH_CUBLASLT_UNIFIED_WORKSPACE"] = "1"
     archive = workdir / "archive"
     archive.mkdir(exist_ok=True)

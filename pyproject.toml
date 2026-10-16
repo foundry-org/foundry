@@ -129,7 +129,17 @@ docstring-code-format = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tests/_helpers.py is imported from every tier (and by the SAVE / LOAD children).
+pythonpath = ["tests"]
+# Engine launches and 4-GPU cases are opt-in: -m slow, -m "slow and multigpu", -m "slow and xlarge".
+addopts = "-ra -m 'not slow and not xlarge'"
+# Markers are applied by directory in tests/conftest.py (see tests/README.md).
 markers = [
-    "xlarge: 4-GPU, 100+ GB model end-to-end cases; deselected by default, run with -m xlarge",
+    "gpu: needs a CUDA device (tests/core, tests/multigpu, tests/sglang/e2e); skipped without one",
+    "multigpu: needs 2 CUDA devices (tests/multigpu, multi-GPU e2e cases); skipped with fewer",
+    "sglang: needs sglang (tests/sglang)",
+    "slow: engine launches and model downloads (tests/sglang/e2e); deselected by default",
+    "xlarge: 4-GPU, 100+ GB model cases; deselected by default, run with -m 'slow and xlarge'",
+    "plugin_route: sglang plugin route only; delete together with the plugin",
 ]
-addopts = "-m 'not xlarge'"
+filterwarnings = ["ignore:TORCH_CUDA_ARCH_LIST is not set"]

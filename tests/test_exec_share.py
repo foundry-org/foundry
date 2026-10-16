@@ -220,7 +220,7 @@ def _run_load(archive):
 def _spawn(cmd_mode, workdir, share=False, workload="elementwise"):
     """SAVE/LOAD subprocess with the hook preloaded (cwd: ./hook_archive lives there).
     Returns the combined stdout/stderr."""
-    from test_load_cublas_ws import _get_hook_so_path
+    from _helpers import hook_so_path
 
     env = os.environ.copy()
     env.pop(SHARE_ENV, None)
@@ -228,7 +228,7 @@ def _spawn(cmd_mode, workdir, share=False, workload="elementwise"):
         env[SHARE_ENV] = "1"
     env[WORKLOAD_ENV] = workload
     preload = env.get("LD_PRELOAD")
-    env["LD_PRELOAD"] = f"{_get_hook_so_path()}:{preload}" if preload else _get_hook_so_path()
+    env["LD_PRELOAD"] = f"{hook_so_path()}:{preload}" if preload else hook_so_path()
     env["TORCH_CUBLASLT_UNIFIED_WORKSPACE"] = "1"
     archive = workdir / "archive"
     archive.mkdir(exist_ok=True)
