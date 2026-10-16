@@ -37,6 +37,7 @@ recipe/sglang/
 ├── serve_qwen3-30ba3b_ep.sh        # Qwen3-30B-A3B (MoE)  expert parallel (DeepEP + DP-attention)
 ├── serve_qwen3-30ba3b_ep_tpattn.sh # Qwen3-30B-A3B (MoE)  expert parallel, TP attention (symm-mem allreduce)
 ├── serve_qwen3-30ba3bfp8_ep_v2.sh  # Qwen3-30B-A3B-FP8    expert parallel, DeepEP v2 (NCCL symmetric windows)
+├── serve_qwen3-235ba22b.sh         # Qwen3-235B-A22B      MoE, FP8 (default) or bf16; tpep4, tp2ep4 (4 GPUs min), epN, tp4ep8
 ├── serve_qwen3.5-27b.sh            # Qwen3.5-27B          dense hybrid; single, dp2-8, tp2-8
 ├── serve_qwen3.5-35ba3b.sh         # Qwen3.5-35B-A3B      MoE hybrid; tp2/tp4, ep2-8, tpep2/tpep4
 ├── serve_qwen3.5-122ba10b.sh       # Qwen3.5-122B-A10B    MoE hybrid, FP8 (default) or bf16; ep4, tpep4, tp2ep4, ep8, tp4ep8
@@ -54,6 +55,7 @@ bash serve_qwen3-1.7b_dp.sh        <dp_size>   [--save|--load]
 bash serve_qwen3-30ba3b_ep.sh          <ep_size>   [--save|--load]
 bash serve_qwen3-30ba3b_ep_tpattn.sh   <ep_size>   [--save|--load]
 bash serve_qwen3-30ba3bfp8_ep_v2.sh    <ep_size>   [--save|--load]
+bash serve_qwen3-235ba22b.sh           <cfg>       [--save|--load]     # tpep4 | tp2ep4 | epN | tp4ep8; see "Qwen3.5 and DeepSeek" below
 bash serve_qwen3.5-27b.sh              <cfg>       [--save|--load]     # see "Qwen3.5 and DeepSeek" below
 bash serve_qwen3.5-35ba3b.sh           <cfg>       [--save|--load]
 bash serve_qwen3.5-122ba10b.sh         <cfg>       [--save|--load]
@@ -108,6 +110,7 @@ model or topology before SAVE.
 | Expert parallel | `serve_qwen3-30ba3b_ep.sh` | Qwen3-30B-A3B | DP-attention + DeepEP; fa3 backend; `SGL_MODEL=Qwen/Qwen3-30B-A3B-FP8` for FP8 |
 | Expert parallel, TP attention | `serve_qwen3-30ba3b_ep_tpattn.sh` | Qwen3-30B-A3B | symm-mem allreduce + DeepEP (vLLM-shaped EP); uses the per-phase cuda-graph flags |
 | Expert parallel, DeepEP v2 | `serve_qwen3-30ba3bfp8_ep_v2.sh` | Qwen3-30B-A3B-FP8 | NCCL symmetric windows + GIN instead of NVSHMEM; needs NCCL >= 2.30.7 (see below) |
+| Large MoE | `serve_qwen3-235ba22b.sh` | Qwen3-235B-A22B-FP8 | same `<cfg>` vocabulary as the Qwen3.5 scripts; validated tpep4 / tp2ep4 on 4xH200 at 0.7, chunked prefill 2048 |
 
 ## Activation: `--cuda-graph-persistence`
 
@@ -264,7 +267,7 @@ it exists at the same addresses in both modes; see `docs/sglang/hooks.md`.
 
 ## Qwen3.5 and DeepSeek
 
-In `serve_qwen3.5-*.sh` and `serve_deepseek-v4-flash.sh` the first
+In `serve_qwen3.5-*.sh`, `serve_qwen3-235ba22b.sh` and `serve_deepseek-v4-flash.sh` the first
 argument names the parallel topology with the vocabulary of the cold-start matrix that validated them
 (`experimental/matrix3`): `single`, `dpN`, `tpN` (torch symm-mem allreduce), `epN` (DP attention + DeepEP
 low-latency + DeepGEMM, capture bs per rank), `tpepN` (TP attention + EP; capture bs = N·k), and `tp2ep4` /
