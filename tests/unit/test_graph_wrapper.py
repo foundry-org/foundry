@@ -8,12 +8,17 @@ extension does not bind (names the stub lacks are reported as a warning).
 """
 
 import ast
+import importlib
 import types
 import warnings
 from pathlib import Path
 
 import pytest
-from foundry import graph, ops
+from foundry import ops
+
+# `from foundry import graph` yields the capture helper class foundry.graph.graph, which
+# foundry/__init__.py re-exports over the submodule; import the module explicitly.
+graph = importlib.import_module("foundry.graph")
 
 PYI = Path(ops.__file__).with_name("ops.pyi")
 
