@@ -255,7 +255,7 @@ matters even for baseline runs of this topology, because without DP-attention
 every rank dispatches the full prefill chunk and prefill-graph capture trips
 DeepEP's `num_max_dispatch_tokens_per_rank` assert.
 
-The EP script sets `--enable-dp-attention --moe-a2a-backend deepep --deepep-mode low_latency
+The EP script sets `--attn-dp-size <ep_size> --moe-a2a-backend deepep --deepep-mode low_latency
 --moe-runner-backend deep_gemm --attention-backend fa3` and
 `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256`; the script also passes `--enable-torch-symm-mem
 --disable-custom-all-reduce` in every mode. `--enable-torch-symm-mem` routes the DP-attention gather

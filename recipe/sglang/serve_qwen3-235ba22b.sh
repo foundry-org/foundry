@@ -21,7 +21,7 @@ CHUNK=${CHUNK:-2048}
 GRAPHS=(--cuda-graph-max-bs-decode "$MAXBS" --disable-cuda-graph-padding --cuda-graph-backend-prefill disabled)
 case "$CFG" in
   ep[0-9]*) N=${CFG#ep}
-    TOPO=(--tp-size "$N" --dp-size "$N" --ep-size "$N" --enable-dp-attention
+    TOPO=(--tp-size "$N" --attn-dp-size "$N" --ep-size "$N"
           --moe-a2a-backend deepep --deepep-mode low_latency --moe-runner-backend deep_gemm
           --chunked-prefill-size "$CHUNK" --attention-backend fa3 --max-running-requests $((256 * N))) ;;
   tpep[0-9]*) N=${CFG#tpep}
@@ -31,7 +31,7 @@ case "$CFG" in
     GRAPHS=(--cuda-graph-max-bs-decode $((MAXBS * N)) --cuda-graph-bs-decode $(seq -s' ' "$N" "$N" $((MAXBS * N)))
             --disable-cuda-graph-padding --cuda-graph-backend-prefill disabled) ;;
   tp[0-9]*ep[0-9]*) ATP=${CFG%%ep*}; ATP=${ATP#tp}; N=${CFG##*ep}
-    TOPO=(--tp-size "$N" --dp-size $((N / ATP)) --ep-size "$N" --enable-dp-attention
+    TOPO=(--tp-size "$N" --attn-dp-size $((N / ATP)) --ep-size "$N"
           --moe-a2a-backend deepep --deepep-mode low_latency --moe-runner-backend deep_gemm
           --chunked-prefill-size "$CHUNK" --attention-backend fa3 --max-running-requests $((256 * N)))
     GRAPHS=(--cuda-graph-max-bs-decode $((MAXBS * ATP)) --cuda-graph-bs-decode $(seq -s' ' "$ATP" "$ATP" $((MAXBS * ATP)))

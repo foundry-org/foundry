@@ -26,7 +26,7 @@ same code as the plugin's (`plugin.py`, `hooks.py`); only the messages name the 
 MoE all-to-all (NVSHMEM, foundry-compatible); TP attention + EP (`serve_qwen3-30ba3b_ep_tpattn.sh`,
 the `tpepN` / `tpAepN` topologies of the Qwen3.5 serve scripts) routes the attention all-reduce
 through torch symmetric memory. The serve script is `recipe/sglang/serve_qwen3-30ba3b_ep.sh
-<ep_size> [--save|--load]` with: `--enable-dp-attention --moe-a2a-backend deepep
+<ep_size> [--save|--load]` with: `--attn-dp-size <ep_size> --moe-a2a-backend deepep
 --deepep-mode low_latency --moe-runner-backend deep_gemm --attention-backend fa3`
 (the script passes custom all-reduce off and torch symm-mem on in every mode; Foundry pins the same values on SAVE / LOAD). The EP kernels (`sgl-deep-ep`, `sgl-deep-gemm`, fa3 inside
 `sglang-kernel`) come as wheels with the sglang install. `fa3` is used because the

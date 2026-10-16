@@ -20,7 +20,7 @@ export SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${SGLANG_DEEPEP_V2_NUM_
 exec sglang serve \
   --model-path "${SGL_MODEL:-Qwen/Qwen3-30B-A3B-FP8}" \
   --trust-remote-code --host 0.0.0.0 --port "${PORT:-12000}" \
-  --tp-size "$EP_SIZE" --dp-size "$EP_SIZE" --ep-size "$EP_SIZE" --enable-dp-attention \
+  --tp-size "$EP_SIZE" --attn-dp-size "$EP_SIZE" --ep-size "$EP_SIZE" \
   --moe-a2a-backend deepep_v2 --moe-runner-backend deep_gemm \
   --mem-fraction-static "${MEM_FRACTION_STATIC:-0.8}" --disable-radix-cache \
   --chunked-prefill-size 256 --attention-backend fa3 \

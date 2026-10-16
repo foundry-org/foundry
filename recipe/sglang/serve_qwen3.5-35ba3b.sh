@@ -17,7 +17,7 @@ GRAPHS=(--cuda-graph-max-bs-decode "$MAXBS" --disable-cuda-graph-padding --cuda-
 case "$CFG" in
   tp[0-9]*) N=${CFG#tp}; TOPO=(--tp-size "$N"); MEMFRAC_DEFAULT=0.8 ;;
   ep[0-9]*) N=${CFG#ep}
-    TOPO=(--tp-size "$N" --dp-size "$N" --ep-size "$N" --enable-dp-attention
+    TOPO=(--tp-size "$N" --attn-dp-size "$N" --ep-size "$N"
           --moe-a2a-backend deepep --deepep-mode low_latency --moe-runner-backend deep_gemm
           --chunked-prefill-size 256 --attention-backend fa3 --max-running-requests $((256 * N)))
     export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512 NVSHMEM_QP_DEPTH=2048

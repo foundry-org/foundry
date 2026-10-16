@@ -104,9 +104,9 @@ _DEEPEP = [
 
 
 def _ep(n):
-    # The recipes still use the deprecated --dp-size N --enable-dp-attention (sglang removes it
-    # after 2026-12-31); change it here together with the recipes.
-    return ["--tp-size", str(n), "--dp-size", str(n), "--ep-size", str(n), "--enable-dp-attention"]
+    # DP attention over all n ranks, as the recipes' epN case (--attn-dp-size replaces the
+    # deprecated --dp-size N --enable-dp-attention pair).
+    return ["--tp-size", str(n), "--attn-dp-size", str(n), "--ep-size", str(n)]
 
 
 def _decode_max(maxbs):

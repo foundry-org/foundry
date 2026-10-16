@@ -26,7 +26,7 @@ exec sglang serve \
   --trust-remote-code --host 0.0.0.0 --port "${PORT:-12000}" \
   --disable-radix-cache --mem-fraction-static "${MEMFRAC:-0.8}" \
   --max-mamba-cache-size "$MAMBA" \
-  --tp-size "$N" --dp-size "$N" --ep-size "$N" --enable-dp-attention \
+  --tp-size "$N" --attn-dp-size "$N" --ep-size "$N" \
   --moe-a2a-backend deepep --deepep-mode low_latency --moe-runner-backend deep_gemm \
   --chunked-prefill-size 512 --max-running-requests $((256 * N)) \
   --cuda-graph-max-bs-decode "$MAXBS" --disable-cuda-graph-padding --cuda-graph-backend-prefill disabled \
