@@ -10,6 +10,7 @@ no pytest, torch or foundry import at module top.
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -166,3 +167,31 @@ def assert_bit_exact(got, want, what: str = "output") -> None:
 
 def check_against_reference(archive, outputs, inputs, name: str = "reference.pt") -> None:
     assert_bit_exact(outputs, load_reference(archive, inputs, name))
+
+
+LAYOUT_JSON = "layout.json"
+
+
+def save_layout(archive: str) -> None:
+    """SAVE, after capture: record the region cursor so a LOAD can back the span."""
+    import foundry as fdry
+
+    with open(os.path.join(archive, LAYOUT_JSON), "w") as f:
+        json.dump({"final_alloc_offset": fdry.get_current_alloc_offset()}, f)
+
+
+def map_saved_layout(archive: str) -> None:
+    """LOAD, before start_graph_builds: map the span up to SAVE's final offset
+    (what the sglang route's preallocate_for_load_mode does). The background
+    template builds add memcpy nodes before finish_graph_loads replays the
+    allocator events, and the driver rejects a not-yet-mapped source pointer
+    (cuGraphAddMemcpyNode: invalid argument). CUDAGraph.load needs none of this."""
+    import foundry as fdry
+
+    with open(os.path.join(archive, LAYOUT_JSON)) as f:
+        final = int(json.load(f)["final_alloc_offset"])
+    current = fdry.get_current_alloc_offset()
+    if final > current:
+        assert fdry.ops.preallocate_ranges([(current, final - current)], final), (
+            f"could not map the layout span {current:#x}..{final:#x}"
+        )

@@ -26,7 +26,12 @@ import sys
 import pytest
 import torch
 import torch.distributed as dist
-from _helpers import free_port, run_phase
+from _helpers import (
+    free_port,
+    map_saved_layout,
+    run_phase,
+    save_layout,
+)
 
 BASE_ADDR = 0x600000000000
 REGION_SIZE_STR = "32GB"
@@ -146,6 +151,7 @@ def _save_rank(local_rank: int, archive: str, algo: str):
     os.makedirs(rank_archive, exist_ok=True)
     graph.save(os.path.join(rank_archive, "graph.json"), output_tensors=[out])
     fdry.pack_fatbins_to_folder(rank_archive)
+    save_layout(rank_archive)
     # graph.save re-enables packing on exit; the ranks would race on ./hook_archive.
     fdry.set_pack_fatbins_on_exit(False)
     meta = {"info": info, "inp_va": inp.data_ptr(), "out_va": out.data_ptr()}
@@ -188,6 +194,7 @@ def _load_rank(local_rank: int, archive: str, algo: str, load_api: str):
     if load_api == "single":
         graph, outputs = fdry.CUDAGraph.load(graph_json)
     else:
+        map_saved_layout(rank_archive)  # one_shot copies from graph-pool memory
         pending = fdry.CUDAGraph.start_graph_builds([graph_json])
         ((graph, outputs),) = fdry.CUDAGraph.finish_graph_loads(pending)
     loaded_out = outputs if isinstance(outputs, torch.Tensor) else outputs[0]

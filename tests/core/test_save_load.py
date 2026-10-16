@@ -20,16 +20,12 @@ Workloads:
                (preallocate_cublas_workspaces), linear with bias (cuBLASLt epilogue)
 Load APIs: ``load`` (CUDAGraph.load) and ``builds`` (start_graph_builds +
 finish_graph_loads). compat also runs LOAD with FOUNDRY_MMAP_ARCHIVE=0.
-The builds path maps SAVE's layout span first (``preallocate_ranges`` up to the
-recorded final offset, as the sglang route's preallocate_for_load_mode does):
-the background template builds add memcpy nodes before finish_graph_loads
-replays the allocator events, and the driver rejects a source pointer that is
-not mapped yet (cuGraphAddMemcpyNode: invalid argument).
+The builds path maps SAVE's layout span first (``map_saved_layout`` in
+_helpers: what the sglang route's preallocate_for_load_mode does).
 add, sgemm and hgemm_nvjet then change an input in place and replay once
 more: the graph reads its inputs, it does not bake them.
 """
 
-import json
 import os
 import sys
 from collections.abc import Callable
@@ -37,14 +33,21 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-from _helpers import assert_bit_exact, load_reference, prefix_region, run_phase, save_reference
+from _helpers import (
+    assert_bit_exact,
+    load_reference,
+    map_saved_layout,
+    prefix_region,
+    run_phase,
+    save_layout,
+    save_reference,
+)
 
 BASE_ADDR = 0x3F0000000000
 GRAPH_BASE_ADDR = 0x3F8000000000  # add: the graph's own region
 REGION_SIZE_STR = "1GB"
 SEED = 1234
 GRAPH_JSON = "graph.json"
-LAYOUT_JSON = "layout.json"
 
 
 @dataclass(frozen=True)
@@ -191,22 +194,8 @@ def _run_save(archive, workload):
             assert torch.equal(a, b), f"{name}: deterministic output changed between replays"
     _check_eager(w, replays[0], inputs)
     save_reference(archive, replays, inputs)
-    with open(os.path.join(archive, LAYOUT_JSON), "w") as f:
-        json.dump({"final_alloc_offset": fdry.get_current_alloc_offset()}, f)
+    save_layout(archive)
     fdry.stop_allocation_region()
-
-
-def _map_layout_span(archive):
-    """Back SAVE's layout span before the parallel builds (see the module docstring)."""
-    import foundry as fdry
-
-    with open(os.path.join(archive, LAYOUT_JSON)) as f:
-        final = int(json.load(f)["final_alloc_offset"])
-    current = fdry.get_current_alloc_offset()
-    if final > current:
-        assert fdry.ops.preallocate_ranges([(current, final - current)], final), (
-            f"could not map the layout span {current:#x}..{final:#x}"
-        )
 
 
 def _run_load(archive, workload, load_api):
@@ -225,7 +214,7 @@ def _run_load(archive, workload, load_api):
             assert isinstance(result, fdry.ops.CUDAGraph), f"expected a bare graph: {result!r}"
             graph, outs = result, None
     else:
-        _map_layout_span(archive)
+        map_saved_layout(archive)
         pending = fdry.CUDAGraph.start_graph_builds([path])
         ((graph, outs),) = fdry.CUDAGraph.finish_graph_loads(pending)
     if w.save_outputs:
