@@ -36,8 +36,8 @@ permanent); after upload, argument changes are free but launch-config
 changes (grid/block/shmem/func) still demote; execs <=128 nodes never
 demote. See docs/exec-update-penalty.md.
 
-Usage: python bench_exec_update.py [--cases core] [--nodes 365]
-                                   [--replays 3000] [--rounds 5]
+Usage: python tools/bench/bench_exec_update.py [--cases core] [--nodes 365]
+                                               [--replays 3000] [--rounds 5]
 """
 
 import argparse
