@@ -29,9 +29,6 @@ class CUDAGraph(ops.CUDAGraph):
     def capture_end(self) -> None:
         super().capture_end()
 
-    def instantiate(self) -> None:
-        super().instantiate()
-
     def replay(self) -> None:
         super().replay()
 
@@ -49,9 +46,6 @@ class CUDAGraph(ops.CUDAGraph):
 
     def raw_cuda_graph(self) -> int:
         return super().raw_cuda_graph()
-
-    def raw_cuda_graph_exec(self) -> int:
-        return super().raw_cuda_graph_exec()
 
     def save(self, json_path: str, output_tensors: OutputTensors | None = None) -> None:
         return super().save(json_path, output_tensors)
