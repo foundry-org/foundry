@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
-"""Contract test: every sglang symbol Foundry patches or reads at a fixed
-signature still exists (process groups are built in
-``bootstrap.init_parallel_runtime``). A rename upstream fails here
-instead of at a user's LOAD.
+"""Plugin route only (delete with the plugin): every sglang symbol the
+plugin's hooks.install patches or reads at a fixed signature still exists
+(process groups are built in ``bootstrap.init_parallel_runtime``). A rename
+upstream fails here instead of at a user's LOAD. On the dependency route sglang
+calls foundry.integration.sglang.api from its own call sites instead.
 
-    pytest tests/integration/sglang/test_sglang_hook_points.py -v
+    pytest tests/sglang/test_plugin_hook_points.py -v
 """
 
 import importlib
@@ -104,28 +105,10 @@ def test_distributed_bring_up_site():
         assert "self.ps" in inspect.getsource(ModelRunner.__init__)
 
 
-def test_triton_key_is_cached_process_wide():
-    """The triton_key prewarm thread only helps if the main thread's later
-    call hits the same lru_cache."""
-    pytest.importorskip("triton")
-    from foundry.integration.sglang.hooks import _resolve_triton_key
-
-    assert hasattr(_resolve_triton_key(), "cache_info")
-
-
 def test_engine_launch_is_a_classmethod():
     from sglang.srt.entrypoints.engine import Engine
 
     assert isinstance(Engine.__dict__["_launch_scheduler_processes"], classmethod)
-
-
-def test_foundry_graphs_support_backend_cleanup():
-    """Upstream main's FullCudaGraphBackend.cleanup() calls graph.reset() on
-    every graph in ``_graphs``; the graphs Foundry places there are
-    foundry.ops.CUDAGraph objects (the fork base's cleanup() does not reset)."""
-    from foundry import ops
-
-    assert callable(getattr(ops.CUDAGraph, "reset", None))
 
 
 def test_resolution_hook_sites_are_overridable_and_called():

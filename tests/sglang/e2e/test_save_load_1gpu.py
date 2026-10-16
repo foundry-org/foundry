@@ -4,8 +4,8 @@
 model with dummy weights and a small decode set. Greedy output must be
 identical across the three, LOAD must restore every decode graph once, and
 Foundry must report itself active in the launcher and the scheduler. SAVE and LOAD
-first pass the preflight the recipe scripts run (foundry.integration.sglang.preflight).
-Runs on whichever route the installed sglang has (conftest.foundry_launch): the
+first pass the preflight CLI's checks (foundry.integration.sglang.preflight).
+Runs on whichever route the installed sglang has (_sglang_helpers.foundry_launch): the
 --cuda-graph-persistence flags when sglang has the Foundry adapter, the plugin's
 environment variable otherwise.
 
@@ -13,7 +13,7 @@ Needs sglang, a CUDA GPU and the model's config (HF cache or network).
 Model override: FOUNDRY_E2E_MODEL (default: sglang's
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST, meta-llama/Llama-3.2-1B-Instruct).
 
-    pytest tests/integration/sglang/test_sglang_save_load_e2e.py -v -s
+    pytest tests/sglang/e2e/test_save_load_1gpu.py -m slow -v -s
 """
 
 import os
@@ -24,8 +24,8 @@ import pytest
 pytest.importorskip("sglang")
 torch = pytest.importorskip("torch")
 
-from conftest import ACTIVE as _ACTIVE  # noqa: E402
-from conftest import foundry_toml, serve  # noqa: E402
+from _sglang_helpers import ACTIVE as _ACTIVE  # noqa: E402
+from _sglang_helpers import foundry_toml, serve  # noqa: E402
 from sglang.test.test_utils import (  # noqa: E402
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

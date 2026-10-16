@@ -7,7 +7,7 @@
 Activation is process-global (the config, the message labels), so every
 check that activates runs in a fresh interpreter. No GPU needed.
 
-    pytest tests/integration/sglang/test_sglang_dependency_route.py -v
+    pytest tests/sglang/test_dependency_route.py -v
 """
 
 import functools
@@ -17,7 +17,7 @@ import pytest
 pytest.importorskip("sglang")
 adapter = pytest.importorskip("sglang.srt.utils.foundry_adapter")
 
-from conftest import run_python  # noqa: E402
+from _sglang_helpers import run_python  # noqa: E402
 from foundry.integration.sglang import api, plugin  # noqa: E402
 
 _PIN_ENV_NAMES = [pin.name for pin in plugin.ENV_PINS] + [

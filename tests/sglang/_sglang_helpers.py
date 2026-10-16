@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
-"""Route-aware helpers for the SGLang integration tests.
+"""Route-aware helpers for the SGLang integration tests (imported by the test
+modules; the fixtures are in conftest.py).
 
 Foundry reaches SGLang by one of two routes, decided by the installed sglang:
 
@@ -14,14 +15,13 @@ Foundry reaches SGLang by one of two routes, decided by the installed sglang:
 The end-to-end tests launch through :func:`foundry_launch` (via
 :func:`serve`) so one file validates whichever route the installed sglang has.
 Also shared: the mini model config for CPU-only resolution tests
-(:func:`model_dir`) and :func:`run_python` for checks that need a fresh
-interpreter.
+(:data:`MINI_CONFIG`, the ``model_dir`` fixture) and :func:`run_python` for
+checks that need a fresh interpreter.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 import re
 import subprocess
@@ -85,12 +85,6 @@ MINI_CONFIG = {
     "vocab_size": 128,
     "max_position_embeddings": 2048,
 }
-
-
-@pytest.fixture
-def model_dir(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps(MINI_CONFIG))
-    return str(tmp_path)
 
 
 def run_python(code, cwd=None, *, env_drop=(CONFIG_ENV,), env_extra=None):

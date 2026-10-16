@@ -37,8 +37,8 @@ import pytest
 pytest.importorskip("sglang")
 torch = pytest.importorskip("torch")
 
-from conftest import ACTIVE as _ACTIVE  # noqa: E402
-from conftest import foundry_toml, serve  # noqa: E402
+from _sglang_helpers import ACTIVE as _ACTIVE  # noqa: E402
+from _sglang_helpers import foundry_toml, serve  # noqa: E402
 from sglang.benchmark.serving import run_benchmark  # noqa: E402
 from sglang.test.test_utils import (  # noqa: E402
     DEFAULT_URL_FOR_TEST,
