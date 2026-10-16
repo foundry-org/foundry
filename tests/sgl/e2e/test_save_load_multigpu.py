@@ -21,9 +21,9 @@ already exported wins, as there), plus NCCL_CUMEM_ENABLE=0 and NCCL_NVLS_ENABLE=
 Qwen3.5 (hybrid gated DeltaNet) and DeepSeek-V4 cannot capture full-backend prefill graphs in plain SGLang (the GDN
 backend's out-of-graph metadata is decode-only; the DSV4 backend rejects EXTEND), so every case here is decode-only.
 
-    pytest tests/sglang/e2e/test_save_load_multigpu.py -m "slow and multigpu and not xlarge" -v -s   # 35B, 2 GPUs
-    pytest tests/sglang/e2e/test_save_load_multigpu.py -m "slow and xlarge" -v -s                    # 4 GPUs
-    pytest tests/sglang/e2e/test_save_load_multigpu.py -m slow -k q35_ep2 -v -s                      # one case
+    pytest tests/sgl/e2e/test_save_load_multigpu.py -m "slow and multigpu and not xlarge" -v -s   # 35B, 2 GPUs
+    pytest tests/sgl/e2e/test_save_load_multigpu.py -m "slow and xlarge" -v -s                    # 4 GPUs
+    pytest tests/sgl/e2e/test_save_load_multigpu.py -m slow -k q35_ep2 -v -s                      # one case
 
 Overrides: FOUNDRY_E2E_MAXBS (decode max batch size per rank, default 64; the recipes use 256),
 FOUNDRY_E2E_WEIGHTS=dummy|real (default per case).

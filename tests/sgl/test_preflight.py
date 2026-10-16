@@ -4,7 +4,7 @@
 recipe TOML: SAVE and LOAD checks, the FAILED line and the exit codes
 (0 ok, 1 a failed check, 2 bad arguments). No GPU.
 
-    pytest tests/sglang/test_preflight.py -v
+    pytest tests/sgl/test_preflight.py -v
 
 recipe/sglang/foundry.toml has no ``mode`` key (the mode comes from
 --cuda-graph-persistence), so it passes only on the dependency route; on the

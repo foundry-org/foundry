@@ -6,7 +6,7 @@ plugin's hooks.install patches or reads at a fixed signature still exists
 upstream fails here instead of at a user's LOAD. On the dependency route sglang
 calls foundry.integration.sglang.api from its own call sites instead.
 
-    pytest tests/sglang/test_plugin_hook_points.py -v
+    pytest tests/sgl/test_plugin_hook_points.py -v
 """
 
 import importlib

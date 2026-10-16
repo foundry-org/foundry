@@ -19,11 +19,11 @@ pytest tests/                                   # unit, core, multigpu, sglang (
 pytest tests/unit                               # host without a GPU
 pytest tests/core                               # 1 GPU
 pytest tests/multigpu                           # 2 GPUs
-pytest tests/sglang                             # sglang, no engines
-pytest tests/sglang/e2e/test_save_load_1gpu.py -m slow -v -s
-pytest tests/sglang/e2e -m "slow and multigpu and not xlarge" -v -s     # Qwen3.5-35B-A3B on 2 GPUs
-pytest tests/sglang/e2e -m slow -k q35_ep2 -v -s                       # one case
-pytest tests/sglang/e2e -m "slow and xlarge" -v -s                     # 4 GPUs
+pytest tests/sgl                             # sglang, no engines
+pytest tests/sgl/e2e/test_save_load_1gpu.py -m slow -v -s
+pytest tests/sgl/e2e -m "slow and multigpu and not xlarge" -v -s     # Qwen3.5-35B-A3B on 2 GPUs
+pytest tests/sgl/e2e -m slow -k q35_ep2 -v -s                       # one case
+pytest tests/sgl/e2e -m "slow and xlarge" -v -s                     # 4 GPUs
 pytest tests/ -m "not slow and not xlarge and not plugin_route"         # without the plugin-route files
 pytest tests/core/test_save_load.py -k compat -q -s                     # torch-compat check of a wheel
 ```

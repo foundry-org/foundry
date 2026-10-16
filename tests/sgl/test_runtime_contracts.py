@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Runtime contracts that hold on both sglang routes.
 
-pytest tests/sglang/test_runtime_contracts.py -v
+pytest tests/sgl/test_runtime_contracts.py -v
 """
 
 import pytest

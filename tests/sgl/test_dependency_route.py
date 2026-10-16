@@ -7,7 +7,7 @@
 Activation is process-global (the config, the message labels), so every
 check that activates runs in a fresh interpreter. No GPU needed.
 
-    pytest tests/sglang/test_dependency_route.py -v
+    pytest tests/sgl/test_dependency_route.py -v
 """
 
 import functools

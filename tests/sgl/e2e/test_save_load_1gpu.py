@@ -13,7 +13,7 @@ Needs sglang, a CUDA GPU and the model's config (HF cache or network).
 Model override: FOUNDRY_E2E_MODEL (default: sglang's
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST, meta-llama/Llama-3.2-1B-Instruct).
 
-    pytest tests/sglang/e2e/test_save_load_1gpu.py -m slow -v -s
+    pytest tests/sgl/e2e/test_save_load_1gpu.py -m slow -v -s
 """
 
 import os

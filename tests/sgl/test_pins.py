@@ -8,7 +8,7 @@ state Foundry cannot replay, and features it cannot persist.
 CPU only (no GPU, no server, no weights): records are built on a mini
 config.json with device="cuda".
 
-    pytest tests/sglang/test_pins.py -v
+    pytest tests/sgl/test_pins.py -v
 """
 
 import os

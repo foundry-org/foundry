@@ -135,10 +135,10 @@ pythonpath = ["tests"]
 addopts = "-ra -m 'not slow and not xlarge'"
 # Markers are applied by directory in tests/conftest.py (see tests/README.md).
 markers = [
-    "gpu: needs a CUDA device (tests/core, tests/multigpu, tests/sglang/e2e); skipped without one",
+    "gpu: needs a CUDA device (tests/core, tests/multigpu, tests/sgl/e2e); skipped without one",
     "multigpu: needs 2 CUDA devices (tests/multigpu, multi-GPU e2e cases); skipped with fewer",
-    "sglang: needs sglang (tests/sglang)",
-    "slow: engine launches and model downloads (tests/sglang/e2e); deselected by default",
+    "sglang: needs sglang (tests/sgl)",
+    "slow: engine launches and model downloads (tests/sgl/e2e); deselected by default",
     "xlarge: 4-GPU, 100+ GB model cases; deselected by default, run with -m 'slow and xlarge'",
     "plugin_route: sglang plugin route only; delete together with the plugin",
 ]

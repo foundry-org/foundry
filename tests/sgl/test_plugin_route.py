@@ -10,7 +10,7 @@ CPU only (no GPU, no server, no weights): resolution runs on a mini
 config.json with device="cuda", like sglang's own
 test/registered/unit/server_args/test_resolution_declarations.py.
 
-    pytest tests/sglang/test_plugin_route.py -v
+    pytest tests/sgl/test_plugin_route.py -v
 """
 
 import os

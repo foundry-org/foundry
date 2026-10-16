@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Fixtures of the SGLang tests. Helpers the test modules import are in
 _sglang_helpers.py (pytest puts this directory on sys.path when it loads this
-conftest, also for tests/sglang/e2e)."""
+conftest, also for tests/sgl/e2e)."""
 
 import json
 import os
