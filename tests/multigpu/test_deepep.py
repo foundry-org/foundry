@@ -6,7 +6,7 @@ SAVE creates the DeepEP buffer inside the allocation region, captures one
 low_latency_dispatch, replays it and saves it. LOAD (fresh processes) loads
 the kernel images, recreates the buffer, runs the deferred NVSHMEM module
 init (init_nvshmem_for_loaded_modules), restores the graph with
-start_graph_builds + finish_graph_loads and replays it. Every replay must
+start_graph_builds + finish_graph_loads and replays it once. The replay must
 deliver exactly the expected tokens to every local expert.
 
     pytest tests/multigpu/test_deepep.py -q -s
@@ -259,13 +259,16 @@ def _load_rank(local_rank: int, archive: str, case: str):
     pending = fdry.CUDAGraph.start_graph_builds([os.path.join(rank_archive, "graph.json")])
     ((graph, outputs),) = fdry.CUDAGraph.finish_graph_loads(pending)
     recv_x, recv_count = outputs[0], outputs[1]
-    for i in range(2):
-        recv_x.zero_()
-        recv_count.zero_()
-        torch.cuda.synchronize()
-        dist.barrier(group)
-        graph.replay()
-        _verify(recv_x, recv_count, rank, f"LOAD replay {i + 1}")
+    # One replay per process, as SAVE does: a lone captured low-latency dispatch
+    # replayed back-to-back (no combine, no buffer clean) delivers mixed rows on
+    # the second replay in the capturing process too (2026-10-16, 2x H200), so a
+    # second replay would test DeepEP's slot/signal state, not the restore.
+    recv_x.zero_()
+    recv_count.zero_()
+    torch.cuda.synchronize()
+    dist.barrier(group)
+    graph.replay()
+    _verify(recv_x, recv_count, rank, "LOAD replay")
     dist.barrier(group)
     fdry.stop_allocation_region()
     buffer.destroy()

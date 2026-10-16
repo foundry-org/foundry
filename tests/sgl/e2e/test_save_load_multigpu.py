@@ -278,6 +278,11 @@ def test_save_then_load_multigpu(case, tmp_path):
     assert restore_s < RESTORE_RATIO * capture_s, (
         f"LOAD restore {restore_s:.3f}s, native capture {capture_s:.3f}s (bound x{RESTORE_RATIO})"
     )
+    print(
+        f"[e2e {case['id']}] native decode capture {capture_s:.3f} s, LOAD restore {restore_s:.3f} s "
+        f"({loaded[0][0]} graphs/rank, ratio {restore_s / capture_s:.4f}); median TPOT native "
+        f"{native['tpot_ms']:.3f} ms, LOAD {load['tpot_ms']:.3f} ms"
+    )
 
     # (b)
     # One-sided: LOAD must not be slower than native by more than the tolerance;
