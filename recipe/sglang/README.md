@@ -75,9 +75,12 @@ non-determinism that requires a two-pass save (unlike the vLLM recipe).
 **Run every engine with the common environment of [`set_env.sh`](set_env.sh)** (the scripts
 source it; `source recipe/sglang/set_env.sh` yourself when launching sglang by hand):
 `TORCHDYNAMO_DISABLE=1` (with it unset, SAVE fails at the first `@torch.compile` helper inside the
-capture window on torch >= 2.14), `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`, and `NVSHMEM_DISABLE_NCCL=1`
+capture window on torch >= 2.14), `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`, `NVSHMEM_DISABLE_NCCL=1`
 (NVSHMEM's per-team NCCL communicators cost ~2.4 s in every DeepEP bootstrap, native and LOAD alike,
-and the low-latency kernels never use them).
+and the low-latency kernels never use them), `NCCL_IB_DISABLE=1` + `NVSHMEM_REMOTE_TRANSPORT=none`
+(single-node recipes: no InfiniBand discovery; export your own values for multi-node), and
+`PYTORCH_CUDA_ALLOC_CONF=pinned_use_cuda_host_register:True,...` (faster pinned host buffers; the
+flashinfer backend pins 8 MiB per captured batch size). Each variable keeps a value you already exported.
 
 **Warm the JIT caches once per machine and model before the first SAVE:** run the recipe
 once without `--save`/`--load`, wait for `/health`, stop it.
