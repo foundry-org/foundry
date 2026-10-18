@@ -17,8 +17,8 @@ line must say cudagraph-patch when cgp_exec_update resolves in this process
 (LD_PRELOAD, inherited by the LOAD processes), the real update otherwise.
 
 A second workload (needs Triton) launches one Triton kernel with two BLOCK
-specializations: same function name and DAG, different binary. Share mode
-must split the saved group into one template per binary.
+specializations: same function name and DAG, different binary. Share mode keeps
+them in one template and switches the function across binaries on update.
 """
 
 import ctypes
@@ -259,7 +259,7 @@ def test_share_instantiates_templates_only(runs):
     assert sum(s["updates"] for s in execs) > 0, "no member switch happened"
 
 
-def test_share_splits_kernel_binaries(runs):
+def test_share_keeps_binary_variants_together(runs):
     work, eager, share = runs
     if work.name.startswith("exec_share_elementwise"):
         pytest.skip("Triton workload only")
@@ -267,9 +267,9 @@ def test_share_splits_kernel_binaries(runs):
     m = REFINE_RE.search(share)
     assert m, "no share-mode refinement line"
     saved, templates = map(int, m.groups())
-    # Same names and DAG, two binaries of _affine_kernel: one template per binary.
-    assert (saved, templates) == (1, 2)
-    assert _phase2(share)[:2] == (2, len(SIZES) - 2)
+    # Same names and DAG, two binaries of _affine_kernel: still one template.
+    assert (saved, templates) == (1, 1)
+    assert _phase2(share)[:2] == (1, len(SIZES) - 1)
 
 
 @pytest.mark.skipif(_HAS_CGP, reason="cudagraph-patch preloaded")

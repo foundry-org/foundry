@@ -91,9 +91,7 @@ as in native capture: 256 execs cost ~1.1 s of Phase 2 and ~1 GB of exec memory.
 
 **Share** (`FOUNDRY_ENABLE_EXEC_SHARE=1`). Phase 2 instantiates and uploads
 the template execs only: no prewarm, no member exec. Groups are first refined
-by their full dependency table and, per kernel node, binary hash (an update
-carries a switch to another function of the same binary, not to another binary
-of the same function, e.g. a different Triton specialization), and a member
+by their node types and full dependency table, and a member
 whose cluster dims differ from its
 template is rejected. A replay of a different member than the previous one
 rewrites the builder graph's parameters, `cuGraphExecUpdate`s the template's
