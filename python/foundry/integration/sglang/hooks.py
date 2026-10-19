@@ -392,8 +392,9 @@ def _preallocate_once() -> None:
     state.preallocated = True
 
 
-# The capture scope being run: (phase, prefill request-slot count or None).
-_scope: tuple[str, int | None] | None = None
+# The capture scope being run: (phase, prefill request-slot count or None,
+# decode-type scope kind or None).
+_scope: tuple[str, int | None, str | None] | None = None
 
 
 def capture_one(shape_key, forward_fn, *, pool, stream):
@@ -408,6 +409,7 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
     if _scope is None:
         raise RuntimeError("[Foundry] capture_one called outside capture_scope")
     req_slots = _scope[1]
+    kind = _scope[2]
     if getattr(shape_key, "attention_variant", None) is not None:
         # ShapeKey.attention_variant (e.g. DSV4.1 candidate-indexer graphs on
         # SM100, the HIP DSA dual graph): several graphs per shape, which the
@@ -447,7 +449,10 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
 
     with graph_pool_capture_scope():
         graph, out = capture_graph(pool, stream, forward_fn)
-    save_graph(graph, out, shape_key, prefill_req_slots=req_slots)
+    if req_slots is not None:
+        save_graph(graph, out, shape_key, prefill_req_slots=req_slots)
+    else:
+        save_graph(graph, out, shape_key, kind=kind)
     return graph, out
 
 
@@ -503,18 +508,25 @@ def _prefill_capture_scope(model, req_slots: int):
 
 
 @contextlib.contextmanager
-def _decode_capture_scope(model):
-    """Around ``DecodeCudaGraphRunner.capture`` (its body, SGLang's capture
-    loop, runs inside on both modes). ``model``: the loaded model (the
-    bootstraps walk its modules). The decode backend is full and elastic-EP
-    recapture is off: the resolution steps pinned and validated them;
-    attention graph variants are rejected per shape in :func:`capture_one`."""
+def _decode_capture_scope(model, kind: str):
+    """Around ``DecodeCudaGraphRunner.capture`` and its subclasses' (its body,
+    SGLang's capture loop, runs inside on both modes). ``model``: the
+    runner's loaded model (the bootstraps of the first scope walk its
+    modules); ``kind``: which decode-type graph set the runner captures
+    (``target_decode``; with speculative decoding ``target_verify``,
+    ``draft_decode``, ``draft_extend``). A process runs one scope per kind,
+    in a fixed order (EAGLE: target_verify, draft_decode, draft_extend); each
+    kind's graphs are saved and restored on their own, in capture order. The
+    decode backend is full and elastic-EP recapture is off: the resolution
+    steps pinned and validated them; attention graph variants are rejected
+    per shape in :func:`capture_one`."""
     mode = get_graph_extension_mode()
     if mode == CUDAGraphExtensionMode.NONE:
         yield
         return
 
-    # No-op when the prefill runner captured first.
+    # No-op after the first scope (the prefill runner's or an earlier
+    # decode-type runner's). Both EAGLE models are loaded by then.
     _begin_graph_layout(model, mode)
 
     if mode == CUDAGraphExtensionMode.LOAD:
@@ -523,6 +535,7 @@ def _decode_capture_scope(model):
         from foundry.integration.sglang.graph_ops import (
             finish_decode_graph_restore,
             has_prefill_graphs,
+            load_decode_graph_state,
             start_decode_graph_restore,
         )
 
@@ -534,11 +547,22 @@ def _decode_capture_scope(model):
                 "Foundry archive holds prefill graphs but this LOAD runs without them: "
                 "pass the same --cuda-graph-backend-prefill as SAVE"
             )
+        # The decode-type scopes SAVE ran, in order: this LOAD must run the
+        # same ones in the same order (their allocations are one sequence).
+        expected = load_decode_graph_state()["scopes"]
+        index = state.decode_scopes_done
+        if index >= len(expected) or expected[index] != kind:
+            raise RuntimeError(
+                f"Foundry archive was saved with the decode-type capture scopes {expected}; "
+                f"this LOAD runs {kind!r} as scope {index}. SAVE and LOAD must use the same "
+                "speculative decoding settings."
+            )
+        last = index == len(expected) - 1
 
-        # Already done at the prefill capture when prefill graphs are on.
+        # Already done at the first scope.
         _preallocate_once()
-        start_decode_graph_restore()
-        rt.log_alloc_offset("before_decode_restore")
+        start_decode_graph_restore(kind)
+        rt.log_alloc_offset(f"before_{kind}_restore")
         # The single substitution point: sglang's own capture loop runs
         # (kernel warmup, buffer seeding, the capture session's pool and
         # graph_pool_id, and per shape the dummy batch, TBO / LoRA prep, the
@@ -550,6 +574,12 @@ def _decode_capture_scope(model):
         t_loop = time.perf_counter()
         yield
         finish_decode_graph_restore(time.perf_counter() - t_loop)
+        state.decode_scopes_done += 1
+        rt.log_alloc_offset(f"after_load_{kind}_graphs")
+        if not last:
+            # The next decode-type scope continues the allocation sequence
+            # with the caching allocator as SAVE left it: no empty_cache here.
+            return
         rt.log_alloc_offset("after_load_all_graphs")
 
         # Surrender torch-cached-but-free segments so later eager allocations
@@ -562,32 +592,50 @@ def _decode_capture_scope(model):
 
     # SAVE: the same upstream loop; capture_one captures and saves each graph.
     yield
+    rt.log_alloc_offset(f"save_after_{kind}_capture")
 
-    from foundry.integration.sglang.graph_ops import pack_fatbins, save_graph_manifest
+    from foundry.integration.sglang.graph_ops import (
+        pack_fatbins,
+        save_decode_graph_state,
+        save_graph_manifest,
+    )
 
+    # SAVE does not know whether a later decode-type scope follows (EAGLE's
+    # draft runners), so the archive is completed after every scope: the
+    # decode record, manifest (template = first graph of a partition, stable
+    # as graphs are added), binary pack and region layout are rewritten from
+    # scratch each time and the last scope's write is the one LOAD reads. None
+    # of it allocates device memory.
+    save_decode_graph_state(kind)
     save_graph_manifest()
     pack_fatbins()
     rt.record_region_layout()
 
 
 @contextlib.contextmanager
-def capture_scope(phase: str, model, req_slots: int | None = None):
+def capture_scope(phase: str, model, req_slots: int | None = None, kind: str | None = None):
     """Prefill or decode capture scope (both routes): ``phase`` is
     ``"prefill"`` (with the runner's ``req_slots``, which every
-    :func:`capture_one` inside uses) or ``"decode"``."""
+    :func:`capture_one` inside uses) or ``"decode"`` (with the decode-type
+    runner's ``kind``; None means ``target_decode``, the integration API 2.0
+    contract)."""
     global _scope
     if phase == "prefill":
         if req_slots is None:
             raise ValueError("[Foundry] capture_scope('prefill') needs req_slots")
+        kind = None
         inner = _prefill_capture_scope(model, req_slots)
     elif phase == "decode":
+        from foundry.integration.sglang.graph_ops import check_decode_kind
+
         req_slots = None
-        inner = _decode_capture_scope(model)
+        kind = check_decode_kind(kind)
+        inner = _decode_capture_scope(model, kind)
     else:
         raise ValueError(f"[Foundry] capture_scope: unknown phase {phase!r}")
     if _scope is not None:
         raise RuntimeError(f"[Foundry] capture_scope({phase!r}) inside capture_scope{_scope}")
-    _scope = (phase, req_slots)
+    _scope = (phase, req_slots, kind)
     try:
         with inner:
             yield
@@ -741,7 +789,7 @@ def _patch_cuda_graph_capture() -> None:
     @functools.wraps(orig_capture)
     def patched(self):
         reject_unsupported_decode_runner(self)
-        with capture_scope("decode", self.model_runner.model):
+        with capture_scope("decode", self.model_runner.model, kind=decode_runner_kind(self)):
             return orig_capture(self)
 
     @functools.wraps(orig_resolve_ends)
@@ -855,6 +903,20 @@ def _check_resolved_graph_config(server_args) -> None:
             "Foundry's resolution hooks: load plugins (sglang.srt.plugins.load_plugins) "
             "before resolving them, or pass the Foundry config at launch."
         )
+
+
+def decode_runner_kind(runner) -> str:
+    """Plugin route: the decode-type scope kind of ``runner`` (a
+    ``DecodeCudaGraphRunner`` or subclass), derived as SGLang's dependency
+    route derives it at its call site (``DecodeCudaGraphRunner.capture``):
+    ``<target|draft>_<verify|extend|forward mode>``."""
+    role = "draft" if runner.model_runner.is_draft_worker else "target"
+    mode = runner.capture_forward_mode
+    if mode.is_target_verify():
+        return f"{role}_verify"
+    if mode.is_draft_extend_v2():
+        return f"{role}_extend"
+    return f"{role}_{mode.name.lower()}"
 
 
 def reject_unsupported_decode_runner(runner) -> None:

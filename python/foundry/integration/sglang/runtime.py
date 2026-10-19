@@ -62,6 +62,9 @@ class CUDAGraphExtensionState:
     preallocated: bool = False
     # Whether this process restored (LOAD) prefill graphs.
     prefill_graphs_restored: bool = False
+    # Decode-type capture scopes restored so far (LOAD; one per kind, e.g.
+    # target_verify, draft_decode, draft_extend under EAGLE).
+    decode_scopes_done: int = 0
 
 
 _state: CUDAGraphExtensionState | None = None
@@ -70,7 +73,8 @@ _state: CUDAGraphExtensionState | None = None
 # of SAVE and consumed by LOAD's preallocation (see record_region_layout).
 _LAYOUT_FILE = "region_layout.json"
 # Version of the allocation sequence between the layout start and the end of
-# the decode capture, recorded in _LAYOUT_FILE on SAVE and required on LOAD.
+# the last decode-type capture scope, recorded in _LAYOUT_FILE on SAVE and
+# required on LOAD.
 # 2: both modes run sglang's own decode capture loop and substitute only the
 # capture (1, unmarked: a FlashInfer metadata pre-pass before the loop, which
 # allocates the per-bs wrappers in another order; LOAD cannot replay it).
