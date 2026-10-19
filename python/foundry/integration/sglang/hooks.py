@@ -334,6 +334,7 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
     from foundry.integration.sglang.graph_ops import (
         bootstrap_collective_connections,
         bootstrap_deepep_buffer,
+        bootstrap_expert_mappings,
         bootstrap_flashinfer_tactics,
         bootstrap_lazy_runtimes,
         bootstrap_logits_gatherer,
@@ -360,6 +361,12 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
     rt.log_alloc_offset("before_deepep_bootstrap")
     bootstrap_deepep_buffer(model)
     rt.log_alloc_offset("after_deepep_bootstrap")
+    # 3b. The standard dispatcher's expert-id mapping (both modes; the plain
+    #     EP all-to-all only): built lazily on the first dispatch, which a
+    #     capture would only record (bootstrap_expert_mappings).
+    rt.log_alloc_offset("before_expert_mappings")
+    bootstrap_expert_mappings(model)
+    rt.log_alloc_offset("after_expert_mappings")
     # 4. SAVE only, every model: the two one-time runtime initializations
     #    capture rejects (inductor's lazy init, DeepGEMM's runtime init), with
     #    the allocation region suspended so their transient tensors never move

@@ -262,3 +262,21 @@ routinely.
 Repro: `experimental/expert-parallel/serve_sglang_qwen_30b_a3b.sh 2 --load`,
 then two chat requests, temp 0: `"What is 15 - 6? Answer briefly."` — the
 second (or the first, if the server warmup ran) starts with `" zeroes"`.
+
+## Garbage output on both SAVE and LOAD with `--moe-a2a-backend none` at EP > 1 (FIXED, 2026-10-19)
+
+**Symptom.** Qwen3-30B-A3B-FP8 EP2 (attention DP or TP) with the plain EP all-to-all (`--moe-a2a-backend none`,
+sglang's standard token dispatcher): the SAVE engine's own output is garbage from the first token of every request,
+LOAD's as well (decode-only: first token right, then wrong); native capture is correct; offsets match, no hook
+errors. DeepEP v1 / v2 rows are unaffected.
+
+**Cause.** `StandardDispatcher` built `local_expert_mapping` (global expert id -> local slot, or -1) lazily on its
+first dispatch. SAVE captures the first shape without warm-up forwards, so that first dispatch ran under stream
+capture: the tensor was allocated in the graph pool and its `full`/`arange` fill was only recorded, never
+executed. Every later eager forward (and every graph) routed through the uninitialized mapping, and LOAD's graphs
+referenced its capture-time address.
+
+**Fix.** `bootstrap_expert_mappings` (graph_ops.py), a pre-capture bootstrap like the DeepEP buffer's: at the first
+capture scope, both modes, it builds the mapping of every standard dispatcher with EP > 1 exactly as sglang's lazy
+path does, so the table exists before any capture at the same sequence point on SAVE and LOAD (sglang unchanged).
+The rule stands: state sglang creates lazily on the first forward must exist before the first capture.

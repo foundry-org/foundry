@@ -913,6 +913,65 @@ def _find_dispatcher(model, cls) -> Any:
     return None
 
 
+def _iter_dispatchers(model, cls):
+    """Every ``cls`` dispatcher on the model (``module.dispatcher`` or one of
+    its ``_inners``), one per MoE layer."""
+    for module in model.modules():
+        dispatcher = getattr(module, "dispatcher", None)
+        if dispatcher is None:
+            continue
+        for candidate in (dispatcher, *getattr(dispatcher, "_inners", [])):
+            if isinstance(candidate, cls):
+                yield candidate
+
+
+def bootstrap_expert_mappings(model) -> int:
+    """Build the standard token dispatcher's ``local_expert_mapping`` (global
+    expert id -> local slot, -1 elsewhere) of every MoE layer BEFORE the
+    capture loop, both modes.
+
+    sglang (``token_dispatcher/standard.py``) builds it lazily on the layer's
+    first dispatch, normally inside the pre-capture warmup forwards. SAVE runs
+    none, so the first dispatch is the captured one: the tensor is allocated
+    but its fill is only recorded, every later forward and graph routes
+    through garbage, and LOAD's graphs reference its capture-time address.
+    Only the plain EP all-to-all (``--moe-a2a-backend none``) with EP > 1 has
+    the table; the DeepEP dispatchers do not. Same construction as sglang's;
+    its lazy path then finds the table built. Returns the number built."""
+    try:
+        from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
+        from sglang.srt.utils.common import get_device
+    except ImportError:
+        return 0
+    import torch
+
+    t0 = time.perf_counter()
+    n = 0
+    for d in _iter_dispatchers(model, StandardDispatcher):
+        if d.moe_ep_size <= 1 or d.skip_local_expert_mapping or d.local_expert_mapping is not None:
+            continue
+        device = get_device()
+        routed = d.num_local_routed_experts
+        mapping = torch.full((d.num_experts,), -1, dtype=torch.int32, device=device)
+        mapping[d.moe_ep_rank * routed : (d.moe_ep_rank + 1) * routed] = torch.arange(
+            0, routed, dtype=torch.int32, device=device
+        )
+        if d.num_local_shared_experts > 0:
+            mapping[-d.num_local_shared_experts :] = torch.arange(
+                routed, routed + d.num_local_shared_experts, dtype=torch.int32, device="cpu"
+            )
+        d.local_expert_mapping = mapping
+        n += 1
+    if n:
+        torch.cuda.synchronize()
+        logger.info(
+            "[Foundry] Bootstrapped %d MoE expert mappings pre-capture in %.3fs",
+            n,
+            time.perf_counter() - t0,
+        )
+    return n
+
+
 def bootstrap_deepep_buffer(model) -> bool:
     """Force the singleton DeepEP ``Buffer`` (NVSHMEM runtime + symmetric heap)
     to be created BEFORE the cuda-graph capture loop.
