@@ -18,7 +18,10 @@ The major number changes when a function below is removed or changes its
 signature or its call-site contract; the minor number when one is added.
 2.0 is the contract below: every call site passes values (the model, the
 draft flag, the pool config, the prefill request-slot count once per prefill
-capture scope), never a runner or backend object.
+capture scope), never a runner or backend object. 2.1 adds the ``kind`` of a
+decode-type capture scope (:func:`capture_scope`), so that the speculative
+decoding runners (EAGLE target verify, draft decode, draft extend) are told
+apart; a 2.0 caller passes none, which means the plain target decode runner.
 
 Call sites (SGLang side, in process order):
 
@@ -56,7 +59,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-INTEGRATION_API_VERSION = (2, 0)
+INTEGRATION_API_VERSION = (2, 1)
 MODES = ("save", "load")
 FLAG = "--cuda-graph-persistence"
 
@@ -162,7 +165,8 @@ def validate_graph_config(server_args: Any) -> None:
 
 def validate_resolved_server_args(server_args: Any) -> None:
     """After ``handle_other_validations``: reject what Foundry cannot persist
-    (speculative decoding, LoRA, PD multiplexing, elastic-EP recapture,
+    (speculative decoding other than EAGLE / EAGLE3, LoRA, PD multiplexing,
+    elastic-EP recapture,
     post-capture KV sizing), re-check the graph config and the strict pins
     after the later cascades, and pin the environment including
     ``NCCL_CUMEM_ENABLE`` (left alone for ``--moe-a2a-backend deepep_v2``)."""
@@ -279,20 +283,30 @@ def after_alloc_memory_pool(memory_pool_config: Any, is_draft_worker: bool) -> N
     hooks.after_alloc_memory_pool(memory_pool_config, is_draft_worker)
 
 
-def capture_scope(phase: str, *, model: Any, req_slots: int | None = None):
+def capture_scope(phase: str, *, model: Any, req_slots: int | None = None, kind: str | None = None):
     """Context manager around the body of ``DecodeCudaGraphRunner.capture``
-    (``phase="decode"``) or ``PrefillCudaGraphRunner.capture``
+    (``phase="decode"``, also reached by its subclasses: the EAGLE draft and
+    draft-extend runners) or ``PrefillCudaGraphRunner.capture``
     (``phase="prefill"``, with the runner's fixed request-slot count
     ``req_slots``, recorded with every prefill graph captured or restored in
-    the scope). ``model`` is the loaded model: the pre-capture bootstraps
-    walk its modules (logits gatherer, DeepEP buffer, NVSHMEM). SGLang's
-    capture loop runs inside on both modes; the scope adds the bootstraps and
-    the layout start (first runner), LOAD's preallocation and restore
-    bookkeeping, and SAVE's manifest, fatbin pack and region layout."""
+    the scope). ``model`` is the runner's loaded model: the pre-capture
+    bootstraps of the first scope walk its modules (logits gatherer, DeepEP
+    buffer, NVSHMEM). ``kind`` (2.1, decode only) names the decode-type graph
+    set, a lowercase identifier derived from values: ``<role>_<mode>`` with
+    role ``target`` / ``draft`` (the runner's draft-worker flag) and mode
+    ``decode``, ``verify`` (TARGET_VERIFY), ``extend`` (DRAFT_EXTEND_V2) or
+    the forward mode's name; None means ``target_decode``. A process runs at
+    most one decode-type scope per kind (EAGLE: ``target_verify``,
+    ``draft_decode``, ``draft_extend``, in that order); each kind's graphs
+    are archived and restored on their own, and LOAD must run the kinds SAVE
+    ran, in the same order. SGLang's capture loop runs inside on both modes;
+    the scope adds the bootstraps and the layout start (first scope), LOAD's
+    preallocation and restore bookkeeping, and SAVE's manifest, fatbin pack
+    and region layout (rewritten at the end of every decode-type scope)."""
     _require_active()
     from foundry.integration.sglang import hooks
 
-    return hooks.capture_scope(phase, model, req_slots)
+    return hooks.capture_scope(phase, model, req_slots, kind)
 
 
 def capture_one(shape_key: Any, forward_fn, *, pool: Any, stream: Any):

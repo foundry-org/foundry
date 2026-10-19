@@ -114,7 +114,7 @@ Rec = recorded at SAVE, App = applied at LOAD, Det = detected when missing, Test
 ### 2.7 SGLang flags the plugin already pins or rejects
 
 Decode backend full; prefill full or disabled; no breakable; no `--cuda-graph-config` contradiction;
-no `--disable-cuda-graph`; profiling and autotune off; speculative decoding, LoRA, pdmux, elastic-EP recapture and
+no `--disable-cuda-graph`; profiling and autotune off; speculative decoding other than EAGLE / EAGLE3, LoRA, pdmux, elastic-EP recapture and
 attention graph variants rejected; missing bs at LOAD is an error; graph-pool borrow forced off.
 
 ## 3. Ranked gaps (deduplicated)
@@ -184,7 +184,7 @@ PINS (resolution hook, same as the graph backends today), not a rejection:
 | memory saver graph context, metadata glue graph, graph-pool precarve, graph-pool borrow | off | graph memory owned outside Foundry's region |
 | `--dsv4-attn-backend` | `auto`/`flashmla` | the trtllm variant asserts at first call during capture; needs a bootstrap first |
 
-Rejected with an error (no Foundry logic for them): speculative decoding, LoRA, pdmux, elastic-EP recapture,
+Rejected with an error (no Foundry logic for them): speculative decoding other than EAGLE / EAGLE3, LoRA, pdmux, elastic-EP recapture,
 attention graph variants, non-full graph backends, `--disable-cuda-graph`, profiling/autotune on.
 
 Documented requirements stay: dense no-padding capture with an explicit bs list, DeepEP low-latency on EP rows,

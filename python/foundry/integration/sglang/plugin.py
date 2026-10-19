@@ -29,7 +29,8 @@ pins land at the same pipeline positions as the former in-tree step):
   config, which also covers ``--cuda-graph-config`` JSON (it outranks the
   per-phase flags).
 - ``handle_other_validations`` (wrapped, validates after): features Foundry
-  does not support, once speculative decoding, LoRA and elastic EP are
+  does not support (speculative decoding other than EAGLE / EAGLE3), once
+  speculative decoding, LoRA and elastic EP are
   resolved; the graph config and the pinned flags are checked again after
   the later cascades, and ``NCCL_CUMEM_ENABLE`` is pinned once the MoE
   all-to-all backend is known.
@@ -272,6 +273,15 @@ def _elastic_recapture_path_exists() -> bool:
     return hasattr(cuda_graph_setup, "recapture_elastic_cuda_graph")
 
 
+# Speculative decoding persisted by Foundry: the EAGLE worker's target-verify,
+# draft-decode and draft-extend graphs (one decode-type capture scope each,
+# hooks._decode_capture_scope). NEXTN resolves to EAGLE before this check.
+# The other algorithms (STANDALONE, NGRAM, DFLASH, DSPARK, UNO, FROZEN_KV_MTP
+# and plugin-registered ones) run other workers and runners and stay
+# rejected.
+SUPPORTED_SPECULATIVE_ALGORITHMS = ("EAGLE", "EAGLE3", "NEXTN")
+
+
 def reject_unsupported_features(server_args: Any) -> None:
     """Features whose graphs Foundry cannot save or restore, rejected once
     they are resolved. Pipeline parallelism is allowed: the workspace rank
@@ -282,11 +292,22 @@ def reject_unsupported_features(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     unsupported = []
     spec = getattr(cfg, "speculative_algorithm", None)
-    if spec and str(spec).upper() != "NONE":
+    spec = str(spec).upper() if spec else "NONE"
+    if spec != "NONE" and spec not in SUPPORTED_SPECULATIVE_ALGORITHMS:
         unsupported.append(
-            f"speculative decoding (--speculative-algorithm={spec}): target-verify and "
-            "draft graphs are not persisted"
+            f"speculative decoding (--speculative-algorithm={spec}): only "
+            f"{'/'.join(SUPPORTED_SPECULATIVE_ALGORITHMS)} graphs are persisted"
         )
+    if spec != "NONE":
+        if getattr(cfg, "speculative_adaptive", False):
+            unsupported.append(
+                "adaptive speculative decoding (--speculative-adaptive): it captures one "
+                "graph set per step count and switches between them"
+            )
+        if getattr(cfg, "enable_multi_layer_eagle", False):
+            unsupported.append(
+                "multi-layer EAGLE (--enable-multi-layer-eagle): its runners are not persisted"
+            )
     if getattr(cfg, "enable_lora", False) or getattr(cfg, "lora_paths", None):
         unsupported.append("LoRA (--enable-lora / --lora-paths): not persisted or tested")
     if getattr(cfg, "enable_pdmux", False):

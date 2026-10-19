@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -28,6 +29,15 @@ from foundry.integration.sglang.runtime import get_state
 logger = logging.getLogger(__name__)
 
 _GRAPH_FILENAME_RE = re.compile(r"^graph_(?P<index>\d+)_FULL_t(?P<bs>\d+)_r\d+_UX_pcN\.json$")
+# Decode-type graphs of every other capture scope kind (speculative decoding:
+# target_verify, draft_decode, draft_extend, ...) and of target_decode graphs
+# with a variant label: the kind and the ShapeKey's size (and variant label)
+# are in the name. The plain target decode graphs keep the name above, so
+# archives without speculative decoding are unchanged.
+_KIND_GRAPH_FILENAME_RE = re.compile(
+    r"^graph_(?P<index>\d+)_DECODE-(?P<kind>[a-z][a-z0-9_]*)_t(?P<size>\d+)_UX_pcN"
+    r"(?:_v(?P<variant>[A-Za-z0-9]+))?\.json$"
+)
 # Full-backend prefill graphs: one per token bucket t and cached-prefix variant
 # pc (prefix chunks, 0 = suffix-only), captured with r request slots. Their own
 # phase tag keeps them out of the decode scan above, so decode-only archives
@@ -38,27 +48,59 @@ _PREFILL_GRAPH_FILENAME_RE = re.compile(
 # Per-rank SAVE record of what LOAD needs besides the graphs: the DP-gather
 # flag the captured forwards latch and the prefill output structures.
 _PREFILL_STATE_FILE = "prefill_graphs.json"
+# Per-rank SAVE record of the decode-type capture scopes: their kinds in
+# process order and the output structure of each decode-type graph. Absent in
+# archives saved before 2.1 (one target_decode scope, logits-only outputs).
+_DECODE_STATE_FILE = "decode_graphs.json"
 # PrefillCudaGraphRunner's only ShapeKey variants (_chunked_prefix_variant).
 _CHUNKED_PREFIX_LABEL = "chunked_prefix:"
 # SAVE: output structure of each prefill graph whose output is not one tensor.
 _prefill_output_specs: dict[str, Any] = {}
+# SAVE: output structure of each decode-type graph, and the kinds of the
+# decode-type scopes finished so far (both written to _DECODE_STATE_FILE).
+_decode_output_specs: dict[str, Any] = {}
+_saved_decode_kinds: list[str] = []
+
+# The decode runner of a process without speculative decoding (and the kind
+# an integration API 2.0 caller implies).
+DEFAULT_DECODE_KIND = "target_decode"
+_KIND_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_VARIANT_RE = re.compile(r"^[A-Za-z0-9]+$")
+# Output of a pre-2.1 decode graph: LogitsProcessorOutput(next_token_logits).
+_LEGACY_DECODE_OUTPUT_SPEC: Any = {"lpo": ["next_token_logits"]}
 
 
-def _batch_size_from_key(key: Any) -> int:
-    """Decode ShapeKey(size, stream_idx, variant_label, attention_variant):
-    only plain single-stream graphs are persisted, where size == bs."""
-    if (
-        key.stream_idx is not None
-        or key.variant_label is not None
-        or key.attention_variant is not None
-    ):
+def check_decode_kind(kind: str | None) -> str:
+    """The scope kind (None: :data:`DEFAULT_DECODE_KIND`); it goes into graph
+    filenames and manifest partitions, so it must be a lowercase identifier."""
+    if kind is None:
+        return DEFAULT_DECODE_KIND
+    if not isinstance(kind, str) or not _KIND_RE.match(kind):
+        raise ValueError(f"[Foundry] invalid decode capture scope kind {kind!r}")
+    return kind
+
+
+def _decode_shape(key: Any) -> tuple[int, str | None]:
+    """(size, variant label) of a decode-type ShapeKey(size, stream_idx,
+    variant_label, attention_variant). Multi-stream (PD multiplexing) and
+    attention graph variants are not persisted; a variant label (the EAGLE
+    draft runner's greedy / sampling graph pair) is, by name."""
+    if key.stream_idx is not None or key.attention_variant is not None:
         raise ValueError(f"Foundry SGLang save/load does not support graph variants: {key!r}")
-    return key.size
+    label = key.variant_label
+    if label is not None and (not isinstance(label, str) or not _VARIANT_RE.match(label)):
+        raise ValueError(
+            f"Foundry SGLang save/load does not support decode variant label {label!r}: {key!r}"
+        )
+    return key.size, label
 
 
-def _graph_filename(index: int, key: Any) -> str:
-    batch_size = _batch_size_from_key(key)
-    return f"graph_{index}_FULL_t{batch_size}_r{batch_size}_UX_pcN.json"
+def _graph_filename(index: int, key: Any, kind: str = DEFAULT_DECODE_KIND) -> str:
+    size, variant = _decode_shape(key)
+    if kind == DEFAULT_DECODE_KIND and variant is None:
+        return f"graph_{index}_FULL_t{size}_r{size}_UX_pcN.json"
+    suffix = f"_v{variant}" if variant is not None else ""
+    return f"graph_{index}_DECODE-{kind}_t{size}_UX_pcN{suffix}.json"
 
 
 def _prefill_shape(key: Any) -> tuple[int, int]:
@@ -79,17 +121,28 @@ def _prefill_graph_filename(index: int, key: Any, req_slots: int) -> str:
 
 
 def graph_partition(filename: str) -> str:
-    """Manifest partition: prefill and decode graphs are restored by separate
-    start_graph_builds calls (at their own runner's capture point), so they
-    must not share a template."""
-    return "prefill" if _PREFILL_GRAPH_FILENAME_RE.match(filename) else "decode"
+    """Manifest partition: prefill graphs and each decode-type scope kind's
+    graphs are restored by separate start_graph_builds calls (at their own
+    runner's capture point), so they must not share a template. The plain
+    target decode graphs keep the pre-2.1 partition name."""
+    if _PREFILL_GRAPH_FILENAME_RE.match(filename):
+        return "prefill"
+    match = _KIND_GRAPH_FILENAME_RE.match(filename)
+    if match:
+        return f"decode:{match.group('kind')}"
+    return "decode"
 
 
 def _flatten_prefill_output(output: Any) -> tuple[Any, list[torch.Tensor]]:
     """Prefill graphs capture the transformer body, whose output is the hidden
     states: one tensor for most models, a nested tuple / list (auxiliary hidden
     states) or PPProxyTensors (non-last PP rank) otherwise. Returns a JSON spec
-    of the structure and its tensors in depth-first order."""
+    of the structure and its tensors in depth-first order. Decode-type graphs
+    use the same spec, plus ``{"lpo": [fields]}`` for a LogitsProcessorOutput
+    (its tensor fields; the target-verify and draft-extend outputs carry the
+    hidden states next to the logits) and tuples with None members (the EAGLE
+    draft runner's (parent_list, top_scores_index, draft_tokens, draft_probs))."""
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
     tensors: list[torch.Tensor] = []
@@ -100,6 +153,20 @@ def _flatten_prefill_output(output: Any) -> tuple[Any, list[torch.Tensor]]:
         if isinstance(x, torch.Tensor):
             tensors.append(x)
             return "T"
+        if isinstance(x, LogitsProcessorOutput):
+            names = []
+            for f in dataclasses.fields(x):
+                value = getattr(x, f.name)
+                if value is None:
+                    continue
+                if not isinstance(value, torch.Tensor):
+                    raise TypeError(
+                        f"SGLang CUDA graph output field LogitsProcessorOutput.{f.name} is a "
+                        f"{type(value).__name__}; only tensor fields can be persisted"
+                    )
+                names.append(f.name)
+                tensors.append(value)
+            return {"lpo": names}
         if isinstance(x, PPProxyTensors):
             names = list(x.tensors)
             tensors.extend(x.tensors[n] for n in names)
@@ -114,6 +181,7 @@ def _flatten_prefill_output(output: Any) -> tuple[Any, list[torch.Tensor]]:
 
 
 def _unflatten_prefill_output(spec: Any, tensors: Any) -> Any:
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
     if tensors is None:
@@ -127,6 +195,11 @@ def _unflatten_prefill_output(spec: Any, tensors: Any) -> Any:
             return None
         if s == "T":
             return next(it)
+        if "lpo" in s:
+            fields = {name: next(it) for name in s["lpo"]}
+            if "next_token_logits" not in fields:
+                fields["next_token_logits"] = None
+            return LogitsProcessorOutput(**fields)
         if "pp" in s:
             return PPProxyTensors({n: next(it) for n in s["pp"]})
         if "tuple" in s:
@@ -139,40 +212,43 @@ def _unflatten_prefill_output(spec: Any, tensors: Any) -> Any:
     return out
 
 
-def _pack_output(output: Any) -> torch.Tensor:
-    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-
-    if isinstance(output, LogitsProcessorOutput):
-        if output.next_token_logits is None:
-            raise TypeError("SGLang decode CUDA graph output has no next_token_logits")
-        return output.next_token_logits
-
-    if isinstance(output, torch.Tensor):
-        return output
-
-    raise TypeError(f"Unsupported SGLang CUDA graph output type: {type(output)!r}")
+def _pack_output(output: Any) -> tuple[Any, Any]:
+    """Decode-type graph output -> (structure spec, tensor(s) for graph.save):
+    one tensor when the output holds one (the pre-2.1 layout of a
+    logits-only output), else the list in depth-first order."""
+    spec, tensors = _flatten_prefill_output(output)
+    if not tensors:
+        raise TypeError(f"SGLang decode CUDA graph output holds no tensor: {type(output)!r}")
+    return spec, tensors[0] if len(tensors) == 1 else tensors
 
 
-def _unpack_output(tensors: Any) -> Any:
-    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-
-    if isinstance(tensors, (tuple, list)):
-        if len(tensors) != 1:
-            raise RuntimeError(f"Expected one SGLang CUDA graph output tensor, got {len(tensors)}")
-        tensors = tensors[0]
-    return LogitsProcessorOutput(next_token_logits=tensors)
-
-
-def _scan_graph_files(workspace_dir: str) -> list[tuple[int, str, dict[str, Any]]]:
+def _scan_graph_files(
+    workspace_dir: str, kind: str | None = None
+) -> list[tuple[int, str, dict[str, Any]]]:
+    """Decode-type graph files in capture order, of every kind or of
+    ``kind`` only; meta: index, kind, size, variant."""
     graph_files = []
     for filename in os.listdir(workspace_dir):
         match = _GRAPH_FILENAME_RE.match(filename)
-        if not match:
+        if match:
+            meta = {
+                "index": int(match.group("index")),
+                "kind": DEFAULT_DECODE_KIND,
+                "size": int(match.group("bs")),
+                "variant": None,
+            }
+        else:
+            match = _KIND_GRAPH_FILENAME_RE.match(filename)
+            if not match:
+                continue
+            meta = {
+                "index": int(match.group("index")),
+                "kind": match.group("kind"),
+                "size": int(match.group("size")),
+                "variant": match.group("variant"),
+            }
+        if kind is not None and meta["kind"] != kind:
             continue
-        meta = {
-            "index": int(match.group("index")),
-            "key": int(match.group("bs")),
-        }
         graph_files.append((int(meta["index"]), filename, meta))
     graph_files.sort(key=lambda x: x[0])
     return graph_files
@@ -188,18 +264,26 @@ def capture_graph(pool, stream, forward_fn) -> tuple[Any, Any]:
     return graph, out
 
 
-def save_graph(graph, output: Any, key: Any, prefill_req_slots: int | None = None) -> None:
+def save_graph(
+    graph,
+    output: Any,
+    key: Any,
+    prefill_req_slots: int | None = None,
+    kind: str = DEFAULT_DECODE_KIND,
+) -> None:
     """Persist one captured graph. ``prefill_req_slots`` is set for the
     prefill runner's graphs (its fixed request-slot count) and selects the
-    prefill filename and output packing; decode graphs are unchanged."""
+    prefill filename and output packing; decode-type graphs are named after
+    their scope ``kind`` and record their output structure."""
     cfg = get_config()
     state = get_state()
     if cfg is None or state is None or cfg.workspace_dir is None:
         raise RuntimeError("Foundry SGLang graph extension is not initialized")
 
     if prefill_req_slots is None:
-        packed_output = _pack_output(output)
-        filename = _graph_filename(state.capture_index, key)
+        filename = _graph_filename(state.capture_index, key, kind)
+        spec, packed_output = _pack_output(output)
+        _decode_output_specs[filename] = spec
     else:
         filename = _prefill_graph_filename(state.capture_index, key, prefill_req_slots)
         spec, tensors = _flatten_prefill_output(output)
@@ -238,6 +322,42 @@ def save_prefill_graph_state(*, req_slots: int, has_dp_gather: bool) -> None:
     }
     with open(os.path.join(cfg.workspace_dir, _PREFILL_STATE_FILE), "w") as f:
         json.dump(record, f, indent=2)
+
+
+def save_decode_graph_state(kind: str) -> None:
+    """SAVE, at the end of each decode-type capture scope: append its kind
+    and (re)write the rank's decode record (see _DECODE_STATE_FILE). The
+    process does not know which scope is its last, so the record is complete
+    after every scope."""
+    cfg = get_config()
+    if cfg is None or cfg.workspace_dir is None:
+        return
+    _saved_decode_kinds.append(kind)
+    record = {"scopes": _saved_decode_kinds, "output_specs": _decode_output_specs}
+    with open(os.path.join(cfg.workspace_dir, _DECODE_STATE_FILE), "w") as f:
+        json.dump(record, f, indent=2)
+
+
+_decode_record: dict[str, Any] | None = None
+
+
+def load_decode_graph_state() -> dict[str, Any]:
+    """LOAD: the rank's decode record; an archive saved before 2.1 has none
+    and holds one target_decode scope with logits-only outputs."""
+    global _decode_record
+    if _decode_record is not None:
+        return _decode_record
+    cfg = get_config()
+    if cfg is None or cfg.workspace_dir is None:
+        raise RuntimeError("Foundry SGLang graph extension is not initialized")
+    path = os.path.join(cfg.workspace_dir, _DECODE_STATE_FILE)
+    if os.path.exists(path):
+        with open(path) as f:
+            record = json.load(f)
+    else:
+        record = {"scopes": [DEFAULT_DECODE_KIND], "output_specs": {}}
+    _decode_record = record
+    return record
 
 
 def _scan_prefill_graph_files(workspace_dir: str) -> list[tuple[int, str, dict[str, Any]]]:
@@ -279,7 +399,11 @@ def _log_restore(what: str, n: int, pending: Any, timing: _RestoreTiming, loop_s
     builds = max(0.0, build_end - timing.t0)
     handover = sum(max(0.0, end - max(start, build_end)) for start, end in timing.calls)
     in_calls = sum(end - start for start, end in timing.calls)
-    graphs = "SGLang prefill graphs" if what == "prefill" else "SGLang graphs"
+    # "prefill", "decode" (the target_decode scope, pre-2.1 wording) or the
+    # decode-type scope kind.
+    graphs = {"prefill": "SGLang prefill graphs", "decode": "SGLang graphs"}.get(
+        what, f"SGLang {what} graphs"
+    )
     logger.info(
         "[Foundry] Loaded %d %s in %.3fs (builds %.3fs, handover %.3fs)",
         n,
@@ -831,8 +955,10 @@ def _bootstrap_deepep_v2_buffer(model) -> bool:
 
 @dataclass
 class _DecodeRestore:
+    kind: str
     pending: Any
     graph_files: list[tuple[int, str, dict[str, Any]]]
+    output_specs: dict[str, Any]
     timing: _RestoreTiming
     next: int = 0
 
@@ -840,22 +966,31 @@ class _DecodeRestore:
 _decode_restore: _DecodeRestore | None = None
 
 
+def _shape_label(size: int, variant: str | None) -> str:
+    return f"size={size}" + (f" variant={variant}" if variant is not None else "")
+
+
 @nvtx_traced("foundry.graph_restore.decode_start")
-def start_decode_graph_restore() -> None:
-    """LOAD, at the decode runner's capture: start building every decode graph
-    in one ``start_graph_builds`` call (the manifest's template / on-demand
-    linking needs them in one call; the builds run on foundry's background
-    thread). The graphs are then
-    finished one at a time by restore_next_decode_graph, from inside the
-    upstream capture loop, so their allocator events replay at the points SAVE
-    captured them, between the same per-shape eager work."""
+def start_decode_graph_restore(kind: str = DEFAULT_DECODE_KIND) -> None:
+    """LOAD, at a decode-type runner's capture: start building every graph of
+    this scope ``kind`` in one ``start_graph_builds`` call (the manifest's
+    template / on-demand linking needs a partition in one call; the builds
+    run on foundry's background thread). The graphs are then finished one at
+    a time by restore_next_decode_graph, from inside the upstream capture
+    loop, so their allocator events replay at the points SAVE captured them,
+    between the same per-shape eager work."""
     global _decode_restore
     cfg = get_config()
     if cfg is None or cfg.workspace_dir is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
         raise RuntimeError("Foundry SGLang graph extension is not initialized for LOAD")
-    graph_files = _scan_graph_files(cfg.workspace_dir)
+    if _decode_restore is not None:
+        raise RuntimeError(
+            f"Foundry decode graph restore of {_decode_restore.kind} is still open "
+            f"at the start of {kind}"
+        )
+    graph_files = _scan_graph_files(cfg.workspace_dir, kind)
     if not graph_files:
-        raise RuntimeError(f"No Foundry SGLang graph files found in {cfg.workspace_dir}")
+        raise RuntimeError(f"No Foundry SGLang {kind} graph files found in {cfg.workspace_dir}")
 
     # Graphs may reference NVSHMEM symbols; the DeepEP bootstrap ran before.
     # Single-GPU dense models have no NVSHMEM modules (no-op there).
@@ -865,45 +1000,54 @@ def start_decode_graph_restore() -> None:
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
     pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
     _decode_restore = _DecodeRestore(
-        pending=pending, graph_files=graph_files, timing=_RestoreTiming(t0=t0)
+        kind=kind,
+        pending=pending,
+        graph_files=graph_files,
+        output_specs=load_decode_graph_state().get("output_specs", {}),
+        timing=_RestoreTiming(t0=t0),
     )
 
 
 def restore_next_decode_graph(key: Any) -> tuple[Any, Any]:
-    """LOAD: stands in for capturing decode graph ``key``. The archive holds
-    the graphs in capture order (``reversed(capture_bs)``); the upstream loop
-    asks for them in the same order, which is checked here."""
+    """LOAD: stands in for capturing decode-type graph ``key``. The archive
+    holds the scope's graphs in capture order (``reversed(capture_bs)``, and
+    per size the runner's variants in its order); the upstream loop asks for
+    them in the same order, which is checked here."""
     r = _decode_restore
     state = get_state()
     if r is None or state is None:
         raise RuntimeError("Foundry decode graph restore was not started")
-    bs = _batch_size_from_key(key)
+    size, variant = _decode_shape(key)
     if r.next >= len(r.graph_files):
         raise RuntimeError(
-            f"Foundry archive holds {len(r.graph_files)} decode graphs, but the capture loop "
-            f"asks for more (bs={bs}): the decode capture sizes (--cuda-graph-bs) differ from SAVE"
+            f"Foundry archive holds {len(r.graph_files)} {r.kind} graphs, but the capture loop "
+            f"asks for more ({_shape_label(size, variant)}): the capture sizes "
+            "(--cuda-graph-bs) or speculative settings differ from SAVE"
         )
     _index, filename, meta = r.graph_files[r.next]
-    if meta["key"] != bs:
+    if (meta["size"], meta["variant"]) != (size, variant):
         raise RuntimeError(
-            f"Foundry decode graph order mismatch: the capture loop asks for bs={bs}, the next "
-            f"archived graph is {filename}. The decode capture sizes (--cuda-graph-bs) differ "
-            "between SAVE and LOAD."
+            f"Foundry {r.kind} graph order mismatch: the capture loop asks for "
+            f"{_shape_label(size, variant)}, the next archived graph is {filename}. The capture "
+            "sizes (--cuda-graph-bs) or speculative settings differ between SAVE and LOAD."
         )
     t = time.perf_counter()
     with nvtx_range("foundry.graph_restore.finish_one"):
         graph, tensors = FoundryCUDAGraph.finish_one_graph_load(r.pending, r.next)
     r.timing.calls.append((t, time.perf_counter()))
     r.next += 1
-    output = _unpack_output(tensors)
+    output = _unflatten_prefill_output(
+        r.output_specs.get(filename, _LEGACY_DECODE_OUTPUT_SPEC), tensors
+    )
     # Strong reference next to the backend's own.
-    state.loaded_graphs[bs] = (graph, output)
+    state.loaded_graphs[(r.kind, size, variant)] = (graph, output)
     return graph, output
 
 
 def finish_decode_graph_restore(loop_s: float) -> None:
-    """LOAD, after the upstream decode capture loop (``loop_s`` is its
-    wall): check that it restored every archived decode graph."""
+    """LOAD, after the upstream capture loop of a decode-type scope
+    (``loop_s`` is its wall): check that it restored every archived graph of
+    the scope's kind."""
     global _decode_restore
     r = _decode_restore
     _decode_restore = None
@@ -911,7 +1055,10 @@ def finish_decode_graph_restore(loop_s: float) -> None:
         raise RuntimeError("Foundry decode graph restore was not started")
     if r.next != len(r.graph_files):
         raise RuntimeError(
-            f"Foundry archive holds {len(r.graph_files)} decode graphs, the capture loop "
-            f"restored {r.next}: the decode capture sizes (--cuda-graph-bs) differ from SAVE"
+            f"Foundry archive holds {len(r.graph_files)} {r.kind} graphs, the capture loop "
+            f"restored {r.next}: the capture sizes (--cuda-graph-bs) or speculative settings "
+            "differ from SAVE"
         )
-    _log_restore("decode", r.next, r.pending, r.timing, loop_s)
+    _log_restore(
+        "decode" if r.kind == DEFAULT_DECODE_KIND else r.kind, r.next, r.pending, r.timing, loop_s
+    )

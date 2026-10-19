@@ -194,8 +194,14 @@ def save_graph_manifest(
 
     Should be called after all graphs are captured and saved.
     """
+    # graph_<index>_*.json; not the manifest itself, which a repeated call
+    # (one per capture scope) finds in the directory.
     graph_files = sorted(
-        (f for f in os.listdir(archive_dir) if f.startswith("graph_") and f.endswith(".json")),
+        (
+            f
+            for f in os.listdir(archive_dir)
+            if f.startswith("graph_") and f.endswith(".json") and f.split("_")[1].isdigit()
+        ),
         key=lambda f: int(f.split("_")[1]),
     )
     if not graph_files:
