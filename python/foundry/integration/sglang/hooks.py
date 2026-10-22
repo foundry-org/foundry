@@ -797,23 +797,13 @@ def _patch_cuda_graph_capture() -> None:
                 f"got {self.prefill_backend_name!r}: use --cuda-graph-backend-prefill "
                 "full or disabled"
             )
-        with capture_scope(
-            "prefill",
-            self.model_runner.model,
-            self._capture_req_slots,
-            flashinfer_tactics=flashinfer_tactics_cache(self.model_runner),
-        ):
+        with capture_scope("prefill", self.model_runner.model, self._capture_req_slots):
             return orig_prefill_capture(self)
 
     @functools.wraps(orig_capture)
     def patched(self):
         reject_unsupported_decode_runner(self)
-        with capture_scope(
-            "decode",
-            self.model_runner.model,
-            kind=decode_runner_kind(self),
-            flashinfer_tactics=flashinfer_tactics_cache(self.model_runner),
-        ):
+        with capture_scope("decode", self.model_runner.model, kind=decode_runner_kind(self)):
             return orig_capture(self)
 
     @functools.wraps(orig_resolve_ends)
@@ -927,43 +917,6 @@ def _check_resolved_graph_config(server_args) -> None:
             "Foundry's resolution hooks: load plugins (sglang.srt.plugins.load_plugins) "
             "before resolving them, or pass the Foundry config at launch."
         )
-
-
-def flashinfer_tactics_cache(model_runner) -> str | None:
-    """Plugin route: the runner's FlashInfer tuned-tactics cache file, or None
-    when its kernels take no FlashInfer tactics (the value the dependency
-    route's call sites pass as ``flashinfer_tactics``). SGLang's own helper
-    when the installed sglang has it; otherwise sglang's autotune gate with
-    the pinned disable flag ignored (its MoE runner / quantization checks),
-    and its cache path."""
-    try:
-        from sglang.srt.model_executor.runner import flashinfer_autotune as fa
-    except Exception as exc:
-        logger.info("[Foundry] FlashInfer tactics: no sglang autotune module (%s)", exc)
-        return None
-    helper = getattr(fa, "flashinfer_tactics_cache_for_persistence", None)
-    if helper is not None:
-        return helper(model_runner)
-    try:
-        from sglang.srt.runtime_context import get_exec
-
-        if model_runner.device != "cuda":
-            return None
-        backend = str(get_exec().moe.moe_runner_backend)
-        quant = model_runner.model_config.quantization
-        takes_tactics = backend.startswith("flashinfer_") or quant in (
-            "modelopt",
-            "modelopt_fp8",
-            "modelopt_fp4",
-            "modelopt_mixed",
-            "mxfp8",
-        )
-        if not takes_tactics:
-            return None
-        return str(fa.flashinfer_autotune_cache_path(model_runner))
-    except Exception as exc:
-        logger.warning("[Foundry] FlashInfer tactics: cache path unavailable (%s)", exc)
-        return None
 
 
 def decode_runner_kind(runner) -> str:
