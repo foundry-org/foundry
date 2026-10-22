@@ -48,6 +48,9 @@ class WarmupState:
     # models); LOAD skips the resolver and replays them instead.
     context_overrides: list = field(default_factory=list)
     final_alloc_offset: int = 0
+    # FlashInfer's tuned tactics of this rank (the content of SGLang's autotune
+    # cache file), installed by LOAD before capture; None: default tactics.
+    flashinfer_tactics: dict | None = None
 
 
 @dataclass

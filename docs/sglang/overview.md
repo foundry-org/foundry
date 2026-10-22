@@ -96,8 +96,9 @@ Rejected instead, because Foundry has no logic for them: speculative decoding ot
 recapture, attention graph variants, non-full graph backends, `--disable-cuda-graph`, CUDA-graph profiling,
 `SGLANG_ENABLE_POST_CAPTURE_KV_SIZING`. Profiling and FlashInfer autotune are pinned off with the graph backends;
 FlashInfer's tuned tactics travel with the archive instead: SAVE installs SGLang's per-rank autotune cache file
-(written by a plain start of the same model) and copies it into the archive as `flashinfer_tactics.json`, LOAD installs
-the archived copy, so both sides run the tuned kernels without a tuning pass (`graph_ops.bootstrap_flashinfer_tactics`).
+(written by a plain start of the same model) and keeps its content in the rank's `warmup_state.json` (section
+`flashinfer_tactics`), LOAD installs that section, so both sides run the tuned kernels without a tuning pass
+(`graph_ops.bootstrap_flashinfer_tactics`).
 
 Still documented requirements (a flag cannot express them): dense no-padding decode capture with an explicit
 batch-size list, DeepEP low-latency on EP rows, JIT caches warm before SAVE, pinned hybrid state pools, and identical
