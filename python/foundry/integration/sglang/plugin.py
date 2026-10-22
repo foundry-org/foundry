@@ -21,8 +21,11 @@ pins land at the same pipeline positions as the former in-tree step):
 - ``apply_inkling_prefill_cuda_graph_default`` (wrapped, pins first): the
   step the in-tree ``handle_graph_extension`` ran right before. Decode is
   pinned to ``full``, prefill to ``disabled`` unless ``full`` / ``disabled`` was
-  given, profiling and FlashInfer autotune off (SAVE and LOAD must allocate
-  identically). Conflicting flags raise instead of being overridden. The
+  given, profiling and FlashInfer autotune off (the tuning pass allocates
+  timing-dependently inside the recorded sequence; the tuned tactics are
+  installed from SGLang's cache file / the archive instead, see
+  ``graph_ops.bootstrap_flashinfer_tactics``). Conflicting flags raise
+  instead of being overridden. The
   same step pins the flags that select state Foundry cannot replay
   (:data:`FIELD_PINS`, see "Pins" below).
 - ``handle_cuda_graph_config`` (wrapped, validates after): the resolved
@@ -200,7 +203,7 @@ def pin_graph_fields(server_args: Any) -> None:
     """Decode ``full``; prefill ``full`` or ``disabled`` (default ``disabled``, not
     the platform default, which on CUDA is ``breakable``; leaving it unset
     would also let a model default such as Inkling's pick it); profiling and
-    FlashInfer autotune off."""
+    FlashInfer autotune off (tuned tactics come from the cache file / archive)."""
     from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
     Backend = _backend()
