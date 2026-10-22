@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -52,6 +53,10 @@ _PREFILL_STATE_FILE = "prefill_graphs.json"
 # process order and the output structure of each decode-type graph. Absent in
 # archives saved before 2.1 (one target_decode scope, logits-only outputs).
 _DECODE_STATE_FILE = "decode_graphs.json"
+# Per-rank copy of FlashInfer's tuned-tactics cache (SAVE), installed by LOAD
+# before capture so both sides run the same kernels and workspaces without a
+# tuning pass; decode_graphs.json says whether SAVE had one (flashinfer_tactics).
+_FLASHINFER_TACTICS_FILE = "flashinfer_tactics.json"
 # PrefillCudaGraphRunner's only ShapeKey variants (_chunked_prefix_variant).
 _CHUNKED_PREFIX_LABEL = "chunked_prefix:"
 # SAVE: output structure of each prefill graph whose output is not one tensor.
@@ -334,6 +339,10 @@ def save_decode_graph_state(kind: str) -> None:
         return
     _saved_decode_kinds.append(kind)
     record = {"scopes": _saved_decode_kinds, "output_specs": _decode_output_specs}
+    if _flashinfer_tactics_used is not None:
+        record["flashinfer_tactics"] = (
+            _flashinfer_tactics_used  # LOAD installs the archived tactics file
+        )
     with open(os.path.join(cfg.workspace_dir, _DECODE_STATE_FILE), "w") as f:
         json.dump(record, f, indent=2)
 
@@ -701,6 +710,97 @@ def bootstrap_logits_gatherer(model) -> bool:
             weight.shape[0],
         )
     return built
+
+
+_flashinfer_tactics_used: bool | None = (
+    None  # SAVE: written into the decode record (see save_decode_graph_state)
+)
+
+
+def _load_flashinfer_tactics(path: str) -> tuple[bool, int]:
+    """Install the tactics of ``path`` into FlashInfer's AutoTuner (its config
+    lookup; a kernel's first call then picks the tuned tactic without tuning).
+    Returns (accepted, entries loaded); ``accepted`` is False when the file's
+    metadata (FlashInfer / CUDA / cuBLAS / cuDNN versions, GPU) differs from
+    this process, in which case FlashInfer ignores the whole file."""
+    from flashinfer.autotuner import AutoTuner
+
+    tuner = AutoTuner.get()
+    # _file_configs: the AutoTuner's table of file-loaded tactics (search_cache source 2).
+    before = len(getattr(tuner, "_file_configs", {}))
+    accepted = bool(tuner.load_configs(path))
+    return accepted, len(getattr(tuner, "_file_configs", {})) - before
+
+
+def bootstrap_flashinfer_tactics(cache_path: str | None) -> None:
+    """Both modes, before the runner warmup: give the captured kernels
+    FlashInfer's tuned tactics without a tuning pass.
+
+    The plugin pins ``--disable-flashinfer-autotune`` because the tuning pass
+    benchmarks every tactic of every shape inside the recorded allocation
+    sequence, with timing-dependent allocations SAVE and LOAD cannot repeat.
+    The tactics themselves are static: a plain SGLang start of the same model
+    tunes them once and writes its per-rank cache file (``cache_path``,
+    SGLang's ``flashinfer_autotune_cache_path``; None when the model's kernels
+    take no FlashInfer tactics). SAVE installs that file and copies it into
+    the archive; LOAD installs the archived copy. The tactics decide the
+    kernels and their workspaces, so an archived file LOAD cannot apply is an
+    error, not a fallback. Without a cache file SAVE records that the kernels
+    ran with FlashInfer's default tactics, and LOAD then runs the same.
+    """
+    global _flashinfer_tactics_used
+    cfg = get_config()
+    if cfg is None or cfg.workspace_dir is None:
+        return
+    archived = os.path.join(cfg.workspace_dir, _FLASHINFER_TACTICS_FILE)
+    if cfg.mode == CUDAGraphExtensionMode.LOAD:
+        if not load_decode_graph_state().get("flashinfer_tactics", False):
+            if cache_path is not None:
+                logger.info(
+                    "[Foundry] FlashInfer tactics: the archive carries none; the kernels use "
+                    "FlashInfer's default tactics, as SAVE did"
+                )
+            return
+        if not os.path.isfile(archived):
+            raise RuntimeError(
+                f"[Foundry] the archive records FlashInfer tactics but {archived} is missing"
+            )
+        accepted, n = _load_flashinfer_tactics(archived)
+        if not accepted or n == 0:
+            raise RuntimeError(
+                f"[Foundry] this FlashInfer rejected the archive's tuned tactics ({archived}): "
+                "its metadata (FlashInfer / CUDA / cuBLAS / cuDNN versions, GPU) differs from "
+                "SAVE's. The tactics select the captured kernels and their workspaces, so LOAD "
+                "needs SAVE's stack"
+            )
+        logger.info("[Foundry] FlashInfer tactics: %d loaded from the archive", n)
+        return
+    if cache_path is None:
+        _flashinfer_tactics_used = False  # the model's kernels take no FlashInfer tactics
+        return
+    if not os.path.isfile(cache_path):
+        _flashinfer_tactics_used = False
+        logger.warning(
+            "[Foundry] FlashInfer autotune is pinned off and no tuned-tactics cache exists at %s: "
+            "the captured kernels use FlashInfer's default tactics (slower on FlashInfer MoE / "
+            "GEMM paths). Tune once with a plain SGLang start of the same model and flags "
+            "(autotune on writes that file), then SAVE",
+            cache_path,
+        )
+        return
+    accepted, n = _load_flashinfer_tactics(cache_path)
+    if not accepted or n == 0:
+        _flashinfer_tactics_used = False
+        logger.warning(
+            "[Foundry] FlashInfer tactics cache %s was rejected (metadata of another FlashInfer / "
+            "CUDA / cuDNN / GPU) or is empty: the captured kernels use FlashInfer's default "
+            "tactics. Re-tune with a plain SGLang start on this stack, then SAVE",
+            cache_path,
+        )
+        return
+    shutil.copyfile(cache_path, archived)
+    _flashinfer_tactics_used = True
+    logger.info("[Foundry] FlashInfer tactics: %d loaded from %s and archived", n, cache_path)
 
 
 def install_capture_autotune_guard() -> None:

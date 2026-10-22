@@ -315,11 +315,12 @@ def after_alloc_memory_pool(memory_pool_config, is_draft_worker: bool) -> None:
         rt.save_warmup_state(state)
 
 
-def _begin_graph_layout(model, mode) -> None:
+def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> None:
     """Pre-capture bootstraps + layout start, once per process, at the first
     runner capture: the prefill runner's when prefill graphs are on (sglang
     captures prefill before decode), the decode runner's otherwise. Same
-    sequence point on SAVE and LOAD."""
+    sequence point on SAVE and LOAD. ``flashinfer_tactics``: the runner's
+    FlashInfer tuned-tactics cache file (None: its kernels take none)."""
     state = rt.get_state()
     if state is None:
         raise RuntimeError("Foundry SGLang state is not initialized")
@@ -333,10 +334,15 @@ def _begin_graph_layout(model, mode) -> None:
     from foundry.integration.sglang.graph_ops import (
         bootstrap_collective_connections,
         bootstrap_deepep_buffer,
+        bootstrap_flashinfer_tactics,
         bootstrap_lazy_runtimes,
         bootstrap_logits_gatherer,
     )
 
+    # 0. FlashInfer's tuned tactics (both modes, host-only): installed from
+    #    SAVE's cache file / the archive, since the tuning pass itself is
+    #    pinned off (its allocations are timing-dependent).
+    bootstrap_flashinfer_tactics(flashinfer_tactics)
     # 1. NCCL communicators (both modes): their first collective allocates
     #    and connects, which capture rejects.
     rt.log_alloc_offset("before_collective_bootstrap")
@@ -457,7 +463,7 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
 
 
 @contextlib.contextmanager
-def _prefill_capture_scope(model, req_slots: int):
+def _prefill_capture_scope(model, req_slots: int, flashinfer_tactics: str | None = None):
     """Around ``PrefillCudaGraphRunner.capture`` (its body, SGLang's capture
     loop, runs inside on both modes). ``model``: the loaded model (the
     bootstraps walk its modules); ``req_slots``: the runner's fixed request-
@@ -475,7 +481,7 @@ def _prefill_capture_scope(model, req_slots: int):
         start_prefill_graph_restore,
     )
 
-    _begin_graph_layout(model, mode)
+    _begin_graph_layout(model, mode, flashinfer_tactics)
     dp_flags = get_flags().dp
     if mode == CUDAGraphExtensionMode.LOAD:
         _preallocate_once()
@@ -508,7 +514,7 @@ def _prefill_capture_scope(model, req_slots: int):
 
 
 @contextlib.contextmanager
-def _decode_capture_scope(model, kind: str):
+def _decode_capture_scope(model, kind: str, flashinfer_tactics: str | None = None):
     """Around ``DecodeCudaGraphRunner.capture`` and its subclasses' (its body,
     SGLang's capture loop, runs inside on both modes). ``model``: the
     runner's loaded model (the bootstraps of the first scope walk its
@@ -527,7 +533,7 @@ def _decode_capture_scope(model, kind: str):
 
     # No-op after the first scope (the prefill runner's or an earlier
     # decode-type runner's). Both EAGLE models are loaded by then.
-    _begin_graph_layout(model, mode)
+    _begin_graph_layout(model, mode, flashinfer_tactics)
 
     if mode == CUDAGraphExtensionMode.LOAD:
         import torch
@@ -613,24 +619,32 @@ def _decode_capture_scope(model, kind: str):
 
 
 @contextlib.contextmanager
-def capture_scope(phase: str, model, req_slots: int | None = None, kind: str | None = None):
+def capture_scope(
+    phase: str,
+    model,
+    req_slots: int | None = None,
+    kind: str | None = None,
+    flashinfer_tactics: str | None = None,
+):
     """Prefill or decode capture scope (both routes): ``phase`` is
     ``"prefill"`` (with the runner's ``req_slots``, which every
     :func:`capture_one` inside uses) or ``"decode"`` (with the decode-type
     runner's ``kind``; None means ``target_decode``, the integration API 2.0
-    contract)."""
+    contract). ``flashinfer_tactics`` (2.2): the runner's FlashInfer
+    tuned-tactics cache file, or None (see
+    :func:`graph_ops.bootstrap_flashinfer_tactics`)."""
     global _scope
     if phase == "prefill":
         if req_slots is None:
             raise ValueError("[Foundry] capture_scope('prefill') needs req_slots")
         kind = None
-        inner = _prefill_capture_scope(model, req_slots)
+        inner = _prefill_capture_scope(model, req_slots, flashinfer_tactics)
     elif phase == "decode":
         from foundry.integration.sglang.graph_ops import check_decode_kind
 
         req_slots = None
         kind = check_decode_kind(kind)
-        inner = _decode_capture_scope(model, kind)
+        inner = _decode_capture_scope(model, kind, flashinfer_tactics)
     else:
         raise ValueError(f"[Foundry] capture_scope: unknown phase {phase!r}")
     if _scope is not None:
@@ -783,13 +797,23 @@ def _patch_cuda_graph_capture() -> None:
                 f"got {self.prefill_backend_name!r}: use --cuda-graph-backend-prefill "
                 "full or disabled"
             )
-        with capture_scope("prefill", self.model_runner.model, self._capture_req_slots):
+        with capture_scope(
+            "prefill",
+            self.model_runner.model,
+            self._capture_req_slots,
+            flashinfer_tactics=flashinfer_tactics_cache(self.model_runner),
+        ):
             return orig_prefill_capture(self)
 
     @functools.wraps(orig_capture)
     def patched(self):
         reject_unsupported_decode_runner(self)
-        with capture_scope("decode", self.model_runner.model, kind=decode_runner_kind(self)):
+        with capture_scope(
+            "decode",
+            self.model_runner.model,
+            kind=decode_runner_kind(self),
+            flashinfer_tactics=flashinfer_tactics_cache(self.model_runner),
+        ):
             return orig_capture(self)
 
     @functools.wraps(orig_resolve_ends)
@@ -903,6 +927,43 @@ def _check_resolved_graph_config(server_args) -> None:
             "Foundry's resolution hooks: load plugins (sglang.srt.plugins.load_plugins) "
             "before resolving them, or pass the Foundry config at launch."
         )
+
+
+def flashinfer_tactics_cache(model_runner) -> str | None:
+    """Plugin route: the runner's FlashInfer tuned-tactics cache file, or None
+    when its kernels take no FlashInfer tactics (the value the dependency
+    route's call sites pass as ``flashinfer_tactics``). SGLang's own helper
+    when the installed sglang has it; otherwise sglang's autotune gate with
+    the pinned disable flag ignored (its MoE runner / quantization checks),
+    and its cache path."""
+    try:
+        from sglang.srt.model_executor.runner import flashinfer_autotune as fa
+    except Exception as exc:
+        logger.info("[Foundry] FlashInfer tactics: no sglang autotune module (%s)", exc)
+        return None
+    helper = getattr(fa, "flashinfer_tactics_cache_for_persistence", None)
+    if helper is not None:
+        return helper(model_runner)
+    try:
+        from sglang.srt.runtime_context import get_exec
+
+        if model_runner.device != "cuda":
+            return None
+        backend = str(get_exec().moe.moe_runner_backend)
+        quant = model_runner.model_config.quantization
+        takes_tactics = backend.startswith("flashinfer_") or quant in (
+            "modelopt",
+            "modelopt_fp8",
+            "modelopt_fp4",
+            "modelopt_mixed",
+            "mxfp8",
+        )
+        if not takes_tactics:
+            return None
+        return str(fa.flashinfer_autotune_cache_path(model_runner))
+    except Exception as exc:
+        logger.warning("[Foundry] FlashInfer tactics: cache path unavailable (%s)", exc)
+        return None
 
 
 def decode_runner_kind(runner) -> str:

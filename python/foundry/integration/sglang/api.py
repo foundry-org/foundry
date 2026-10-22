@@ -59,7 +59,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-INTEGRATION_API_VERSION = (2, 1)
+INTEGRATION_API_VERSION = (2, 2)
 MODES = ("save", "load")
 FLAG = "--cuda-graph-persistence"
 
@@ -283,7 +283,14 @@ def after_alloc_memory_pool(memory_pool_config: Any, is_draft_worker: bool) -> N
     hooks.after_alloc_memory_pool(memory_pool_config, is_draft_worker)
 
 
-def capture_scope(phase: str, *, model: Any, req_slots: int | None = None, kind: str | None = None):
+def capture_scope(
+    phase: str,
+    *,
+    model: Any,
+    req_slots: int | None = None,
+    kind: str | None = None,
+    flashinfer_tactics: str | None = None,
+):
     """Context manager around the body of ``DecodeCudaGraphRunner.capture``
     (``phase="decode"``, also reached by its subclasses: the EAGLE draft and
     draft-extend runners) or ``PrefillCudaGraphRunner.capture``
@@ -302,11 +309,18 @@ def capture_scope(phase: str, *, model: Any, req_slots: int | None = None, kind:
     ran, in the same order. SGLang's capture loop runs inside on both modes;
     the scope adds the bootstraps and the layout start (first scope), LOAD's
     preallocation and restore bookkeeping, and SAVE's manifest, fatbin pack
-    and region layout (rewritten at the end of every decode-type scope)."""
+    and region layout (rewritten at the end of every decode-type scope).
+    ``flashinfer_tactics`` (2.2): the path of the runner's FlashInfer
+    tuned-tactics cache file (SGLang's ``flashinfer_autotune_cache_path``), or
+    None when its kernels take no FlashInfer tactics. FlashInfer autotune is
+    pinned off; SAVE installs the file's tactics and archives the file, LOAD
+    installs the archived copy, so both run the same kernels without a tuning
+    pass. The file need not exist (SAVE then warns and records default
+    tactics)."""
     _require_active()
     from foundry.integration.sglang import hooks
 
-    return hooks.capture_scope(phase, model, req_slots, kind)
+    return hooks.capture_scope(phase, model, req_slots, kind, flashinfer_tactics)
 
 
 def capture_one(shape_key: Any, forward_fn, *, pool: Any, stream: Any):
