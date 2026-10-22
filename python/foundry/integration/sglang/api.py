@@ -313,10 +313,10 @@ def capture_scope(
     ``flashinfer_tactics`` (2.2): the path of the runner's FlashInfer
     tuned-tactics cache file (SGLang's ``flashinfer_autotune_cache_path``), or
     None when its kernels take no FlashInfer tactics. FlashInfer autotune is
-    pinned off; SAVE installs the file's tactics and archives the file, LOAD
-    installs the archived copy, so both run the same kernels without a tuning
-    pass. The file need not exist (SAVE then warns and records default
-    tactics)."""
+    pinned off; SAVE installs the file's tactics and keeps them in the rank's
+    ``warmup_state.json``, LOAD installs them from there, so both run the same
+    kernels without a tuning pass. The file need not exist (SAVE then warns
+    and the archive carries no tactics)."""
     _require_active()
     from foundry.integration.sglang import hooks
 
