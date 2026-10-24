@@ -2608,7 +2608,10 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
 
       CUevent event;
       if (event_id_to_event.find(event_id) == event_id_to_event.end()) {
-        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
+        // Rebuilt event nodes only order work inside the graph and nothing reads
+        // their timestamps; a timing-enabled event adds replay cost at every
+        // record/wait node.
+        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
         event_id_to_event[event_id] = event;
         graph->loaded_graph_resources_->created_events.push_back(event);
       } else {
@@ -2622,7 +2625,7 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
 
       CUevent event;
       if (event_id_to_event.find(event_id) == event_id_to_event.end()) {
-        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, CU_EVENT_DEFAULT));
+        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING));
         event_id_to_event[event_id] = event;
         graph->loaded_graph_resources_->created_events.push_back(event);
       } else {

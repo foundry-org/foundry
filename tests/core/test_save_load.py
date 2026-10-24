@@ -18,6 +18,8 @@ Workloads:
   compat       what foundry.ops takes from libtorch: Philox capture state (rand,
                dropout advance per replay), cuBLAS / cuBLASLt handle and workspace
                (preallocate_cublas_workspaces), linear with bias (cuBLASLt epilogue)
+  events       elementwise steps separated by external event record/wait pairs:
+               LOAD rebuilds the EventRecord/EventWait nodes with events of its own
 Load APIs: ``load`` (CUDAGraph.load) and ``builds`` (start_graph_builds +
 finish_graph_loads). compat also runs LOAD with FOUNDRY_MMAP_ARCHIVE=0.
 The builds path maps SAVE's layout span first (``map_saved_layout`` in
@@ -110,6 +112,34 @@ def _compat_ref(x, w1, *_):
     return [torch.relu(x @ w1) * 2.0 + 1.0, None, None, None]
 
 
+EVENT_CHAIN = 8
+_EVENTS = []  # captured record/wait nodes reference these: keep them alive
+
+
+def _events_inputs(g):
+    return (torch.full((256, 256), 1.0, device="cuda"),)
+
+
+def _events(x):
+    """Elementwise steps separated by external event record/wait pairs, so the
+    graph carries EventRecord/EventWait nodes that LOAD rebuilds with events of
+    its own."""
+    s = torch.cuda.current_stream()
+    for _ in range(EVENT_CHAIN):
+        x = x * 1.5 + 1.0
+        ev = torch.cuda.Event(external=True)
+        _EVENTS.append(ev)
+        ev.record(s)
+        s.wait_event(ev)
+    return [x]
+
+
+def _events_ref(x):
+    for _ in range(EVENT_CHAIN):
+        x = x * 1.5 + 1.0
+    return [x]
+
+
 WORKLOADS = {
     "add": Workload(("sum",), _add_inputs, _add, _add, graph_region=True, mutate=True),
     "sgemm": Workload(
@@ -138,6 +168,7 @@ WORKLOADS = {
         cublas="workspaces",
         rng=("rand", "dropout"),
     ),
+    "events": Workload(("out",), _events_inputs, _events, _events_ref),
 }
 
 
