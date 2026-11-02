@@ -11,7 +11,7 @@ steps (`apply_inkling_prefill_cuda_graph_default`, `handle_cuda_graph_config`, `
 
 | # | patched symbol | SAVE | LOAD |
 |---|---|---|---|
-| 1 | `sglang.srt.distributed.bootstrap.init_parallel_runtime` (called from `Scheduler.__init__` before any `ModelRunner`) | `set_device(gpu_id)`, then `setup_graph_extension` reserves the rank's VMM region before any process group exists | same, plus the binary restore (`load_cuda_modules_and_libraries`) and the exec-memory prewarm thread |
+| 1 | `sglang.srt.distributed.bootstrap.init_parallel_runtime` (called from `Scheduler.__init__` before any `ModelRunner`) | `set_device(gpu_id)`, then `setup_graph_extension` reserves the rank's VMM region before any process group exists | same; the binary restore (`load_cuda_modules_and_libraries`) and the exec-memory prewarm thread start later, after the pre-capture bootstraps (`runtime.restore_binaries`) |
 | 1b | `ModelRunner.init_torch_distributed` (end; target runner only) | `skip_to_scratch_boundary()`: weights start at `scratch_space_size` | same |
 | 2 | `KVCacheConfigurator._resolve_memory_pool_config` | run upstream, record the context overrides it issued (e.g. the Mamba/GDN state-pool size) | skip profiling: `gc.collect()` + `empty_cache()` (mirrors SAVE's side effects), return the saved `MemoryPoolConfig`, replay the overrides |
 | 2b | `ModelRunner.alloc_memory_pool` | write `warmup_state.json` (pool config + overrides) | pass-through with offset logging |

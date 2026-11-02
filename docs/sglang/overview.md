@@ -167,7 +167,7 @@ SAVE:
 
 LOAD:
 
-1. `setup_graph_extension(...)` restores the VMM region and replays captured fatbins into device code memory; an archive without `capture_loop_version = 2` is refused here (re-SAVE).
+1. `setup_graph_extension(...)` restores the VMM region; an archive without `capture_loop_version = 2` is refused here (re-SAVE). The captured fatbins are replayed into device code memory later, after the pre-capture bootstraps (`restore_binaries`), so the driver's VA arena grows at the same point as on SAVE.
 2. Distributed init runs as usual; the cursor advances to the same `scratch_space_size`.
 3. Model weights and KV pool re-allocate at the same deterministic offsets. `init_memory_pool` reuses the saved `MemoryPoolConfig` (and calls `torch.cuda.empty_cache()` to mirror SAVE's `_resolve_memory_pool_config` side effect).
 4. `DecodeCudaGraphRunner.capture` preallocates the deterministic range up to `final_alloc_offset`, starts all decode graph builds in one `start_graph_builds(all_paths)` call (the manifest's template/on-demand linking needs one call), then runs the same upstream capture loop as SAVE. The patched `capture_one` takes the next archived graph for each shape (`finish_one_graph_load`: its allocator events replay where SAVE captured it) instead of capturing; `forward_fn` never runs.

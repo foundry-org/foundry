@@ -28,7 +28,7 @@ nvshmem_host_path  = "…/libnvshmem_host.so"  # optional; for EP parity
 flowchart TD
     INIT["ModelRunner.__init__<br/>(upstream stashes self.dp_rank)"]
     TORCH["ModelRunner.init_torch_distributed"]
-    TORCH_PRE["setup_graph_extension<br/>(reserve VMM region, eager cuBLAS,<br/>LOAD: load cached fatbins)"]
+    TORCH_PRE["setup_graph_extension<br/>(reserve VMM region, eager cuBLAS)"]
     TORCH_ORIG["&lt;upstream init_torch_distributed&gt;<br/>NCCL warmup + comm bring-up"]
     TORCH_POST["skip_to_scratch_boundary<br/>cursor → scratch_space_size"]
     LOAD_MODEL["ModelRunner.load_model<br/>(passthrough today)"]

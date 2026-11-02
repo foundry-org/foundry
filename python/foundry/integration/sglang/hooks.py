@@ -137,12 +137,6 @@ def _before_distributed_init(server_args, device: str, gpu_id: int, ranks) -> No
     rt.log_alloc_offset("after_setup_graph_ext")
     if mode == CUDAGraphExtensionMode.LOAD:
         rt.check_capture_loop_version()
-        # Grow the driver's graph-exec memory now, on a background thread,
-        # so Phase 2's instantiates at the capture point reuse it (see
-        # graph_ops.start_exec_pool_prewarm).
-        from foundry.integration.sglang.graph_ops import start_exec_pool_prewarm
-
-        start_exec_pool_prewarm()
 
 
 def _after_runner_distributed_init() -> None:
@@ -367,6 +361,16 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
     rt.log_alloc_offset("before_expert_mappings")
     bootstrap_expert_mappings(model)
     rt.log_alloc_offset("after_expert_mappings")
+    # 3c. LOAD only: the archived binaries and the graph-exec memory prewarm,
+    #     after every bootstrap that puts library state at driver-chosen
+    #     addresses: both grow the driver's VA arena, which SAVE grows only
+    #     inside its captures (rt.restore_binaries).
+    if mode == CUDAGraphExtensionMode.LOAD:
+        from foundry.integration.sglang.graph_ops import start_exec_pool_prewarm
+
+        rt.restore_binaries()
+        start_exec_pool_prewarm()
+        rt.log_alloc_offset("after_binary_restore")
     # 4. SAVE only, every model: the two one-time runtime initializations
     #    capture rejects (inductor's lazy init, DeepGEMM's runtime init), with
     #    the allocation region suspended so their transient tensors never move
