@@ -1610,6 +1610,7 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
 
   std::unordered_map<CUevent, int> event_to_id;
   int next_event_id = 0;
+  int event_record_nodes = 0, event_wait_nodes = 0, event_nodes_without_flags = 0;
 
   for (const auto& graphNode : graph_nodes) {
     json::object node_obj;
@@ -1924,6 +1925,7 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
     } else if (std::holds_alternative<EventRecordNodeMetadata>(graphNode.metadata)) {
       const auto& metadata = std::get<EventRecordNodeMetadata>(graphNode.metadata);
       node_obj["type"] = "EventRecordNode";
+      ++event_record_nodes;
 
       if (event_to_id.find(metadata.event) == event_to_id.end()) {
         event_to_id[metadata.event] = next_event_id++;
@@ -1933,12 +1935,15 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
       params["event_id"] = event_to_id[metadata.event];
       if (metadata.has_flags) {
         params["event_flags"] = metadata.flags;
+      } else {
+        ++event_nodes_without_flags;
       }
       node_obj["params"] = params;
 
     } else if (std::holds_alternative<EventWaitNodeMetadata>(graphNode.metadata)) {
       const auto& metadata = std::get<EventWaitNodeMetadata>(graphNode.metadata);
       node_obj["type"] = "EventWaitNode";
+      ++event_wait_nodes;
 
       if (event_to_id.find(metadata.event) == event_to_id.end()) {
         event_to_id[metadata.event] = next_event_id++;
@@ -1948,6 +1953,8 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
       params["event_id"] = event_to_id[metadata.event];
       if (metadata.has_flags) {
         params["event_flags"] = metadata.flags;
+      } else {
+        ++event_nodes_without_flags;
       }
       node_obj["params"] = params;
 
@@ -1957,6 +1964,14 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
     }
 
     nodes_array.push_back(node_obj);
+  }
+
+  if (event_record_nodes + event_wait_nodes > 0) {
+    fprintf(stderr,
+            "[foundry] %s: event nodes: %d record, %d wait (%zu events), %d without recorded "
+            "flags (rebuilt as CU_EVENT_DEFAULT)\n",
+            json_path.c_str(), event_record_nodes, event_wait_nodes, event_to_id.size(),
+            event_nodes_without_flags);
   }
 
   // Compute topology key = node types + cluster dim values per kernel node.
