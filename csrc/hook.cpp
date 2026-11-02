@@ -38,6 +38,10 @@
 #include <boost/format.hpp>
 #include <boost/json.hpp>
 #include "hook.h"
+// cuda.h maps cuEventDestroy to cuEventDestroy_v2. The hook also exports the
+// legacy symbol, which binaries built for the v1 API link directly.
+#undef cuEventDestroy
+extern "C" CUresult cuEventDestroy(CUevent hEvent);
 
 namespace fs = std::filesystem;
 
@@ -97,6 +101,7 @@ enum CudaDriverAPIIndex {
   CUDA_ENTRY_cuCtxSynchronize,
   CUDA_ENTRY_cuEventCreate,
   CUDA_ENTRY_cuEventDestroy_v2,
+  CUDA_ENTRY_cuEventDestroy,
   CUDA_ENTRY_END
 };
 
@@ -147,6 +152,7 @@ static cuda_driver_entry_t cuda_driver_entry_table[] = {{nullptr, "cuModuleLoadD
                                                         {nullptr, "cuCtxSynchronize"},
                                                         {nullptr, "cuEventCreate"},
                                                         {nullptr, "cuEventDestroy_v2"},
+                                                        {nullptr, "cuEventDestroy"},
                                                         {nullptr, nullptr}};
 
 #define CUDA_DRIVER_CALL(table, idx) (table[idx].fn_ptr)
@@ -2464,7 +2470,10 @@ static void* find_symbol_by_cuda_version(const char* symbol, int cudaVersion) {
   } else if (strcmp(symbol, "cuEventCreate") == 0) {
     return (void*)cuEventCreate;
   } else if (strcmp(symbol, "cuEventDestroy") == 0) {
-    return (void*)cuEventDestroy_v2;
+    if (cudaVersion >= 4000) {
+      return (void*)cuEventDestroy_v2;
+    }
+    return (void*)cuEventDestroy;
   }
 
   return nullptr;
@@ -3070,6 +3079,15 @@ CUresult cuEventDestroy_v2(CUevent hEvent) {
   return real_func(hEvent);
 }
 
+// Legacy (pre-4.0) symbol: binaries built for the v1 API link it directly.
+CUresult cuEventDestroy(CUevent hEvent) {
+  typedef CUresult (*cuEventDestroy_t)(CUevent);
+  auto real_func =
+      (cuEventDestroy_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuEventDestroy);
+  event_creation_flags.erase(hEvent);
+  return real_func(hEvent);
+}
+
 CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
   typedef CUresult (*cuMemAddressFree_t)(CUdeviceptr, size_t);
   auto real_func =
@@ -3192,7 +3210,9 @@ void* dlsym(void* handle, const char* symbol) {
       return (void*)cuIpcCloseMemHandle;
     } else if (strcmp(symbol, "cuEventCreate") == 0) {
       return (void*)cuEventCreate;
-    } else if (strcmp(symbol, "cuEventDestroy") == 0 || strcmp(symbol, "cuEventDestroy_v2") == 0) {
+    } else if (strcmp(symbol, "cuEventDestroy") == 0) {
+      return (void*)cuEventDestroy;
+    } else if (strcmp(symbol, "cuEventDestroy_v2") == 0) {
       return (void*)cuEventDestroy_v2;
     }
   }
