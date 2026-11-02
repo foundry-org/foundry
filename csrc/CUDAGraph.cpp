@@ -1477,6 +1477,7 @@ void CUDAGraph::analyze_captured_graph() {
 
       EventRecordNodeMetadata metadata;
       metadata.event = event;
+      metadata.has_flags = query_event_flags(event, &metadata.flags);
 
       graphNode.metadata = std::move(metadata);
     } else if (nodeType == CU_GRAPH_NODE_TYPE_WAIT_EVENT) {
@@ -1485,6 +1486,7 @@ void CUDAGraph::analyze_captured_graph() {
 
       EventWaitNodeMetadata metadata;
       metadata.event = event;
+      metadata.has_flags = query_event_flags(event, &metadata.flags);
 
       graphNode.metadata = std::move(metadata);
     } else if (nodeType == CU_GRAPH_NODE_TYPE_EMPTY) {
@@ -1929,9 +1931,8 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
 
       json::object params;
       params["event_id"] = event_to_id[metadata.event];
-      unsigned int event_flags;
-      if (query_event_flags(metadata.event, &event_flags)) {
-        params["event_flags"] = event_flags;
+      if (metadata.has_flags) {
+        params["event_flags"] = metadata.flags;
       }
       node_obj["params"] = params;
 
@@ -1945,9 +1946,8 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
 
       json::object params;
       params["event_id"] = event_to_id[metadata.event];
-      unsigned int event_flags;
-      if (query_event_flags(metadata.event, &event_flags)) {
-        params["event_flags"] = event_flags;
+      if (metadata.has_flags) {
+        params["event_flags"] = metadata.flags;
       }
       node_obj["params"] = params;
 

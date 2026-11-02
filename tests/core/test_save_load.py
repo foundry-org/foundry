@@ -22,6 +22,8 @@ Workloads:
                timing and non-timing events alternating: LOAD rebuilds the
                EventRecord/EventWait nodes with events of its own, created with the
                flags SAVE recorded (test_event_flags_archived)
+  events_dropped  events, with the events destroyed after the replays and before
+               save (a graph is saved after its capture's events are gone)
 Load APIs: ``load`` (CUDAGraph.load) and ``builds`` (start_graph_builds +
 finish_graph_loads). compat also runs LOAD with FOUNDRY_MMAP_ARCHIVE=0.
 The builds path maps SAVE's layout span first (``map_saved_layout`` in
@@ -30,6 +32,7 @@ add, sgemm and hgemm_nvjet then change an input in place and replay once
 more: the graph reads its inputs, it does not bake them.
 """
 
+import gc
 import os
 import sys
 from collections.abc import Callable
@@ -65,6 +68,7 @@ class Workload:
     graph_region: bool = False
     rng: tuple = ()  # names of outputs that advance on every replay
     mutate: bool = False  # LOAD: change the first input and replay once more
+    drop_events: bool = False  # SAVE: destroy the captured events before graph.save
 
 
 def _add_inputs(g):
@@ -115,7 +119,7 @@ def _compat_ref(x, w1, *_):
 
 
 EVENT_CHAIN = 8
-_EVENTS = []  # captured record/wait nodes reference these: keep them alive
+_EVENTS = []  # captured record/wait nodes reference these: keep them alive while replaying
 
 
 def _events_inputs(g):
@@ -175,6 +179,7 @@ WORKLOADS = {
         rng=("rand", "dropout"),
     ),
     "events": Workload(("out",), _events_inputs, _events, _events_ref),
+    "events_dropped": Workload(("out",), _events_inputs, _events, _events_ref, drop_events=True),
 }
 
 
@@ -222,6 +227,11 @@ def _run_save(archive, workload):
     with fdry.graph(graph):
         outs = w.body(*inputs)
     replays = _replay_twice(graph, outs)
+    if w.drop_events:
+        # torch.cuda.Event's destructor destroys the event; the graph is not
+        # replayed after this (its record/wait nodes reference the events)
+        _EVENTS.clear()
+        gc.collect()
     graph.save(os.path.join(archive, GRAPH_JSON), output_tensors=outs if w.save_outputs else None)
 
     for name, a, b in zip(w.names, *replays):
@@ -325,12 +335,13 @@ def _cugraph_event_flags(path):
     return flags
 
 
-def test_event_flags_archived(saved):
+@pytest.mark.parametrize("workload", ["events", "events_dropped"])
+def test_event_flags_archived(saved, workload):
     """SAVE records each event's creation flags in the JSON and the .cugraph
     that LOAD rebuilds the event nodes from."""
     import json
 
-    archive = saved("events") / "archive"  # run_phase: <workdir>/archive
+    archive = saved(workload) / "archive"  # run_phase: <workdir>/archive
     want = {
         i: CU_EVENT_DEFAULT if _events_timing(i) else CU_EVENT_DISABLE_TIMING
         for i in range(EVENT_CHAIN)
