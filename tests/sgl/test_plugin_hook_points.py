@@ -42,7 +42,8 @@ _HOOK_POINTS = [
     (
         "sglang.srt.model_executor.model_runner",
         "ModelRunner.alloc_memory_pool",
-        ["self", "memory_pool_config"],
+        # draft_parallel_layout: keyword-only, upstream 2026-10 (the wrapper forwards *args/**kwargs)
+        ["self", "memory_pool_config", "draft_parallel_layout"],
     ),
     (
         "sglang.srt.mem_cache.kv_cache_configurator",
