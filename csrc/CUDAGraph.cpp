@@ -1388,22 +1388,9 @@ void CUDAGraph::analyze_captured_graph() {
             note_attr_failure(CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE, res);
           }
 
-          // Programmatic dependent launch: kernels captured from PDL launches
-          // (cudaLaunchKernelExC with PROGRAMMATIC_STREAM_SERIALIZATION, e.g.
-          // FA3 fwd/combine on sm90) carry this node attribute; a rebuilt
-          // node without it loses the launch overlap the attribute permits.
-          res = cuGraphKernelNodeGetAttribute(
-              nodes[i],
-              static_cast<CUkernelNodeAttrID>(
-                  CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION),
-              &attr_val);
-          if (res == CUDA_SUCCESS) {
-            metadata.node_attrs.has_programmatic_stream_serialization = true;
-            metadata.node_attrs.programmaticStreamSerializationAllowed =
-                attr_val.programmaticStreamSerializationAllowed;
-          } else {
-            note_attr_failure(CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION, res);
-          }
+          // PROGRAMMATIC_STREAM_SERIALIZATION is a launch-only attribute (CUlaunchAttributeID:
+          // "Valid for launches"); a graph node never reports it. Programmatic dependent
+          // launch is carried by the edge data (ports) below instead.
         }
       }
 
@@ -1750,11 +1737,6 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
           kernel_node_attrs["deviceUpdatable"] = metadata.node_attrs.deviceUpdatable;
           kernel_node_attrs["deviceUpdatableNode"] = static_cast<uint64_t>(
               reinterpret_cast<uintptr_t>(metadata.node_attrs.deviceUpdatableNode));
-        }
-        if (metadata.node_attrs.has_programmatic_stream_serialization &&
-            metadata.node_attrs.programmaticStreamSerializationAllowed != 0) {
-          kernel_node_attrs["programmaticStreamSerialization"] =
-              metadata.node_attrs.programmaticStreamSerializationAllowed;
         }
         params["kernel_node_attrs"] = kernel_node_attrs;
       }

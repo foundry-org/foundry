@@ -15,8 +15,7 @@ launch without cluster attribute and one with clusterDim 2x1x1.
 * attr 4 (CLUSTER_DIMENSION): SAVE raises. With FOUNDRY_ALLOW_ATTR_QUERY_FAILURE=1 it
   writes the nodes with attrQueryAvailable=false, LOAD warns, and the 2x1x1 launch is
   restored without a cluster (what the warning means).
-* control (no failing ids): no summary line beyond attributes the driver itself rejects,
-  no LOAD warning, everything restored.
+* control (no failing ids): no summary line, no LOAD warning, everything restored.
 
     pytest tests/core/test_attr_query.py -q -s
 """
@@ -45,7 +44,6 @@ ORDER = [0, 1, 0, 1]  # LOAD replay order
 ATTR_CLUSTER_DIM = 4
 ATTR_PREFERRED_CLUSTER_DIM = 11
 # 580.126.20 rejects the PROGRAMMATIC_STREAM_SERIALIZATION (6) query on every kernel node.
-DRIVER_REJECTED = {6}
 
 SUMMARY = re.compile(
     r"\[foundry\] (\S+): attribute queries on (\d+) kernel node\(s\): (\d+) saved without "
@@ -217,10 +215,7 @@ def _load(tmp_path, libs, load_api, expect, fail="", share=False):
 
 def test_control(tmp_path, libs):
     log = _save(tmp_path, libs)
-    for name, m in _summaries(log).items():
-        # Only attributes the driver itself rejects may show up; none drops a node's data.
-        assert m.group(3) == "0", m.group(0)
-        assert set(_failures(m)) <= DRIVER_REJECTED, m.group(0)
+    assert not _summaries(log), [m.group(0) for m in _summaries(log).values()]
     for path in _paths(tmp_path / "archive"):
         attrs = _kernel_attrs(path)
         assert [a.get("clusterDimX") for a in attrs] == [None, 2], attrs

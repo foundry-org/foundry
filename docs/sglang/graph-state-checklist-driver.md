@@ -83,7 +83,7 @@ The SAVE query is in `analyze_captured_graph` (CUDAGraph.cpp:960-1063). If the f
 | `PREFERRED_SHARED_MEMORY_CARVEOUT` (node) | yes (:1381) | yes | yes / yes / yes / yes | |
 | `ACCESS_POLICY_WINDOW` | yes, per node, with the raw `base_ptr` (:1387) | **no** (clears `FLAG_COMPLETE_KERNEL_ATTRS`, BinaryGraphIO.cpp:110) | yes (:2229) / per node yes (:688), **common no** / n/a (falls back to JT) / **no** | No effect without an L2 persisting set-aside, which is not recorded (section 5). The pointer is in the VMM region if the window was |
 | `DEVICE_UPDATABLE_KERNEL_NODE` | flag yes. `devNode` handle recorded in memory only, not written | `KNX_DEVICE_UPDATABLE` (ext) | yes / per node yes, **common no** / yes / **no** | The `CUgraphDeviceNode` handle the app keeps for device-side updates changes at LOAD. Not handled. Not detected |
-| `PROGRAMMATIC_STREAM_SERIALIZATION` (PDL) | yes (:1052-1062, :1405) | `KNX_PROGRAMMATIC_STREAM_SERIALIZATION` (ext) | **SER: no** (never read) / yes, per node and common (:891) / yes, per node / **no** (member inherits the template's) | The topology key does not contain it |
+| `PROGRAMMATIC_STREAM_SERIALIZATION` (PDL) | **not queried**: a launch-only attribute (`CUlaunchAttributeID`: "Valid for launches"), a graph node never reports it; PDL is captured as edge data (next row) | `KNX_PROGRAMMATIC_STREAM_SERIALIZATION` (ext, never written) | the readers (JT per node and common :891, BT per node) stay for the key but no archive carries it | The topology key does not contain it |
 | `PROGRAMMATIC_EVENT`, `LAUNCH_COMPLETION_EVENT` | captured as edge data (programmatic / launch-order ports) **[doc]** | `BinDependency` v2 ports and type | yes on SER, JT and BT (`add_graph_dependencies`). MEM: deps are **stripped** from member files (graph.py:237-249), so the template's edges are used | `core/test_graph_dependencies.py` |
 | `IGNORE`-style / newer attributes (`NVLINK_UTIL_CENTRIC_SCHEDULING`, portable-cluster-size mode) **[unverified names/versions]** | no | no | no | Not queried at SAVE: a node carrying one would be rebuilt without it, silently |
 | Node params: grid, block, `sharedMemBytes`, `kernelParams` bytes, `extra` arg buffer | yes (:1331-1490) | yes | yes on all paths | `kernelParams` sizes come from `cuFuncGetParamInfo(params.func, …)` (:1068). **[unverified]** If a node reports only `kern` (func NULL), this returns no params and the node is saved with none. `cuKernelGetParamInfo` would be the kern-side call |
@@ -181,9 +181,8 @@ The SAVE query is in `analyze_captured_graph` (CUDAGraph.cpp:960-1063). If the f
    and a wait becomes a no-op race. Event flags are lost too. How to detect at SAVE: fail, or at least warn, on any
    event node whose partner is not in the same graph. Better, record the event's creator or site.
 7. **Path divergence.**
-   - SER (`CUDAGraph.load`, graph.py:65) ignores PSS completely. A graph whose kernels are all PDL loses it.
    - JT drops *common* APW and deviceUpdatable.
-   - MEM never applies PSS, APW or deviceUpdatable.
+   - MEM never applies APW or deviceUpdatable.
    - Non-portable common cluster dims get no opt-in.
 
    Fix: route all paths through one attribute-apply helper, and give it one unit test that runs the JSON builder
