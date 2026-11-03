@@ -22,6 +22,11 @@ capture scope), never a runner or backend object. 2.1 adds the ``kind`` of a
 decode-type capture scope (:func:`capture_scope`), so that the speculative
 decoding runners (EAGLE target verify, draft decode, draft extend) are told
 apart; a 2.0 caller passes none, which means the plain target decode runner.
+2.2 adds ``flashinfer_tactics`` to :func:`capture_scope`. 2.3 adds
+:func:`record_memory_pool_config`, one call at the end of
+``_resolve_memory_pool_config`` that replaces :func:`record_memory_pool_overrides`
+plus the two ``alloc_memory_pool`` calls (:func:`before_alloc_memory_pool`,
+:func:`after_alloc_memory_pool`); those three stay for 2.2 callers.
 
 Call sites (SGLang side, in process order):
 
@@ -37,9 +42,7 @@ scheduler / DP-controller spawn             :func:`configure_subprocess`
                                             :func:`after_parallel_init`
 ``ModelRunner.init_torch_distributed``      :func:`after_runner_distributed_init`
 ``_resolve_memory_pool_config``             :func:`replay_saved_memory_pool_config`,
-                                            :func:`record_memory_pool_overrides`
-``ModelRunner.alloc_memory_pool``           :func:`before_alloc_memory_pool`,
-                                            :func:`after_alloc_memory_pool`
+                                            :func:`record_memory_pool_config` (2.3)
 decode / prefill runner ``capture``         :func:`capture_scope`
 ``FullCudaGraphBackend.capture_one``        :func:`capture_one`
 ==========================================  ===================================
@@ -59,7 +62,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-INTEGRATION_API_VERSION = (2, 2)
+INTEGRATION_API_VERSION = (2, 3)
 MODES = ("save", "load")
 FLAG = "--cuda-graph-persistence"
 
@@ -257,9 +260,25 @@ def replay_saved_memory_pool_config():
     return hooks.replay_saved_memory_pool_config()
 
 
+def record_memory_pool_config(memory_pool_config: Any) -> None:
+    """End of ``KVCacheConfigurator._resolve_memory_pool_config`` (2.3), with
+    the ``MemoryPoolConfig`` it returns: SAVE keeps the context overrides the
+    resolver issued and writes both into the rank's ``warmup_state.json`` for
+    LOAD (whose resolver returns early through
+    :func:`replay_saved_memory_pool_config`). The resolver runs for the target
+    runner only (draft workers reuse its config), so no draft flag is needed.
+    Replaces :func:`record_memory_pool_overrides` + :func:`before_alloc_memory_pool`
+    + :func:`after_alloc_memory_pool`, which remain for 2.2 callers."""
+    _require_active()
+    from foundry.integration.sglang import hooks
+
+    hooks.record_memory_pool_config(memory_pool_config)
+
+
 def record_memory_pool_overrides() -> None:
-    """End of ``_resolve_memory_pool_config`` (SAVE keeps the overrides the
-    resolver issued)."""
+    """2.2 (superseded by :func:`record_memory_pool_config`): end of
+    ``_resolve_memory_pool_config`` (SAVE keeps the overrides the resolver
+    issued)."""
     _require_active()
     from foundry.integration.sglang import hooks
 
@@ -267,7 +286,8 @@ def record_memory_pool_overrides() -> None:
 
 
 def before_alloc_memory_pool(is_draft_worker: bool) -> None:
-    """Head of ``ModelRunner.alloc_memory_pool`` (draft workers skipped)."""
+    """2.2 (not called by a 2.3 caller): head of ``ModelRunner.alloc_memory_pool``
+    (allocation-offset log; draft workers skipped)."""
     _require_active()
     from foundry.integration.sglang import hooks
 
@@ -275,7 +295,8 @@ def before_alloc_memory_pool(is_draft_worker: bool) -> None:
 
 
 def after_alloc_memory_pool(memory_pool_config: Any, is_draft_worker: bool) -> None:
-    """End of ``ModelRunner.alloc_memory_pool``: SAVE records the resolved
+    """2.2 (superseded by :func:`record_memory_pool_config`): end of
+    ``ModelRunner.alloc_memory_pool``: SAVE records the resolved
     ``MemoryPoolConfig`` (a dataclass) for LOAD; draft workers skipped."""
     _require_active()
     from foundry.integration.sglang import hooks

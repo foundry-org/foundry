@@ -238,6 +238,8 @@ def replay_saved_memory_pool_config():
     cannot reproduce (rejected at resolution)."""
     global _resolve_log_start
     mode = get_graph_extension_mode()
+    if mode != CUDAGraphExtensionMode.NONE:
+        rt.log_alloc_offset("before_memory_pool_config")
     if mode == CUDAGraphExtensionMode.SAVE:
         from sglang.srt.runtime_context import get_context
 
@@ -287,6 +289,24 @@ def record_memory_pool_overrides() -> None:
     _resolve_log_start = None
 
 
+def _save_memory_pool_state(memory_pool_config) -> None:
+    state = rt.create_warmup_state(asdict(memory_pool_config), context_overrides=_resolve_overrides)
+    rt.save_warmup_state(state)
+
+
+def record_memory_pool_config(memory_pool_config) -> None:
+    """End of ``_resolve_memory_pool_config`` (API 2.3), SAVE: keep the
+    resolver's context overrides and write them with the resolved
+    MemoryPoolConfig into ``warmup_state.json``. Same content as the 2.2 pair
+    record_memory_pool_overrides + after_alloc_memory_pool: the configurator
+    hands this config object unchanged to the pools and back to
+    ``ModelRunner.memory_pool_config``."""
+    if get_graph_extension_mode() != CUDAGraphExtensionMode.SAVE:
+        return
+    record_memory_pool_overrides()
+    _save_memory_pool_state(memory_pool_config)
+
+
 def before_alloc_memory_pool(is_draft_worker: bool) -> None:
     """Head of ``ModelRunner.alloc_memory_pool``. Draft-worker pools reuse the
     target's resolved config upstream and are left alone."""
@@ -303,10 +323,7 @@ def after_alloc_memory_pool(memory_pool_config, is_draft_worker: bool) -> None:
         return
     rt.log_alloc_offset("after_init_memory_pool")
     if mode == CUDAGraphExtensionMode.SAVE:
-        state = rt.create_warmup_state(
-            asdict(memory_pool_config), context_overrides=_resolve_overrides
-        )
-        rt.save_warmup_state(state)
+        _save_memory_pool_state(memory_pool_config)
 
 
 def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> None:

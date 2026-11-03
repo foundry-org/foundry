@@ -52,7 +52,8 @@ before the weight load) and refuses an archive without it or with another value;
 must be re-saved.
 
 The alloc-offset log lines (`[Foundry] SGLang alloc_offset[<point>]=...`) mark each step: `after_setup_graph_ext`,
-`after_init_parallel_runtime`, `after_init_torch_dist`, `after_scratch_skip`, `before/after_init_memory_pool`, the
+`after_init_parallel_runtime`, `after_init_torch_dist`, `after_scratch_skip`, `before_memory_pool_config`,
+`before/after_init_memory_pool` (plugin route and 2.2 callers), the
 bootstrap points below, `before/after_preallocate`, `before/after_prefill_restore` (prefill graphs on),
 `before_decode_restore`, `after_load_all_graphs` (must equal SAVE's `final_alloc_offset`),
 `after_post_load_empty_cache`.
