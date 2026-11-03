@@ -27,6 +27,12 @@ apart; a 2.0 caller passes none, which means the plain target decode runner.
 ``_resolve_memory_pool_config`` that replaces :func:`record_memory_pool_overrides`
 plus the two ``alloc_memory_pool`` calls (:func:`before_alloc_memory_pool`,
 :func:`after_alloc_memory_pool`); those three stay for 2.2 callers.
+SGLang's 2.3 call sites also no longer call :func:`validate_graph_config`
+(:func:`validate_resolved_server_args` checks the same), :func:`apply_env_pins`
+(resolution and every :func:`configure_subprocess` apply the pins),
+:func:`after_parallel_init` (an offset log) or
+:func:`after_runner_distributed_init` (the scratch skip, a no-op once the
+cursor is past ``scratch_space_size``); they stay for 2.2 callers.
 
 Call sites (SGLang side, in process order):
 
