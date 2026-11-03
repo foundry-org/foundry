@@ -36,22 +36,26 @@ cursor is past ``scratch_space_size``); they stay for 2.2 callers.
 
 Call sites (SGLang side, in process order):
 
-==========================================  ===================================
-SGLang site                                 function
-==========================================  ===================================
-resolution, before the prefill default      :func:`pin_server_args`
-resolution, after ``handle_cuda_graph_config``  :func:`validate_graph_config`
-resolution, after ``handle_other_validations``  :func:`validate_resolved_server_args`
-``_set_envs_and_config`` (launcher)         :func:`apply_env_pins`
-scheduler / DP-controller spawn             :func:`configure_subprocess`
-``bootstrap.init_parallel_runtime``         :func:`before_parallel_init`,
-                                            :func:`after_parallel_init`
-``ModelRunner.init_torch_distributed``      :func:`after_runner_distributed_init`
-``_resolve_memory_pool_config``             :func:`replay_saved_memory_pool_config`,
-                                            :func:`record_memory_pool_config` (2.3)
-decode / prefill runner ``capture``         :func:`capture_scope`
-``FullCudaGraphBackend.capture_one``        :func:`capture_one`
-==========================================  ===================================
+===============================================  =========================================
+SGLang site                                      function
+===============================================  =========================================
+resolution: ``handle_cuda_graph_persistence``    :func:`activate`, :func:`pin_server_args`
+resolution: ``validate_cuda_graph_persistence``  :func:`validate_resolved_server_args`
+``Engine`` launch, before the spawns             :func:`activate`
+scheduler spawn                                  :func:`configure_subprocess`
+DP-controller spawn                              :func:`configure_subprocess`
+``run_scheduler_process``                        :func:`activate`
+``bootstrap.init_parallel_runtime``              :func:`before_parallel_init`
+``_resolve_memory_pool_config``                  :func:`replay_saved_memory_pool_config`
+                                                 :func:`record_memory_pool_config` (2.3)
+``BaseRunner._prepare_capture_state``            none (SGLang-owned prebuild of the
+                                                 dispatchers and logits gatherers;
+                                                 the first :func:`capture_scope`
+                                                 checks them)
+decode runner ``capture``                        :func:`capture_scope`
+prefill runner ``capture``                       :func:`capture_scope`
+``FullCudaGraphBackend.capture_one``             :func:`capture_one` (replaces the body)
+===============================================  =========================================
 
 Every function except :func:`activate` and :func:`is_active` requires an
 active process (:func:`activate` ran in it).
