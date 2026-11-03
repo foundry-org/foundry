@@ -7,6 +7,11 @@ tests/core/csrc/cluster_probe.cu is built into a shared library. Its kernel writ
 with clusterDim (n,1,1), or without the attribute for n = 0. SAVE captures one graph per
 workload (WORKLOADS: the n of each launch, in order). When every kernel node has the
 same attrs, save() stores them once at the graph level (common_kernel_node_attrs).
+
+The driver reports clusterDim 0x0x0 for a launch without the attribute and 1x1x1 for
+an explicit one-block cluster. The two differ on the device (%is_explicit_cluster), and
+kernels that use cluster-scoped instructions can trap when rebuilt without the cluster,
+so an explicit 1x1x1 must be archived and restored like any other cluster.
 The archive must record each node's cluster dims, and LOAD (``load`` and ``builds``
 APIs, fresh process) must replay the same values.
 
@@ -30,14 +35,21 @@ BASE_ADDR = 0x3F0000000000
 GRAPH_JSON = "graph.json"
 BLOCKS = 4
 # clusterDim.x passed to launch_cluster -> (is_explicit_cluster, cluster_nctarank) per block
-SEEN = {0: (0, 1), 2: (1, 2)}
+SEEN = {0: (0, 1), 1: (1, 1), 2: (1, 2)}
 WORKLOADS = {
     "mixed": [0, 2],
     "uniform": [2, 2],  # one attr set for every node: common_kernel_node_attrs
+    "explicit_1x1x1": [1, 0, 2],
+    "uniform_1x1x1": [1, 1],
 }
 # Archived clusterDimX per kernel node (None: no cluster attr recorded)
-ARCHIVED = {"mixed": [None, 2], "uniform": [2, 2]}
-COMMON = {"uniform"}
+ARCHIVED = {
+    "mixed": [None, 2],
+    "uniform": [2, 2],
+    "explicit_1x1x1": [1, None, 2],
+    "uniform_1x1x1": [1, 1],
+}
+COMMON = {"uniform", "uniform_1x1x1"}
 
 
 def _expected(workload):

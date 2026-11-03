@@ -72,7 +72,7 @@ The SAVE query is in `analyze_captured_graph` (CUDAGraph.cpp:960-1063). If the f
 
 | Attribute | Rec (JSON) | Binary node table | Applied: SER / JT / BT / MEM | Notes |
 |---|---|---|---|---|
-| `CLUSTER_DIMENSION` | yes when >1 (:1344) | `KNA_CLUSTER_DIM` | yes / yes / yes / yes (MEM first resets to 1x1x1, :531-543) | In the topology key (:1664) unless `FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0` |
+| `CLUSTER_DIMENSION` | yes when any dim > 0, an explicit 1x1x1 included (:1344) | `KNA_CLUSTER_DIM` | yes / yes / yes / yes (MEM first resets to 1x1x1, :531-543) | In the topology key (:1664) unless `FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0` |
 | `PREFERRED_CLUSTER_DIMENSION` | yes (:1351) | `KNA_PREFERRED_CLUSTER_DIM` | yes / yes / yes / yes | |
 | `CLUSTER_SCHEDULING_POLICY_PREFERENCE` | yes (:1360) | yes | yes / yes / yes / yes | |
 | `COOPERATIVE` | yes (:1365) | yes | yes / yes / yes / yes (only when the member has a value; sentinel -1 keeps the template's) | |

@@ -138,7 +138,10 @@ A kernel node's cluster comes from the function's compiled `__cluster_dims__`
 (SAVE records it as `func_attrs.required_cluster_*`) or from a
 cluster-dimension launch attribute (`kernel_node_attrs.clusterDim*`); every
 builder (JSON, binary template, member update, exec-pool prewarm) merges the
-two the same way. A cluster wider than 8 blocks is non-portable: the driver
+two the same way. The driver reports 0x0x0 for a launch without the attribute,
+so SAVE records any non-zero value: an explicit 1x1x1 is a cluster launch on
+the device (`%is_explicit_cluster`), and kernels using cluster-scoped
+instructions can trap without it (`tests/core/test_cluster_restore.py`). A cluster wider than 8 blocks is non-portable: the driver
 rejects the node (`cuGraphAddKernelNode`, member `SetParams`, or the cluster
 attribute) with `CUDA_ERROR_INVALID_CLUSTER_SIZE` (912) unless the function
 has `CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED=1`. The capturing

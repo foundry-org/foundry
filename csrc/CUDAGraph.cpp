@@ -1632,10 +1632,12 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
       {
         json::object kernel_node_attrs;
         kernel_node_attrs["attrQueryAvailable"] = metadata.node_attrs.attr_query_available;
-        // cluster_dim: default is 1x1x1, only save if any dimension > 1
+        // cluster_dim: the driver reports 0x0x0 for a launch without clusters. Save any
+        // non-zero value, 1x1x1 included: that is an explicit cluster launch, and kernels
+        // that use cluster-scoped instructions can trap when rebuilt without it.
         if (metadata.node_attrs.has_cluster_dim &&
-            (metadata.node_attrs.clusterDimX > 1 || metadata.node_attrs.clusterDimY > 1 ||
-             metadata.node_attrs.clusterDimZ > 1)) {
+            (metadata.node_attrs.clusterDimX > 0 || metadata.node_attrs.clusterDimY > 0 ||
+             metadata.node_attrs.clusterDimZ > 0)) {
           kernel_node_attrs["clusterDimX"] = metadata.node_attrs.clusterDimX;
           kernel_node_attrs["clusterDimY"] = metadata.node_attrs.clusterDimY;
           kernel_node_attrs["clusterDimZ"] = metadata.node_attrs.clusterDimZ;
