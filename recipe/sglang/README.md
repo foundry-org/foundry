@@ -542,7 +542,7 @@ Any later `pip install -e` of foundry re-resolves torch's NCCL pin; use
 `--no-deps` or re-pin 2.30.7 afterwards.
 
 What foundry does for v2 (all automatic): creates the `ElasticBuffer` at the
-same pre-capture point on SAVE and LOAD (`_bootstrap_deepep_v2_buffer`),
+same pre-capture point on SAVE and LOAD (sglang's warmup prebuild),
 reports success for `cuPointerSetAttribute(SYNC_MEMOPS)` on region memory
 (DOCA requires it), and pins `NCCL_GRAPH_REGISTER=0`/`NCCL_LOCAL_REGISTER=0`
 so no collective in a captured graph depends on registration state that a

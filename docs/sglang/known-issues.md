@@ -129,8 +129,8 @@ forward must be created at the same sequence point on SAVE and LOAD: (1) SAVE no
 eager warmup pass; the only pre-capture work is the two one-time initializations that stream
 capture rejects (inductor's lazy init, DeepGEMM's runtime init), run with the allocation region
 suspended, so the model's compiles and JIT loads happen inside the captured forward and are
-recorded; (2) `bootstrap_logits_gatherer` builds the gatherer's state before capture on both
-modes, so the graphs capture the multicast gather exactly as native sglang does and it lands at
+recorded; (2) the gatherer's state is built before capture on both modes (now by sglang's
+warmup, `LogitsProcessor.prebuild_logits_gatherer`), so the graphs capture the multicast gather exactly as native sglang does and it lands at
 the same addresses on LOAD. Validated: identical output, TPOT within 1.3% of native capture.
 `FOUNDRY_SGLANG_CHECK_ARCHIVE=1` (or `python -m foundry.integration.sglang.archive_check`)
 reports any graph pointer into the region that no recorded range covers, which names the next
@@ -247,8 +247,8 @@ NVSHMEM traffic and graph-referenced addresses used the SAVE-time address
 while the runtime used the LOAD-time one; whichever eager tensor later
 reused the stale VA got corrupted (logits-path tensors by default).
 
-**Fix** (hooks.py, no dummy forwards): run `bootstrap_deepep_buffer` BEFORE
-the SAVE-side warmup pass, so the buffer is created at the same
+**Fix** (hooks.py, no dummy forwards): create the buffer (now sglang's warmup
+prebuild, `DeepEPDispatcher.prebuild`) BEFORE the SAVE-side warmup pass, so the buffer is created at the same
 allocation-sequence point in both modes and its address matches by
 construction. Archives must be RE-SAVED (baked addresses change).
 `torch.cuda.empty_cache()` after graph load was also added as allocator
@@ -276,7 +276,7 @@ capture: the tensor was allocated in the graph pool and its `full`/`arange` fill
 executed. Every later eager forward (and every graph) routed through the uninitialized mapping, and LOAD's graphs
 referenced its capture-time address.
 
-**Fix.** `bootstrap_expert_mappings` (graph_ops.py), a pre-capture bootstrap like the DeepEP buffer's: at the first
-capture scope, both modes, it builds the mapping of every standard dispatcher with EP > 1 exactly as sglang's lazy
-path does, so the table exists before any capture at the same sequence point on SAVE and LOAD (sglang unchanged).
+**Fix.** sglang's `StandardDispatcher.prebuild()` builds the mapping with the same builder as its lazy path, in
+the EagerRunner warmup (`BaseRunner._prepare_capture_state`) before any capture, at the same sequence point on SAVE
+and LOAD; Foundry's first capture scope checks it exists (`check_capture_state_prebuilt`).
 The rule stands: state sglang creates lazily on the first forward must exist before the first capture.

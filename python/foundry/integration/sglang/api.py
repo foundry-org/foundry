@@ -323,11 +323,11 @@ def capture_scope(
     draft-extend runners) or ``PrefillCudaGraphRunner.capture``
     (``phase="prefill"``, with the runner's fixed request-slot count
     ``req_slots``, recorded with every prefill graph captured or restored in
-    the scope). ``model`` is the runner's loaded model: the pre-capture
-    bootstraps of the first scope walk its modules (logits gatherer, DeepEP
-    buffer, NVSHMEM). ``kind`` (2.1, decode only) names the decode-type graph
-    set, a lowercase identifier derived from values: ``<role>_<mode>`` with
-    role ``target`` / ``draft`` (the runner's draft-worker flag) and mode
+    the scope). ``model`` is the runner's loaded model: the first scope checks
+    that sglang's warmup prebuilt its dispatchers and logits gatherer.
+    ``kind`` (2.1, decode only) names the decode-type graph set, a lowercase
+    identifier derived from values: ``<role>_<mode>`` with role ``target`` /
+    ``draft`` (the runner's draft-worker flag) and mode
     ``decode``, ``verify`` (TARGET_VERIFY), ``extend`` (DRAFT_EXTEND_V2) or
     the forward mode's name; None means ``target_decode``. A process runs at
     most one decode-type scope per kind (EAGLE: ``target_verify``,

@@ -341,14 +341,15 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
     # Pre-capture bootstraps. Everything sglang initializes lazily on the
     # first eager forward that a capturing stream rejects, or that must exist
     # at the same addresses on both modes, is done here, at the same sequence
-    # point on SAVE and LOAD; no model forward runs.
+    # point on SAVE and LOAD; no model forward runs. The MoE dispatcher buffers
+    # / expert mappings and the logits all-gather state are sglang's own: its
+    # EagerRunner warmup (BaseRunner._prepare_capture_state) builds them before
+    # this first scope, on both modes.
     from foundry.integration.sglang.graph_ops import (
         bootstrap_collective_connections,
-        bootstrap_deepep_buffer,
-        bootstrap_expert_mappings,
         bootstrap_flashinfer_tactics,
         bootstrap_lazy_runtimes,
-        bootstrap_logits_gatherer,
+        check_capture_state_prebuilt,
     )
 
     # 0. FlashInfer's tuned tactics (both modes, host-only): installed from
@@ -360,28 +361,13 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
     rt.log_alloc_offset("before_collective_bootstrap")
     bootstrap_collective_connections()
     rt.log_alloc_offset("after_collective_bootstrap")
-    # 2. The logits all-gather's symmetric-memory state (both modes): built
-    #    on a host with multicast by any eager forward before capture, and
-    #    invisible to the hook (torch symmetric memory is not cudaMalloc).
-    rt.log_alloc_offset("before_logits_gatherer")
-    bootstrap_logits_gatherer(model)
-    rt.log_alloc_offset("after_logits_gatherer")
-    # 3. The DeepEP-family buffer (both modes; a no-op for other all-to-all
-    #    backends): NVSHMEM runtime + symmetric heap, otherwise created inside
-    #    the first captured forward, where deep_ep_cpp.Buffer(...) aborts.
-    rt.log_alloc_offset("before_deepep_bootstrap")
-    bootstrap_deepep_buffer(model)
-    rt.log_alloc_offset("after_deepep_bootstrap")
-    # 3b. The standard dispatcher's expert-id mapping (both modes; the plain
-    #     EP all-to-all only): built lazily on the first dispatch, which a
-    #     capture would only record (bootstrap_expert_mappings).
-    rt.log_alloc_offset("before_expert_mappings")
-    bootstrap_expert_mappings(model)
-    rt.log_alloc_offset("after_expert_mappings")
-    # 3c. LOAD only: the archived binaries and the graph-exec memory prewarm,
-    #     after every bootstrap that puts library state at driver-chosen
-    #     addresses: both grow the driver's VA arena, which SAVE grows only
-    #     inside its captures (rt.restore_binaries).
+    # 2. sglang's prebuilt state (both modes) must exist before step 3: DeepEP /
+    #    Mooncake / symmetric-memory state sits at driver-chosen addresses.
+    check_capture_state_prebuilt(model)
+    # 3. LOAD only: the archived binaries and the graph-exec memory prewarm,
+    #    after all library state at driver-chosen addresses exists (sglang's
+    #    prebuilt state, step 2): both grow the driver's VA arena, which SAVE
+    #    grows only inside its captures (rt.restore_binaries).
     if mode == CUDAGraphExtensionMode.LOAD:
         from foundry.integration.sglang.graph_ops import start_exec_pool_prewarm
 
@@ -500,7 +486,7 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
 def _prefill_capture_scope(model, req_slots: int, flashinfer_tactics: str | None = None):
     """Around ``PrefillCudaGraphRunner.capture`` (its body, SGLang's capture
     loop, runs inside on both modes). ``model``: the loaded model (the
-    bootstraps walk its modules); ``req_slots``: the runner's fixed request-
+    first scope checks its prebuilt state); ``req_slots``: the runner's fixed request-
     slot count, recorded with the prefill graphs. The prefill backend is
     full: the resolution step validated it (full or disabled)."""
     mode = get_graph_extension_mode()
@@ -551,8 +537,8 @@ def _prefill_capture_scope(model, req_slots: int, flashinfer_tactics: str | None
 def _decode_capture_scope(model, kind: str, flashinfer_tactics: str | None = None):
     """Around ``DecodeCudaGraphRunner.capture`` and its subclasses' (its body,
     SGLang's capture loop, runs inside on both modes). ``model``: the
-    runner's loaded model (the bootstraps of the first scope walk its
-    modules); ``kind``: which decode-type graph set the runner captures
+    runner's loaded model (the first scope checks its prebuilt
+    state); ``kind``: which decode-type graph set the runner captures
     (``target_decode``; with speculative decoding ``target_verify``,
     ``draft_decode``, ``draft_extend``). A process runs one scope per kind,
     in a fixed order (EAGLE: target_verify, draft_decode, draft_extend); each

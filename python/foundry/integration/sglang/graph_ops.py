@@ -465,7 +465,7 @@ def start_prefill_graph_restore() -> dict[str, Any]:
     with open(record_path) as f:
         record = json.load(f)
 
-    # Graphs may reference NVSHMEM symbols; the DeepEP bootstrap ran before.
+    # Graphs may reference NVSHMEM symbols; sglang's warmup built the DeepEP buffer before.
     cge.init_nvshmem_for_loaded_modules()
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
     t0 = time.perf_counter()
@@ -639,73 +639,6 @@ def bootstrap_collective_connections() -> None:
     )
 
 
-def bootstrap_logits_gatherer(model) -> bool:
-    """Create the logits all-gather's symmetric-memory state BEFORE capture, on
-    SAVE and LOAD alike.
-
-    sglang's ``LogitsProcessor`` gathers the TP-sharded logits through
-    ``MultimemAllGatherer``: a torch symmetric-memory buffer plus a multicast
-    mapping and signal pads, built lazily on the first *eager* call
-    (``create_state``, a collective) and skipped under capture, where the
-    gatherer falls back to an NCCL all-gather. Whether the multicast path is
-    available is a host property (IMEX / fabric), so on a host with multicast
-    any eager forward before capture activates the gatherer and every graph
-    then bakes in its pointers; those allocations bypass cudaMalloc, so the
-    hook never records them and LOAD cannot recreate them (illegal address at
-    the first decode). Creating the state here, at the same sequence point in
-    both modes, gives it the same addresses on both sides (its VA reservations
-    are carved from the region) and lets the graphs capture the multicast
-    gather exactly as native sglang does.
-
-    Returns True when a state was (or already is) built, False when the
-    gatherer is disabled, absent, or multicast is unavailable (NCCL fallback,
-    identical on both modes).
-    """
-    import torch
-
-    try:
-        from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
-            MultimemAllGatherer,
-        )
-    except Exception:
-        return False
-    built = False
-    for module in model.modules():
-        gatherer = getattr(module, "_logits_gatherer", None)
-        if not isinstance(gatherer, MultimemAllGatherer):
-            continue
-        if gatherer._state is None:
-            continue  # disabled by configuration
-        if gatherer._state is not MultimemAllGatherer._UNINIT:
-            # Built before this point by an eager forward: its addresses depend
-            # on that forward's allocations, which LOAD does not repeat.
-            logger.warning(
-                "[Foundry] logits all-gather state was already built before the bootstrap; "
-                "SAVE and LOAD may place it differently"
-            )
-            built = True
-            continue
-        lm_head = getattr(model, "lm_head", None)
-        weight = getattr(lm_head, "weight", None)
-        if weight is None or weight.dim() != 2:
-            logger.warning("[Foundry] logits gatherer found but no lm_head weight; leaving it lazy")
-            return False
-        # The gather input is the per-rank logits shard: (tokens, vocab / tp).
-        probe = torch.empty((1, weight.shape[0]), dtype=torch.bfloat16, device=weight.device)
-        t0 = time.perf_counter()
-        state = gatherer._build(probe)
-        if state is not MultimemAllGatherer._UNINIT:
-            gatherer._state = state
-        built = state is not None and state is not MultimemAllGatherer._UNINIT
-        logger.info(
-            "[Foundry] logits all-gather state %s pre-capture in %.3fs (shard width %d)",
-            "built" if built else "not built (NCCL fallback)",
-            time.perf_counter() - t0,
-            weight.shape[0],
-        )
-    return built
-
-
 def _load_flashinfer_tactics(path: str) -> tuple[bool, int]:
     """Install the tactics of ``path`` into FlashInfer's AutoTuner (its config
     lookup; a kernel's first call then picks the tuned tactic without tuning).
@@ -722,8 +655,9 @@ def _load_flashinfer_tactics(path: str) -> tuple[bool, int]:
 
 
 def bootstrap_flashinfer_tactics(cache_path: str | None) -> None:
-    """Both modes, before the runner warmup: give the captured kernels
-    FlashInfer's tuned tactics without a tuning pass.
+    """Both modes, at the first capture scope (after the EagerRunner warmup,
+    before any capture): give the captured kernels FlashInfer's tuned tactics
+    without a tuning pass.
 
     The plugin pins ``--disable-flashinfer-autotune`` because the tuning pass
     benchmarks every tactic of every shape inside the recorded allocation
@@ -901,211 +835,27 @@ def bootstrap_lazy_runtimes() -> None:
     logger.info("[Foundry] SGLang lazy runtimes bootstrapped in %.3fs", time.perf_counter() - t0)
 
 
-def _find_dispatcher(model, cls) -> Any:
-    """The first ``cls`` dispatcher on the model: ``module.dispatcher`` itself
-    or one of its ``_inners`` (the two-batch-overlap wrapper holds the real
-    dispatchers there)."""
-    for module in model.modules():
-        dispatcher = getattr(module, "dispatcher", None)
-        if dispatcher is None:
-            continue
-        for candidate in (dispatcher, *getattr(dispatcher, "_inners", [])):
-            if isinstance(candidate, cls):
-                return candidate
-    return None
+def check_capture_state_prebuilt(model) -> None:
+    """Both modes, at the first capture scope: verify that sglang's warmup
+    (``BaseRunner._prepare_capture_state``) built the communication state the
+    first forward otherwise creates lazily: every MoE dispatcher's buffer or
+    expert mapping and the logits all-gather state. Built inside a capture, they
+    record garbage (the expert mapping) or abort (DeepEP buffers); built after
+    LOAD's ``restore_binaries`` (hooks step 3), their driver-placed memory lands at
+    other addresses than on SAVE. Raises naming what is still unbuilt."""
+    from sglang.srt.layers.logits_processor import LogitsProcessor
+    from sglang.srt.layers.moe.token_dispatcher.base import iter_dispatchers
 
-
-def _iter_dispatchers(model, cls):
-    """Every ``cls`` dispatcher on the model (``module.dispatcher`` or one of
-    its ``_inners``), one per MoE layer."""
-    for module in model.modules():
-        dispatcher = getattr(module, "dispatcher", None)
-        if dispatcher is None:
-            continue
-        for candidate in (dispatcher, *getattr(dispatcher, "_inners", [])):
-            if isinstance(candidate, cls):
-                yield candidate
-
-
-def bootstrap_expert_mappings(model) -> int:
-    """Build the standard token dispatcher's ``local_expert_mapping`` (global
-    expert id -> local slot, -1 elsewhere) of every MoE layer BEFORE the
-    capture loop, both modes.
-
-    sglang (``token_dispatcher/standard.py``) builds it lazily on the layer's
-    first dispatch, normally inside the pre-capture warmup forwards. SAVE runs
-    none, so the first dispatch is the captured one: the tensor is allocated
-    but its fill is only recorded, every later forward and graph routes
-    through garbage, and LOAD's graphs reference its capture-time address.
-    Only the plain EP all-to-all (``--moe-a2a-backend none``) with EP > 1 has
-    the table; the DeepEP dispatchers do not. Same construction as sglang's;
-    its lazy path then finds the table built. Returns the number built."""
-    try:
-        from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
-        from sglang.srt.utils.common import get_device
-    except ImportError:
-        return 0
-    import torch
-
-    t0 = time.perf_counter()
-    n = 0
-    for d in _iter_dispatchers(model, StandardDispatcher):
-        if d.moe_ep_size <= 1 or d.skip_local_expert_mapping or d.local_expert_mapping is not None:
-            continue
-        device = get_device()
-        routed = d.num_local_routed_experts
-        mapping = torch.full((d.num_experts,), -1, dtype=torch.int32, device=device)
-        mapping[d.moe_ep_rank * routed : (d.moe_ep_rank + 1) * routed] = torch.arange(
-            0, routed, dtype=torch.int32, device=device
+    unbuilt = sorted({type(d).__name__ for d in iter_dispatchers(model) if d.prebuild_pending})
+    if any(isinstance(m, LogitsProcessor) and m.logits_gatherer_pending for m in model.modules()):
+        unbuilt.append("LogitsProcessor logits all-gather")
+    if unbuilt:
+        raise RuntimeError(
+            f"[Foundry] lazily built sglang state is still unbuilt at the first capture: "
+            f"{', '.join(unbuilt)}. sglang builds it before capture in "
+            "BaseRunner._prepare_capture_state (prepare_capture_state, run by the "
+            "EagerRunner warmup); this sglang lacks that step or skipped it"
         )
-        if d.num_local_shared_experts > 0:
-            mapping[-d.num_local_shared_experts :] = torch.arange(
-                routed, routed + d.num_local_shared_experts, dtype=torch.int32, device="cpu"
-            )
-        d.local_expert_mapping = mapping
-        n += 1
-    if n:
-        torch.cuda.synchronize()
-        logger.info(
-            "[Foundry] Bootstrapped %d MoE expert mappings pre-capture in %.3fs",
-            n,
-            time.perf_counter() - t0,
-        )
-    return n
-
-
-def bootstrap_deepep_buffer(model) -> bool:
-    """Force the singleton DeepEP ``Buffer`` (NVSHMEM runtime + symmetric heap)
-    to be created BEFORE the cuda-graph capture loop.
-
-    sglang creates the DeepEP buffer lazily on the first MoE dispatch — normally
-    during the two pre-capture warmup forwards. Foundry suppresses those warmups
-    (for allocation determinism), which would push buffer creation into the
-    captured forward, where ``deep_ep_cpp.Buffer(...)`` aborts with
-    ``operation not permitted when stream is capturing``.
-
-    Triggering it here (outside any stream capture) creates only the NVSHMEM
-    runtime + symmetric heap — no model activations — so it stays symmetric
-    across SAVE and LOAD and lands at the same VMM offset on both. The buffer is
-    a process-wide singleton (``DeepEPBuffer._buffer``), so one creation per rank
-    is enough. It is a collective over the EP group, so every rank must reach
-    this point together — which they do, since ``capture`` runs on all ranks.
-
-    Returns True if a buffer was (or already is) created, False if DeepEP is off.
-    """
-    try:
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
-        backend = get_moe_a2a_backend()
-    except Exception:
-        return False
-    # Outside the guard: a failure to build the buffer must surface here, not
-    # resurface as a native abort when the capture forward retries lazily.
-    if backend.is_deepep_v2():
-        return _bootstrap_deepep_v2_buffer(model)
-    if backend.is_mooncake():
-        return _bootstrap_mooncake_buffer(model)
-    if not backend.is_deepep():
-        return False
-
-    from sglang.srt.layers.moe.token_dispatcher.deepep import (
-        DeepEPBuffer,
-        DeepEPDispatcher,
-    )
-
-    # The singleton now lives on the runtime context's resources
-    # (DeepEPBuffer._state().buffer), not a class attribute.
-    if DeepEPBuffer._state().buffer is not None:
-        return True
-
-    deepep = _find_dispatcher(model, DeepEPDispatcher)
-    # Prefer the low-latency impl (the mode foundry captures); the buffer is
-    # sized for whichever impls exist, so either bootstraps the shared
-    # singleton.
-    impl = deepep and (
-        getattr(deepep, "_low_latency_dispatcher", None)
-        or getattr(deepep, "_normal_dispatcher", None)
-    )
-    if impl is not None:
-        t0 = time.perf_counter()
-        impl._get_buffer()
-        logger.info(
-            "[Foundry] Bootstrapped DeepEP buffer pre-capture in %.3fs",
-            time.perf_counter() - t0,
-        )
-        return True
-
-    logger.warning(
-        "[Foundry] DeepEP backend active but no DeepEPDispatcher found on the "
-        "model; buffer not bootstrapped (capture may fail inside stream capture)."
-    )
-    return False
-
-
-def _bootstrap_mooncake_buffer(model) -> bool:
-    """Mooncake EP counterpart (elastic EP): create the process-wide mooncake
-    ``Buffer`` (RDMA-registered EP buffer) before capture / graph load, for the
-    same SAVE/LOAD allocation-sequence parity reasons as DeepEP. Without it the
-    first MoE dispatch -- and the torch.compile / DeepGEMM lazy init around it
-    -- runs inside the captured forward on SAVE."""
-    from sglang.srt.layers.moe.token_dispatcher.mooncake import (
-        EPBuffer,
-        MooncakeEPDispatcher,
-    )
-
-    if EPBuffer.get_existing_buffer() is not None:
-        return True
-
-    mk = _find_dispatcher(model, MooncakeEPDispatcher)
-    impl = getattr(mk, "_low_latency_dispatcher", None)
-    if impl is not None:
-        t0 = time.perf_counter()
-        impl._get_buffer()
-        logger.info(
-            "[Foundry] Bootstrapped Mooncake EP buffer pre-capture in %.3fs",
-            time.perf_counter() - t0,
-        )
-        return True
-
-    logger.warning(
-        "[Foundry] Mooncake a2a backend active but no MooncakeEPDispatcher found; "
-        "buffer not bootstrapped (capture may fail inside stream capture)."
-    )
-    return False
-
-
-def _bootstrap_deepep_v2_buffer(model) -> bool:
-    """DeepEP v2 counterpart: create the process-wide ``ElasticBuffer`` (its own
-    NCCL communicator + symmetric-memory windows) before capture / graph load.
-
-    sglang creates it lazily on the first dispatch, which on SAVE is inside the
-    first captured forward and on LOAD would be the first request — so the
-    window VA and NCCL state would sit at different allocation-sequence points
-    on the two paths. Collective over the EP group, like the v1 bootstrap.
-    """
-    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import (
-        DeepEPv2Buffer,
-        DeepEPv2Dispatcher,
-    )
-
-    if DeepEPv2Buffer._state().buffer is not None:
-        return True
-
-    v2 = _find_dispatcher(model, DeepEPv2Dispatcher)
-    if v2 is not None:
-        t0 = time.perf_counter()
-        v2._impl._get_buffer()
-        logger.info(
-            "[Foundry] Bootstrapped DeepEP v2 ElasticBuffer pre-capture in %.3fs",
-            time.perf_counter() - t0,
-        )
-        return True
-
-    logger.warning(
-        "[Foundry] DeepEP v2 backend active but no DeepEPv2Dispatcher found on the "
-        "model; ElasticBuffer not bootstrapped."
-    )
-    return False
 
 
 @dataclass
@@ -1147,7 +897,7 @@ def start_decode_graph_restore(kind: str = DEFAULT_DECODE_KIND) -> None:
     if not graph_files:
         raise RuntimeError(f"No Foundry SGLang {kind} graph files found in {cfg.workspace_dir}")
 
-    # Graphs may reference NVSHMEM symbols; the DeepEP bootstrap ran before.
+    # Graphs may reference NVSHMEM symbols; sglang's warmup built the DeepEP buffer before.
     # Single-GPU dense models have no NVSHMEM modules (no-op there).
     cge.init_nvshmem_for_loaded_modules()
 

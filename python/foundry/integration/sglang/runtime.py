@@ -221,14 +221,15 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
 @nvtx_traced("foundry.restore_binaries (binary restore)")
 def restore_binaries() -> None:
     """LOAD: load the archived CUDA modules and libraries, once, after the
-    pre-capture bootstraps and before any graph restore.
+    pre-capture state exists (sglang's warmup prebuild, Foundry's collective
+    bootstrap) and before any graph restore.
 
     Loading ~0.2-0.5 GB of fatbins grows the driver's own VA arena, which
     SAVE grows only later (its kernels load lazily inside the captures).
     Library objects the driver places there and the graphs reference by
     address must see the same arena on both modes: NCCL's per-communicator
     shadow pool (a CUDA mempool) holds DeepEP v2's ``ncclWindow_t`` and
-    device-communicator state, created by the ElasticBuffer bootstrap; with
+    device-communicator state, created by sglang's warmup prebuild; with
     the binaries loaded first it sits one 512 MB arena chunk higher on LOAD
     and the restored dispatch kernels read a stale window (peer counts never
     arrive: "DeepEP notify timeout")."""

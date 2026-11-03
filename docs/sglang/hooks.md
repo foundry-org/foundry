@@ -53,39 +53,30 @@ must be re-saved.
 
 The alloc-offset log lines (`[Foundry] SGLang alloc_offset[<point>]=...`) mark each step: `after_setup_graph_ext`,
 `after_init_parallel_runtime`, `after_init_torch_dist`, `after_scratch_skip`, `before_memory_pool_config`,
-`before/after_init_memory_pool` (plugin route and 2.2 callers), the
-bootstrap points below, `before/after_preallocate`, `before/after_prefill_restore` (prefill graphs on),
+`before/after_init_memory_pool` (plugin route and 2.2 callers), `before/after_collective_bootstrap`,
+`after_binary_restore` (LOAD), `after_lazy_runtimes` (SAVE), `before/after_preallocate`,
+`before/after_prefill_restore` (prefill graphs on),
 `before_decode_restore`, `after_load_all_graphs` (must equal SAVE's `final_alloc_offset`),
 `after_post_load_empty_cache`.
 
 ## Pre-capture bootstraps and EP additions
 
 Pre-capture bootstraps run at the first runner capture on SAVE and LOAD alike (same sequence point, no model
-forward). The DeepEP buffer step is active for the DeepEP-family backends (DeepEP, DeepEP v2, Mooncake). Both
-attention layouts work with EP: DP attention, and TP attention (or attention-TP inside DP groups) with its
-all-reduce through torch symmetric memory (validated attn-TP + EP rows up to attn-TP4 + EP8 in
+forward). Both attention layouts work with EP: DP attention, and TP attention (or attention-TP inside DP groups)
+with its all-reduce through torch symmetric memory (validated attn-TP + EP rows up to attn-TP4 + EP8 in
 `recipe/sglang/README.md`).
 
+- **sglang's own pre-capture state** (`check_capture_state_prebuilt`, graph_ops). sglang builds, in its
+  EagerRunner warmup (`BaseRunner._prepare_capture_state`, before the first capture scope, both modes), the
+  state its first forward would otherwise create lazily: every MoE dispatcher's buffer (DeepEP, DeepEP v2,
+  Mooncake, NIXL; `BaseDispatcher.prebuild`), the standard dispatcher's expert mapping (EP > 1,
+  `--moe-a2a-backend none`) and the logits all-gather's symmetric-memory state (`MultimemAllGatherer`).
+  Foundry only checks, at the first scope, that none is still pending (it raises naming the object), so all
+  of it exists before LOAD's `restore_binaries` grows the driver's VA arena.
 - **NCCL communicator bootstrap** (`bootstrap_collective_connections`). NCCL connects a communicator on its first
   collective, which a capturing stream rejects (seen on the attention-TP sub-group's first reduce-scatter of
   Qwen3.5-35B-A3B attention-TP2 + EP4). Foundry issues small and large all-reduce / all-gather / reduce-scatter on
   every initialized group through sglang's coordinators before capture.
-- **DeepEP buffer pre-capture bootstrap** (`bootstrap_deepep_buffer`, graph_ops). sglang
-  creates the singleton NVSHMEM `Buffer` lazily on the first MoE dispatch — normally
-  during the warmup forwards foundry suppresses, which would push creation *inside* the
-  captured stream (`deep_ep_cpp.Buffer(...)` → "operation not permitted when stream is
-  capturing"). The hook forces it before the capture loop, unwrapping the
-  `MaybeTboDeepEPDispatcher._inners` to reach a `DeepEPDispatcher`. Runs on SAVE and LOAD.
-- **Logits all-gather bootstrap** (`bootstrap_logits_gatherer`, `capture()` patch, SAVE and LOAD).
-  sglang's `LogitsProcessor` gathers TP-sharded logits through `MultimemAllGatherer`, whose torch
-  symmetric-memory buffer, multicast mapping and signal pads are built lazily on the first *eager*
-  call and skipped under capture (NCCL fallback). Multicast availability is a host property, so on
-  a host with multicast any eager forward before capture activates the gatherer and every graph
-  bakes in pointers to memory the hook never saw (torch symmetric memory is not `cudaMalloc`);
-  LOAD then faults at the first decode, while the same SAVE passes on a host without multicast.
-  The hook builds the state (`_build` with a probe of the per-rank logits shard width) before
-  capture at the same sequence point in both modes, so it lands at the same addresses and the
-  graphs capture the multicast gather like native sglang.
 - **SAVE-side runtime-init bootstrap** (`bootstrap_lazy_runtimes`, `capture()` patch). Two
   one-time initializations are illegal while a stream is capturing and would otherwise fire
   inside the first captured forward: inductor's pattern-matcher lazy init (an unpinned

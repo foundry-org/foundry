@@ -97,8 +97,8 @@ Rec = recorded at SAVE, App = applied at LOAD, Det = detected when missing, Test
 | feature | one-time work native does in warm-up / capture | Foundry |
 |---|---|---|
 | NCCL communicators | first collective connects and allocates | handled: `bootstrap_collective_connections`; `NCCL_GRAPH_REGISTER=0`, `NCCL_LOCAL_REGISTER=0` |
-| torch symm-mem all-reduce, logits `MultimemAllGatherer` | rendezvous / buffer on first eager forward | handled (bootstrap + re-rendezvous) |
-| DeepEP / DeepEP v2 / Mooncake buffer | created on first dispatch | handled (`bootstrap_deepep_buffer` and v2 variant) |
+| torch symm-mem all-reduce, logits `MultimemAllGatherer` | rendezvous / buffer on first eager forward | handled (sglang warmup prebuild + re-rendezvous) |
+| DeepEP / DeepEP v2 / Mooncake / NIXL buffer, standard-dispatcher expert mapping | created on first dispatch | handled: sglang warmup prebuild (`BaseDispatcher.prebuild`), checked by `check_capture_state_prebuilt` |
 | inductor lazy init, DeepGEMM runtime init, Triton autotune | first call | handled: per-key lazy_init warm-up, autotune guard, **caches must be warm before SAVE** |
 | FlashInfer per-bs wrappers and workspaces | created by the capture loop between shapes | handled since c5e43c4: the loop runs on LOAD too, no pre-pass |
 | **backend detection by attribute** (`hasattr(attn_backend, "indices_updater_decode")`): wrapper backends such as `HybridLinearAttnBackend` hide their FlashInfer child, so hybrid + flashinfer took the non-FlashInfer branch and LOAD re-created the per-bs `_int_workspace_buffer`s after load_all_graphs at new addresses; graphs read plans never updated (Qwen3.5-2B: same wrong tokens every run) | per-bs wrapper creation between captures | **closed 2026-09-30 by c5e43c4: decode LOAD re-runs SGLang's capture loop and substitutes only capture_one (as prefill did), so every per-shape host object is re-created by SGLang in SAVE's order; pre-pass, reuse shim, backend detection and post-load metadata init deleted; archives need `capture_loop_version: 2` (re-SAVE)** |
