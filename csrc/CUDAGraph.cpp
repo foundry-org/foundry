@@ -2195,6 +2195,10 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
   graph->has_graph_ = true;
 
   const json::array& nodes_array = root.at("nodes").as_array();
+  // save() moves kernel node attrs shared by every kernel node to the graph level.
+  const json::object* common_kernel_attrs = nullptr;
+  if (root.contains("common_kernel_node_attrs"))
+    common_kernel_attrs = &root.at("common_kernel_node_attrs").as_object();
 
   std::unordered_map<int, CUgraphNode> id_to_node;
   std::unordered_map<int, CUevent> event_id_to_event;
@@ -2268,8 +2272,19 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
       bool has_device_updatable = false;
       int device_updatable = 0;
 
-      if (params.contains("kernel_node_attrs")) {
-        const json::object& node_attrs = params.at("kernel_node_attrs").as_object();
+      if (params.contains("kernel_node_attrs") || common_kernel_attrs) {
+        // With common attrs, save() leaves only attrQueryAvailable on the node, so the
+        // two sets never hold the same attr and the merge order does not matter.
+        json::object merged_attrs;
+        if (common_kernel_attrs) {
+          merged_attrs = *common_kernel_attrs;
+          if (params.contains("kernel_node_attrs")) {
+            for (const auto& kv : params.at("kernel_node_attrs").as_object())
+              merged_attrs[kv.key()] = kv.value();
+          }
+        }
+        const json::object& node_attrs =
+            common_kernel_attrs ? merged_attrs : params.at("kernel_node_attrs").as_object();
         if (node_attrs.contains("clusterDimX")) {
           cluster_width = node_attrs.at("clusterDimX").to_number<int>();
           cluster_height = node_attrs.at("clusterDimY").to_number<int>();
