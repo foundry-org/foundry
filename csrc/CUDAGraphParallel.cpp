@@ -1877,9 +1877,13 @@ void CUDAGraph::link_on_demand_shared_exec(CUDAGraph& graph,
       CUkernelNodeAttrValue cluster{}, preferred{};
       C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeGetAttribute(
           shared_exec->ordered_nodes[i], CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &cluster));
-      C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeGetAttribute(
-          shared_exec->ordered_nodes[i], CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION,
-          &preferred));
+      // Not every driver reports this attribute (580.105.08 returns INVALID_VALUE,
+      // "Invalid kernel attribute: 11"); analyze_captured_graph ignores the same
+      // failure at SAVE, so read it as unset here too.
+      if (cuGraphKernelNodeGetAttribute(shared_exec->ordered_nodes[i],
+                                        CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION,
+                                        &preferred) != CUDA_SUCCESS)
+        preferred = CUkernelNodeAttrValue{};
       const auto& attrs = update.kernel_attrs;
       TORCH_CHECK(cluster.clusterDim.x == attrs.clusterDimX &&
                       cluster.clusterDim.y == attrs.clusterDimY &&
