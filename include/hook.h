@@ -77,6 +77,9 @@ std::variant<CUfunction, CUkernel> query_function_handle(uint64_t binary_hash,
                                                          const std::string& function_name);
 uint64_t query_binary_hash(std::variant<CUmodule, CUlibrary> handle);
 void mark_binary_used(uint64_t binary_hash);
+// Flags the application created `event` with; false for an event the hook did
+// not see created (or that was destroyed since).
+bool query_event_flags(CUevent event, unsigned int* flags);
 void load_cuda_modules_and_libraries(const std::string& archive_dir);
 
 }  // namespace foundry

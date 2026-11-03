@@ -187,6 +187,9 @@ struct BinMemcpyNode {
 
 struct BinEventNode {
   int32_t event_id;
+  // Creation flags SAVE recorded for the event (spare union space, so 0 =
+  // CU_EVENT_DEFAULT in files written before it).
+  uint32_t flags;
 };
 
 struct BinNodeEntry {
@@ -197,7 +200,7 @@ struct BinNodeEntry {
     BinKernelNode kernel;  // 136 bytes
     BinMemsetNode memset;  // 48 bytes
     BinMemcpyNode memcpy;  // 152 bytes (largest)
-    BinEventNode event;    // 4 bytes
+    BinEventNode event;    // 8 bytes
                            // EmptyNode has no data
   };
   // Pad to fixed 168 bytes (8 header + 152 memcpy + 8 tail)

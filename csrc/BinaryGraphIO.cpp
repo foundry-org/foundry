@@ -3,6 +3,7 @@
 
 #include "CUDAGraph.h"
 #include "BinaryGraphFormat.h"
+#include "CUDAGraphInternal.h"
 #include <boost/json.hpp>
 #include <fstream>
 #include <sstream>
@@ -277,10 +278,12 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
     } else if (type_str == "EventRecordNode") {
       entry.type = bf::NODE_EVENT_RECORD;
       entry.event.event_id = no.at("params").as_object().at("event_id").to_number<int32_t>();
+      entry.event.flags = saved_event_flags(no.at("params").as_object());
 
     } else if (type_str == "EventWaitNode") {
       entry.type = bf::NODE_EVENT_WAIT;
       entry.event.event_id = no.at("params").as_object().at("event_id").to_number<int32_t>();
+      entry.event.flags = saved_event_flags(no.at("params").as_object());
 
     } else if (type_str == "EmptyNode") {
       entry.type = bf::NODE_EMPTY;
@@ -648,11 +651,13 @@ boost::json::value read_and_parse_binary_graph(const std::string& bin_path) {
       }
       case bf::NODE_EVENT_RECORD:
         node_obj["type"] = "EventRecordNode";
-        node_obj["params"] = json::object{{"event_id", entry.event.event_id}};
+        node_obj["params"] =
+            json::object{{"event_id", entry.event.event_id}, {"event_flags", entry.event.flags}};
         break;
       case bf::NODE_EVENT_WAIT:
         node_obj["type"] = "EventWaitNode";
-        node_obj["params"] = json::object{{"event_id", entry.event.event_id}};
+        node_obj["params"] =
+            json::object{{"event_id", entry.event.event_id}, {"event_flags", entry.event.flags}};
         break;
       case bf::NODE_EMPTY:
         node_obj["type"] = "EmptyNode";

@@ -194,10 +194,18 @@ struct MemcpyNodeMetadata {
 
 struct EventRecordNodeMetadata {
   CUevent event;
+  // Creation flags from the hook, read at capture end: the application may
+  // destroy the event (and the driver reuse its handle) before save().
+  bool has_flags = false;
+  unsigned int flags = 0;
 };
 
 struct EventWaitNodeMetadata {
   CUevent event;
+  // Creation flags from the hook, read at capture end: the application may
+  // destroy the event (and the driver reuse its handle) before save().
+  bool has_flags = false;
+  unsigned int flags = 0;
 };
 
 struct EmptyNodeMetadata {};

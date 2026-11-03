@@ -18,6 +18,12 @@ Workloads:
   compat       what foundry.ops takes from libtorch: Philox capture state (rand,
                dropout advance per replay), cuBLAS / cuBLASLt handle and workspace
                (preallocate_cublas_workspaces), linear with bias (cuBLASLt epilogue)
+  events       elementwise steps separated by external event record/wait pairs,
+               timing and non-timing events alternating: LOAD rebuilds the
+               EventRecord/EventWait nodes with events of its own, created with the
+               flags SAVE recorded (test_event_flags_archived)
+  events_dropped  events, with the events destroyed after the replays and before
+               save (a graph is saved after its capture's events are gone)
 Load APIs: ``load`` (CUDAGraph.load) and ``builds`` (start_graph_builds +
 finish_graph_loads). compat also runs LOAD with FOUNDRY_MMAP_ARCHIVE=0.
 The builds path maps SAVE's layout span first (``map_saved_layout`` in
@@ -26,6 +32,7 @@ add, sgemm and hgemm_nvjet then change an input in place and replay once
 more: the graph reads its inputs, it does not bake them.
 """
 
+import gc
 import os
 import sys
 from collections.abc import Callable
@@ -61,6 +68,7 @@ class Workload:
     graph_region: bool = False
     rng: tuple = ()  # names of outputs that advance on every replay
     mutate: bool = False  # LOAD: change the first input and replay once more
+    drop_events: bool = False  # SAVE: destroy the captured events before graph.save
 
 
 def _add_inputs(g):
@@ -110,6 +118,38 @@ def _compat_ref(x, w1, *_):
     return [torch.relu(x @ w1) * 2.0 + 1.0, None, None, None]
 
 
+EVENT_CHAIN = 8
+_EVENTS = []  # captured record/wait nodes reference these: keep them alive while replaying
+
+
+def _events_inputs(g):
+    return (torch.full((256, 256), 1.0, device="cuda"),)
+
+
+def _events_timing(i):
+    return i % 2 == 0
+
+
+def _events(x):
+    """Elementwise steps separated by external event record/wait pairs, so the
+    graph carries EventRecord/EventWait nodes that LOAD rebuilds with events of
+    its own. Even steps use a timing event, odd steps a non-timing one."""
+    s = torch.cuda.current_stream()
+    for i in range(EVENT_CHAIN):
+        x = x * 1.5 + 1.0
+        ev = torch.cuda.Event(enable_timing=_events_timing(i), external=True)
+        _EVENTS.append(ev)
+        ev.record(s)
+        s.wait_event(ev)
+    return [x]
+
+
+def _events_ref(x):
+    for _ in range(EVENT_CHAIN):
+        x = x * 1.5 + 1.0
+    return [x]
+
+
 WORKLOADS = {
     "add": Workload(("sum",), _add_inputs, _add, _add, graph_region=True, mutate=True),
     "sgemm": Workload(
@@ -138,6 +178,8 @@ WORKLOADS = {
         cublas="workspaces",
         rng=("rand", "dropout"),
     ),
+    "events": Workload(("out",), _events_inputs, _events, _events_ref),
+    "events_dropped": Workload(("out",), _events_inputs, _events, _events_ref, drop_events=True),
 }
 
 
@@ -185,6 +227,11 @@ def _run_save(archive, workload):
     with fdry.graph(graph):
         outs = w.body(*inputs)
     replays = _replay_twice(graph, outs)
+    if w.drop_events:
+        # torch.cuda.Event's destructor destroys the event; the graph is not
+        # replayed after this (its record/wait nodes reference the events)
+        _EVENTS.clear()
+        gc.collect()
     graph.save(os.path.join(archive, GRAPH_JSON), output_tensors=outs if w.save_outputs else None)
 
     for name, a, b in zip(w.names, *replays):
@@ -260,6 +307,55 @@ def saved(tmp_path_factory):
 def test_load_matches_save(saved, workload, load_api, mmap):
     env = {} if mmap else {"FOUNDRY_MMAP_ARCHIVE": "0"}
     run_phase(__file__, "load", saved(workload), workload, load_api, env=env)
+
+
+CU_EVENT_DEFAULT = 0x0
+CU_EVENT_DISABLE_TIMING = 0x2
+
+
+def _cugraph_event_flags(path):
+    """{event_id: flags} from the NODE_TABLE of a .cugraph (BinaryGraphFormat.h)."""
+    import struct
+
+    data = path.read_bytes()
+    assert data[:8] == b"CUGRAPH\0", f"{path}: not a .cugraph"
+    num_nodes, _, _, num_sections = struct.unpack_from("<4I", data, 16)
+    for i in range(num_sections):
+        section_type, _, offset, _ = struct.unpack_from("<IIQQ", data, 64 + 24 * i)
+        if section_type == 1:  # SECTION_NODE_TABLE
+            break
+    else:
+        raise AssertionError(f"{path}: no node table")
+    flags = {}
+    for n in range(num_nodes):
+        entry = offset + 168 * n
+        if data[entry + 4] in (3, 4):  # NODE_EVENT_RECORD, NODE_EVENT_WAIT
+            event_id, event_flags = struct.unpack_from("<iI", data, entry + 8)
+            flags.setdefault(event_id, set()).add(event_flags)
+    return flags
+
+
+@pytest.mark.parametrize("workload", ["events", "events_dropped"])
+def test_event_flags_archived(saved, workload):
+    """SAVE records each event's creation flags in the JSON and the .cugraph
+    that LOAD rebuilds the event nodes from."""
+    import json
+
+    archive = saved(workload) / "archive"  # run_phase: <workdir>/archive
+    want = {
+        i: CU_EVENT_DEFAULT if _events_timing(i) else CU_EVENT_DISABLE_TIMING
+        for i in range(EVENT_CHAIN)
+    }
+    nodes = json.loads((archive / GRAPH_JSON).read_text())["nodes"]
+    got = {}
+    for node in nodes:
+        if node["type"] in ("EventRecordNode", "EventWaitNode"):
+            params = node["params"]
+            assert "event_flags" in params, f"no event_flags recorded: {node}"
+            got.setdefault(params["event_id"], set()).add(params["event_flags"])
+    assert got == {i: {f} for i, f in want.items()}, f"JSON event flags {got} != {want}"
+    binary = _cugraph_event_flags(archive / GRAPH_JSON.replace(".json", ".cugraph"))
+    assert binary == got, f".cugraph event flags {binary} != JSON {got}"
 
 
 if __name__ == "__main__":

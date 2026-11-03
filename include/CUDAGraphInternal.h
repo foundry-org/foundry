@@ -64,6 +64,15 @@ struct PendingGraphLoads {
   std::shared_ptr<double> build_seconds_ = std::make_shared<double>(0.0);
 };
 
+// Event nodes: SAVE records the flags the application created each event with
+// ("event_flags", from the hook) and LOAD creates the rebuilt event with them.
+// Archives written before SAVE recorded them, and events the hook never saw
+// created, rebuild with CU_EVENT_DEFAULT.
+inline unsigned int saved_event_flags(const boost::json::object& params) {
+  const boost::json::value* flags = params.if_contains("event_flags");
+  return flags ? flags->to_number<unsigned int>() : CU_EVENT_DEFAULT;
+}
+
 // Split load: JSON parse + template build + on-demand prep (synchronous).
 // Called by CUDAGraph::start_graph_builds.
 std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(

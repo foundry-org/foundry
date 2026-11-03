@@ -38,6 +38,10 @@
 #include <boost/format.hpp>
 #include <boost/json.hpp>
 #include "hook.h"
+// cuda.h maps cuEventDestroy to cuEventDestroy_v2. The hook also exports the
+// legacy symbol, which binaries built for the v1 API link directly.
+#undef cuEventDestroy
+extern "C" CUresult cuEventDestroy(CUevent hEvent);
 
 namespace fs = std::filesystem;
 
@@ -95,6 +99,9 @@ enum CudaDriverAPIIndex {
   CUDA_ENTRY_cuLibraryGetGlobal,
   CUDA_ENTRY_cuPointerSetAttribute,
   CUDA_ENTRY_cuCtxSynchronize,
+  CUDA_ENTRY_cuEventCreate,
+  CUDA_ENTRY_cuEventDestroy_v2,
+  CUDA_ENTRY_cuEventDestroy,
   CUDA_ENTRY_END
 };
 
@@ -143,6 +150,9 @@ static cuda_driver_entry_t cuda_driver_entry_table[] = {{nullptr, "cuModuleLoadD
                                                         {nullptr, "cuLibraryGetGlobal"},
                                                         {nullptr, "cuPointerSetAttribute"},
                                                         {nullptr, "cuCtxSynchronize"},
+                                                        {nullptr, "cuEventCreate"},
+                                                        {nullptr, "cuEventDestroy_v2"},
+                                                        {nullptr, "cuEventDestroy"},
                                                         {nullptr, nullptr}};
 
 #define CUDA_DRIVER_CALL(table, idx) (table[idx].fn_ptr)
@@ -278,6 +288,9 @@ static thread_local ThreadLocalStorage tls_storage;
 static std::once_flag default_allocation_region_flag;
 static boost::unordered::concurrent_flat_map<CUdeviceptr, AllocMetadata> global_alloc_metadata;
 static boost::unordered::concurrent_flat_map<CUdeviceptr, size_t> global_carved_reserve_metadata;
+// Creation flags of every live event. The driver has no query for them, and
+// SAVE needs them to rebuild event nodes as the application created them.
+static boost::unordered::concurrent_flat_map<CUevent, unsigned int> event_creation_flags;
 
 // Defined in the VMM-IPC section below (inside the extern "C" block, hence
 // the matching linkage here); closes and forgets the exported fd for a VA
@@ -2454,6 +2467,13 @@ static void* find_symbol_by_cuda_version(const char* symbol, int cudaVersion) {
     return (void*)cuIpcOpenMemHandle;
   } else if (strcmp(symbol, "cuIpcCloseMemHandle") == 0) {
     return (void*)cuIpcCloseMemHandle;
+  } else if (strcmp(symbol, "cuEventCreate") == 0) {
+    return (void*)cuEventCreate;
+  } else if (strcmp(symbol, "cuEventDestroy") == 0) {
+    if (cudaVersion >= 4000) {
+      return (void*)cuEventDestroy_v2;
+    }
+    return (void*)cuEventDestroy;
   }
 
   return nullptr;
@@ -3039,6 +3059,35 @@ CUresult cuPointerSetAttribute(const void* value, CUpointer_attribute attribute,
   return result;
 }
 
+CUresult cuEventCreate(CUevent* phEvent, unsigned int Flags) {
+  typedef CUresult (*cuEventCreate_t)(CUevent*, unsigned int);
+  auto real_func =
+      (cuEventCreate_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuEventCreate);
+  CUresult result = real_func(phEvent, Flags);
+  if (result == CUDA_SUCCESS) {
+    event_creation_flags.insert_or_assign(*phEvent, Flags);
+  }
+  return result;
+}
+
+CUresult cuEventDestroy_v2(CUevent hEvent) {
+  typedef CUresult (*cuEventDestroy_t)(CUevent);
+  auto real_func =
+      (cuEventDestroy_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuEventDestroy_v2);
+  // Forget first: the driver may hand the same handle to the next event.
+  event_creation_flags.erase(hEvent);
+  return real_func(hEvent);
+}
+
+// Legacy (pre-4.0) symbol: binaries built for the v1 API link it directly.
+CUresult cuEventDestroy(CUevent hEvent) {
+  typedef CUresult (*cuEventDestroy_t)(CUevent);
+  auto real_func =
+      (cuEventDestroy_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuEventDestroy);
+  event_creation_flags.erase(hEvent);
+  return real_func(hEvent);
+}
+
 CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
   typedef CUresult (*cuMemAddressFree_t)(CUdeviceptr, size_t);
   auto real_func =
@@ -3159,6 +3208,12 @@ void* dlsym(void* handle, const char* symbol) {
       return (void*)cuIpcOpenMemHandle;
     } else if (strcmp(symbol, "cuIpcCloseMemHandle") == 0) {
       return (void*)cuIpcCloseMemHandle;
+    } else if (strcmp(symbol, "cuEventCreate") == 0) {
+      return (void*)cuEventCreate;
+    } else if (strcmp(symbol, "cuEventDestroy") == 0) {
+      return (void*)cuEventDestroy;
+    } else if (strcmp(symbol, "cuEventDestroy_v2") == 0) {
+      return (void*)cuEventDestroy_v2;
     }
   }
 
@@ -4487,6 +4542,10 @@ uint64_t query_binary_hash(std::variant<CUmodule, CUlibrary> handle) {
   }
 
   return hash;
+}
+
+bool query_event_flags(CUevent event, unsigned int* flags) {
+  return event_creation_flags.visit(event, [&](const auto& pair) { *flags = pair.second; }) > 0;
 }
 
 void mark_binary_used(uint64_t binary_hash) {
