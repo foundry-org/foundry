@@ -11,6 +11,7 @@
 #include <c10/util/intrusive_ptr.h>
 #include "metadata.h"
 
+#include <map>
 #include <vector>
 #include <memory>
 #include <atomic>
@@ -299,6 +300,14 @@ struct CUDAGraph {
 
   std::vector<GraphNode> graph_nodes;
   std::vector<GraphDependency> graph_dependencies;
+
+  // SAVE: kernel-node attribute query outcome of analyze_captured_graph, reported by save().
+  struct AttrQueryStats {
+    size_t kernel_nodes = 0;
+    size_t unavailable_nodes = 0;  // CLUSTER_DIMENSION query failed: attrQueryAvailable=false
+    std::map<int, std::pair<size_t, CUresult>> failures;  // attr id -> (count, first result)
+  };
+  AttrQueryStats attr_query_stats_;
 
   boost::json::object allocator_events_;
 

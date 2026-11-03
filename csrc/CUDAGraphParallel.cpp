@@ -2292,6 +2292,8 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       // ---- Binary path: extract metadata directly from binary sections ----
       namespace bf = binary_format;
       const auto& bf_data = bin_files[i];
+      // Every builder this graph reaches (template, eager member, on-demand) starts here.
+      warn_attr_query_unavailable(json_paths[i], count_attr_query_unavailable(bf_data));
 
       // Build minimal JSON for prepare_graph_shell (it only reads generators
       // and sets up the graph shell — doesn't touch nodes).
@@ -2343,6 +2345,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
     } else {
       // ---- JSON path: original flow ----
       boost::json::object& pre_root = parsed_jsons[i].as_object();
+      warn_attr_query_unavailable(json_paths[i], count_attr_query_unavailable(pre_root));
 
       auto gen_it = pre_root.find("generators");
       if (gen_it != pre_root.end()) {

@@ -68,7 +68,9 @@ recorded and re-applied (or derived) by Foundry itself. Today Foundry does that 
 ## 2. Launch attributes on kernel nodes
 
 The SAVE query is in `analyze_captured_graph` (CUDAGraph.cpp:960-1063). If the first query
-(`CLUSTER_DIMENSION`, :963) fails, `attr_query_available=false` and **every** other attribute is skipped silently.
+(`CLUSTER_DIMENSION`, :963) fails, SAVE raises unless `FOUNDRY_ALLOW_ATTR_QUERY_FAILURE=1`, which saves the node with
+`attr_query_available=false` and every other attribute skipped; every tolerated query failure is counted in one
+`[foundry] <json>:` line per graph at save, and LOAD warns once per graph that has such nodes.
 
 | Attribute | Rec (JSON) | Binary node table | Applied: SER / JT / BT / MEM | Notes |
 |---|---|---|---|---|
