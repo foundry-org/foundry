@@ -397,10 +397,9 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
         with rt.allocation_region_suspended():
             bootstrap_lazy_runtimes()
         rt.log_alloc_offset("after_lazy_runtimes")
-    # 5. Both modes, before the first eager extend, opt-in only: the FlashInfer
-    #    SM90 GDN prefill kernels load from FlashInfer's .o cache instead of
-    #    compiling 8-10 s in every scheduler (see flashinfer_cute_cache for why
-    #    it is off by default).
+    # 5. Both modes, before the first eager extend: the FlashInfer SM90 GDN
+    #    prefill kernels load from FlashInfer's .o cache instead of compiling
+    #    8-10 s in every scheduler (host-side patch, see flashinfer_cute_cache).
     from foundry.integration.sglang import flashinfer_cute_cache
 
     if flashinfer_cute_cache.gdn_flashinfer_in_use():
@@ -410,8 +409,8 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
                 logger.info("[Foundry] FlashInfer CuTe-DSL cache: %s", status)
         else:
             logger.info(
-                "[Foundry] FlashInfer CuTe-DSL cache: off (%s=1 enables it)",
-                flashinfer_cute_cache.OPT_IN_ENV,
+                "[Foundry] FlashInfer CuTe-DSL cache: off (%s=0)",
+                flashinfer_cute_cache.OPT_OUT_ENV,
             )
 
     # The deterministic layout begins here on both modes: same sequence

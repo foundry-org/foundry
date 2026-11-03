@@ -129,8 +129,8 @@ def test_gdn_flashinfer_detection(monkeypatch):
     assert fcc.gdn_flashinfer_in_use()
 
 
-def test_patch_is_opt_in(monkeypatch):
-    monkeypatch.delenv(fcc.OPT_IN_ENV, raising=False)
-    assert not fcc.enabled()
-    monkeypatch.setenv(fcc.OPT_IN_ENV, "1")
+def test_patch_is_on_by_default(monkeypatch):
+    monkeypatch.delenv(fcc.OPT_OUT_ENV, raising=False)
     assert fcc.enabled()
+    monkeypatch.setenv(fcc.OPT_OUT_ENV, "0")
+    assert not fcc.enabled()
