@@ -6,10 +6,11 @@
 // (comma-separated ints) and forwards every other query to the driver. At exit it prints
 // how many queries it failed.
 //
-// The driver function is looked up on a libcuda handle, not with dlsym(RTLD_NEXT): the
-// harness preloads libcuda_hook.so ahead of this library, the hook interposes dlsym and
-// issues the real lookup from its own object, so RTLD_NEXT would resolve to the object
-// after the hook, which is this shim.
+// The driver function is looked up with dlsym(RTLD_NEXT) on purpose: the harness
+// preloads libcuda_hook.so ahead of this library and the hook interposes dlsym, so
+// this doubles as the regression test for the hook's RTLD_NEXT handling (it must
+// resolve relative to this shim, not to the hook; the self-check below aborts
+// otherwise).
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -45,11 +46,7 @@ static void init(void) {
     for (char* tok = strtok(buf, ","); tok && num_fail < MAX_FAIL; tok = strtok(NULL, ","))
       fail_ids[num_fail++] = atoi(tok);
   }
-  void* handle = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
-  if (!handle)
-    handle = dlopen("libcuda.so.1", RTLD_NOW);
-  if (handle)
-    real_get_attr = (get_attr_fn)dlsym(handle, "cuGraphKernelNodeGetAttribute");
+  real_get_attr = (get_attr_fn)dlsym(RTLD_NEXT, "cuGraphKernelNodeGetAttribute");
   if (!real_get_attr || real_get_attr == cuGraphKernelNodeGetAttribute) {
     fprintf(stderr,
             "[attr_query_shim] cannot resolve the driver's cuGraphKernelNodeGetAttribute\n");

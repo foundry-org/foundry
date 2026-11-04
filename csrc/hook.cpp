@@ -7,6 +7,7 @@
 // #define FOUNDRY_DEBUG  // Verbose logging (see README "Debugging"); same flag as CUDAGraph.cpp
 
 #include <dlfcn.h>
+#include <link.h>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -3130,6 +3131,44 @@ CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
 // expert relocation ~6x slower under the hook). Recover the original semantics
 // by re-issuing a failed lookup against the calling module's own handle, whose
 // dependency closure is exactly the scope glibc would have searched.
+// RTLD_NEXT means "the first definition after the *caller's* object in load
+// order". Interposed, the caller glibc sees is this library, so an interposer
+// loaded after it (an LD_PRELOAD shim, a profiler) gets the object after the
+// hook - possibly itself - instead of the object after its own. Walk the link
+// map from the caller's object and take the first object that defines the
+// symbol itself (dladdr names the defining object; a hit through a dependency
+// is skipped, that object comes later in the chain).
+static void* dlsym_next_after_caller(const char* symbol, void* caller_addr) {
+  Dl_info caller_info;
+  struct link_map* caller_map = nullptr;
+  if (caller_addr == nullptr || symbol == nullptr ||
+      dladdr1(caller_addr, &caller_info, (void**)&caller_map, RTLD_DL_LINKMAP) == 0 ||
+      caller_map == nullptr) {
+    return nullptr;
+  }
+  for (struct link_map* m = caller_map->l_next; m != nullptr; m = m->l_next) {
+    if (m->l_name == nullptr || m->l_name[0] == '\0') {
+      continue;
+    }
+    void* h = dlopen(m->l_name, RTLD_LAZY | RTLD_NOLOAD);
+    if (h == nullptr) {
+      continue;  // vdso and the like
+    }
+    void* result = real_dlsym(h, symbol);
+    dlclose(h);  // only drops the RTLD_NOLOAD reference
+    if (result == nullptr) {
+      continue;
+    }
+    Dl_info result_info;
+    if (dladdr(result, &result_info) != 0 && result_info.dli_fname != nullptr &&
+        strcmp(result_info.dli_fname, m->l_name) == 0) {
+      dlerror();
+      return result;
+    }
+  }
+  return nullptr;
+}
+
 static void* dlsym_in_caller_scope(void* handle, const char* symbol, void* caller_addr) {
   Dl_info caller_info;
   if (caller_addr == nullptr || dladdr(caller_addr, &caller_info) == 0 ||
@@ -3217,6 +3256,12 @@ void* dlsym(void* handle, const char* symbol) {
     }
   }
 
+  if (handle == RTLD_NEXT) {
+    void* next = dlsym_next_after_caller(symbol, caller_addr);
+    if (next != nullptr) {
+      return next;
+    }
+  }
   void* result = real_dlsym(handle, symbol);
   if (result == nullptr && symbol != nullptr && (handle == RTLD_DEFAULT || handle == RTLD_NEXT)) {
     result = dlsym_in_caller_scope(handle, symbol, caller_addr);
