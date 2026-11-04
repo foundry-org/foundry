@@ -158,7 +158,10 @@ the driver. Test: `tests/core/test_cluster_optin.py` (driver-level, no archive).
 LOAD rebuilds each EventRecord/EventWait node with an event of its own,
 created with the flags SAVE recorded. `graph.loaded_events()` lists them per
 archived `event_id` (`LoadedEvent`: handle, flags, record and wait node
-indices in the archive's node list); `graph.bind_events({event_id: event})`
+indices in the archive's node list, and `event`, a `foundry.RestoredEvent`: a
+`torch.cuda.Event` subclass whose `query`, `synchronize`, `elapsed_time`,
+`record` and `wait` act on the LOAD-created handle);
+`graph.bind_events({event_id: event})`
 points every record/wait node of that `event_id` in the graph's exec at a
 `torch.cuda.Event` (or `CUevent` handle) of the host process, e.g. to time a
 replay. Supported for graphs with an exec of their own (`CUDAGraph.load`, and

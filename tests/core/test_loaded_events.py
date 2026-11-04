@@ -11,8 +11,9 @@ the captured events (the native measurement, written into the archive) and
 saves the graph. Archives: ``single`` (one graph) and ``group`` (the same chain
 on two row counts plus a manifest: one template and one member). Each LOAD
 must list every archived event with the flags SAVE recorded and the
-record/wait node indices of the archive's node list, then bind two timing
-torch.cuda.Events of its own to the first and last record nodes: the span
+record/wait node indices of the archive's node list, each as a RestoredEvent
+the replay records (timing the span with the first and last), then bind two
+timing torch.cuda.Events of its own to the first and last record nodes: the span
 they measure must match SAVE's, and the outputs stay bit for bit SAVE's.
 
 LOAD APIs: ``load`` (CUDAGraph.load), ``builds`` (start_graph_builds +
@@ -161,7 +162,34 @@ def _check_listing(graph, path):
             assert e.record_nodes[0] > events[i - 1].record_nodes[0], "not in node order"
     handles = [e.handle for e in events]
     assert all(handles) and len(set(handles)) == len(handles), f"event handles {handles}"
+    for e in events:
+        assert isinstance(e.event, torch.cuda.Event), e
+        assert e.event.cuda_event == e.handle and e.event.flags == e.flags, e
     return events
+
+
+def _check_restored(graph, events):
+    """The RestoredEvents of an unbound graph: the replay records them, the
+    first->last span is timed with them, a timing-disabled one refuses
+    elapsed_time, and stream.record_event / wait_event route to them."""
+    import foundry as fdry
+
+    first, second, last = events[0].event, events[1].event, events[-1].event
+    assert isinstance(first, fdry.RestoredEvent) and "RestoredEvent" in repr(first), repr(first)
+    graph.replay()
+    last.synchronize()
+    assert all(e.event.query() for e in events), "replay left an event unrecorded"
+    assert first.elapsed_time(last) > 0, "restored span is not positive"
+    with pytest.raises(RuntimeError, match="cuEventElapsedTime"):
+        second.elapsed_time(last)  # CU_EVENT_DISABLE_TIMING
+    with pytest.raises(NotImplementedError):
+        first.ipc_handle()
+    s = torch.cuda.current_stream()
+    assert s.record_event(second) is second
+    s.wait_event(second)
+    second.synchronize()
+    assert second.query()
+    torch.cuda.synchronize()
 
 
 def _run_load(archive, layout, load_api, share):
@@ -191,6 +219,8 @@ def _run_load(archive, layout, load_api, share):
 
     # every graph's events first: binding one graph must not touch another's
     listings = [_check_listing(graph, path) for (graph, _), path in zip(loaded, paths)]
+    for (graph, _), events in zip(loaded, listings):
+        _check_restored(graph, events)
     timers = []
     for gi, ((graph, out), events) in enumerate(zip(loaded, listings)):
         name = os.path.basename(paths[gi])

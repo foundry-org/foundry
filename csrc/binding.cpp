@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <c10/core/CachingDeviceAllocator.h>
+#include <c10/cuda/CUDAException.h>
 #include <pybind11/stl.h>
 #include <cstring>
 #include "CUDAGraph.h"
@@ -9,6 +10,31 @@
 
 template <typename T>
 using shared_ptr_class_ = py::class_<T, std::shared_ptr<T>>;
+
+namespace {
+
+void check_driver_call(CUresult rc, const char* call) {
+  if (rc == CUDA_SUCCESS)
+    return;
+  const char* name = nullptr;
+  if (cuGetErrorName(rc, &name) != CUDA_SUCCESS || !name)
+    name = "unknown CUresult";
+  TORCH_CHECK(false, call, " failed: ", name, " (", static_cast<int>(rc), ")");
+}
+
+// Driver calls need a current context on the calling thread; cudaSetDevice makes the
+// primary context of the runtime's current device current (CUDA 12+).
+void ensure_current_context() {
+  CUcontext ctx = nullptr;
+  check_driver_call(cuCtxGetCurrent(&ctx), "cuCtxGetCurrent");
+  if (!ctx) {
+    int device = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    C10_CUDA_CHECK(cudaSetDevice(device));
+  }
+}
+
+}  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("graph_pool_handle", &::foundry::graph_pool_handle);
@@ -100,6 +126,57 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "preallocate_cublas_workspaces", []() { ::foundry::preallocate_cublas_workspaces(); },
       "Pre-allocate cuBLAS and cuBLASLt handles and workspaces for the current stream");
 
+  // CUevent handles as integers (foundry.graph.RestoredEvent). Driver errors raise
+  // RuntimeError with the error name; event_query maps CUDA_ERROR_NOT_READY to False.
+  m.def(
+      "event_query",
+      [](uintptr_t handle) {
+        ensure_current_context();
+        const CUresult rc = cuEventQuery(reinterpret_cast<CUevent>(handle));
+        if (rc == CUDA_ERROR_NOT_READY)
+          return false;
+        check_driver_call(rc, "cuEventQuery");
+        return true;
+      },
+      py::arg("handle"));
+  m.def(
+      "event_synchronize",
+      [](uintptr_t handle) {
+        ensure_current_context();
+        check_driver_call(cuEventSynchronize(reinterpret_cast<CUevent>(handle)),
+                          "cuEventSynchronize");
+      },
+      py::arg("handle"), py::call_guard<py::gil_scoped_release>());
+  m.def(
+      "event_elapsed_time",
+      [](uintptr_t start, uintptr_t end) {
+        ensure_current_context();
+        float ms = 0.0f;
+        check_driver_call(cuEventElapsedTime(&ms, reinterpret_cast<CUevent>(start),
+                                             reinterpret_cast<CUevent>(end)),
+                          "cuEventElapsedTime");
+        return ms;
+      },
+      py::arg("start"), py::arg("end"));
+  m.def(
+      "event_record",
+      [](uintptr_t handle, uintptr_t stream) {
+        ensure_current_context();
+        check_driver_call(
+            cuEventRecord(reinterpret_cast<CUevent>(handle), reinterpret_cast<CUstream>(stream)),
+            "cuEventRecord");
+      },
+      py::arg("handle"), py::arg("stream"));
+  m.def(
+      "stream_wait_event",
+      [](uintptr_t stream, uintptr_t handle) {
+        ensure_current_context();
+        check_driver_call(cuStreamWaitEvent(reinterpret_cast<CUstream>(stream),
+                                            reinterpret_cast<CUevent>(handle), 0),
+                          "cuStreamWaitEvent");
+      },
+      py::arg("stream"), py::arg("handle"));
+
   py::class_<::foundry::KernelNodeMetadata>(m, "KernelNodeMetadata")
       .def_property_readonly("func",
                              [](const ::foundry::KernelNodeMetadata& self) {
@@ -172,14 +249,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("replay", &foundry::CUDAGraph::replay, py::call_guard<py::gil_scoped_release>())
       .def("exec_share_stats", &foundry::CUDAGraph::exec_share_stats)
       .def("loaded_events",
-           [](const ::foundry::CUDAGraph& self) {
+           [](py::object self_obj) {
              // foundry.graph.LoadedEvent records (loaded graphs are ops.CUDAGraph objects,
-             // so the Python-side shape lives here, not on foundry.CUDAGraph).
-             py::object record = py::module_::import("foundry.graph").attr("LoadedEvent");
+             // so the Python-side shape lives here, not on foundry.CUDAGraph). Each
+             // RestoredEvent holds a reference to the graph that owns its CUevent.
+             const auto& self = self_obj.cast<const ::foundry::CUDAGraph&>();
+             py::module_ graph_mod = py::module_::import("foundry.graph");
+             py::object record = graph_mod.attr("LoadedEvent");
+             py::object restored = graph_mod.attr("RestoredEvent");
              py::list out;
-             for (const auto& e : self.loaded_events())
-               out.append(record(e.event_id, reinterpret_cast<uintptr_t>(e.event), e.flags,
-                                 e.record_nodes, e.wait_nodes));
+             for (const auto& e : self.loaded_events()) {
+               const auto handle = reinterpret_cast<uintptr_t>(e.event);
+               out.append(record(e.event_id, handle, e.flags, e.record_nodes, e.wait_nodes,
+                                 restored(handle, e.flags, self_obj)));
+             }
              return out;
            })
       .def(

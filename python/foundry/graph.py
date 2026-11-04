@@ -17,6 +17,59 @@ if TYPE_CHECKING:
 OutputTensors = torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
 
 
+class RestoredEvent(torch.cuda.Event):
+    """A CUevent LOAD created for a loaded graph's EventRecord/EventWait nodes,
+    usable where a ``torch.cuda.Event`` is (``isinstance`` holds;
+    ``stream.wait_event`` / ``stream.record_event`` call ``wait`` / ``record``).
+
+    Every method acts on the LOAD-created handle through the driver
+    (``foundry.ops.event_*``); the torch event of the base class is never
+    created. The object holds a reference to the graph that owns the handle.
+    ``elapsed_time`` on an event created with CU_EVENT_DISABLE_TIMING raises
+    the driver's error. ``torch.cuda.Event.elapsed_time(restored)`` reads the
+    base class's event of its argument (never created), so put the
+    RestoredEvent first: ``restored.elapsed_time(end)``.
+    """
+
+    def __new__(cls, handle: int, flags: int = 0, owner: object = None):
+        # The base event is lazy: it creates no CUDA event until its own record().
+        return super().__new__(cls)
+
+    def __init__(self, handle: int, flags: int = 0, owner: object = None):
+        self._handle = handle
+        self.flags = flags  # creation flags SAVE recorded (CU_EVENT_*)
+        self._owner = owner
+
+    @property
+    def cuda_event(self) -> int:
+        return self._handle
+
+    def query(self) -> bool:
+        return ops.event_query(self._handle)
+
+    def synchronize(self) -> None:
+        ops.event_synchronize(self._handle)
+
+    def elapsed_time(self, end_event: torch.cuda.Event) -> float:
+        return ops.event_elapsed_time(self._handle, end_event.cuda_event)
+
+    def record(self, stream: torch.cuda.Stream | None = None) -> None:
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        ops.event_record(self._handle, stream.cuda_stream)
+
+    def wait(self, stream: torch.cuda.Stream | None = None) -> None:
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        ops.stream_wait_event(stream.cuda_stream, self._handle)
+
+    def ipc_handle(self):
+        raise NotImplementedError("RestoredEvent: a LOAD-created event has no IPC handle")
+
+    def __repr__(self) -> str:
+        return f"<foundry.RestoredEvent {self._handle:#x} flags={self.flags:#x}>"
+
+
 class LoadedEvent(NamedTuple):
     """One entry of ``loaded_events()``: an event LOAD rebuilt for a loaded
     graph's EventRecord/EventWait nodes.
@@ -40,6 +93,7 @@ class LoadedEvent(NamedTuple):
     flags: int  # creation flags SAVE recorded (CU_EVENT_*)
     record_nodes: list[int]  # indices in the archive's node list
     wait_nodes: list[int]
+    event: RestoredEvent  # the handle as a torch.cuda.Event
 
 
 class CUDAGraph(ops.CUDAGraph):
