@@ -81,7 +81,11 @@ struct FileHeader {
   uint32_t num_generators;
   uint32_t num_sections;
   uint32_t num_strings;
-  uint8_t reserved[28];  // pad to 64 bytes
+  // Kernel nodes saved with attrQueryAvailable=false (the CLUSTER_DIMENSION query
+  // failed at SAVE); 0 in files written before the field existed. LOAD warns from
+  // it instead of scanning the node table.
+  uint32_t kernel_nodes_without_attrs;
+  uint8_t reserved[24];  // pad to 64 bytes
 };
 static_assert(sizeof(FileHeader) == 64, "FileHeader must be 64 bytes");
 

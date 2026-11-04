@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -265,6 +266,11 @@ def test_cluster_dim_query_fails(tmp_path, libs):
         attrs = _kernel_attrs(path)
         assert [a.get("attrQueryAvailable") for a in attrs] == [False, False], attrs
         assert not any("clusterDimX" in a for a in attrs), attrs
+        # LOAD warns from these counts, written by SAVE, instead of scanning the nodes.
+        root = json.loads(Path(path).read_text())
+        assert root.get("kernel_nodes_without_attrs") == len(LAUNCHES), root.keys()
+        cugraph = Path(path).with_suffix(".cugraph").read_bytes()
+        assert struct.unpack_from("<I", cugraph, 36)[0] == len(LAUNCHES)  # FileHeader offset 36
     # LOAD on a driver that answers the query: the archive itself lacks the cluster dims.
     for api, share in (("load", False), ("builds", False), ("builds", True)):
         log = _load(work, libs, api, "nocluster", share=share)

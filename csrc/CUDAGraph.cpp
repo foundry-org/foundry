@@ -2131,6 +2131,10 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
   }
 
   root["nodes"] = nodes_array;
+  if (attr_query_stats_.unavailable_nodes > 0) {
+    // LOAD warns from this count (JSON root / .cugraph header) without scanning the nodes.
+    root["kernel_nodes_without_attrs"] = attr_query_stats_.unavailable_nodes;
+  }
 
   json::array deps_array;
   for (const auto& dep : graph_dependencies) {
@@ -2219,40 +2223,9 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
   }
 }
 
-size_t count_attr_query_unavailable(const boost::json::object& root) {
-  size_t count = 0;
-  auto nodes_it = root.find("nodes");
-  if (nodes_it == root.end() || !nodes_it->value().is_array())
-    return 0;
-  for (const auto& node_val : nodes_it->value().as_array()) {
-    const auto& node = node_val.as_object();
-    auto type_it = node.find("type");
-    if (type_it == node.end() || type_it->value().as_string() != "KernelNode")
-      continue;
-    const auto& params = node.at("params").as_object();
-    auto attrs_it = params.find("kernel_node_attrs");
-    if (attrs_it == params.end())
-      continue;
-    const auto& attrs = attrs_it->value().as_object();
-    auto avail_it = attrs.find("attrQueryAvailable");
-    if (avail_it != attrs.end() && avail_it->value().is_bool() && !avail_it->value().as_bool())
-      count++;
-  }
-  return count;
-}
-
-size_t count_attr_query_unavailable(const BinaryGraphFile& bin_file) {
-  namespace bf = binary_format;
-  size_t count = 0;
-  const bf::BinNodeEntry* nodes = bin_file.node_table();
-  for (uint32_t i = 0; i < bin_file.header.num_nodes; i++) {
-    if (nodes[i].type != bf::NODE_KERNEL)
-      continue;
-    const auto& k = nodes[i].kernel;
-    if ((k.kna_flags & bf::KNA_ATTR_QUERY_AVAILABLE) && !k.kna_attrQueryAvailable)
-      count++;
-  }
-  return count;
+size_t saved_attr_query_unavailable(const boost::json::object& root) {
+  auto it = root.find("kernel_nodes_without_attrs");
+  return it == root.end() ? 0 : static_cast<size_t>(it->value().to_number<uint64_t>());
 }
 
 void warn_attr_query_unavailable(const std::string& graph_path, size_t count) {
@@ -2276,7 +2249,7 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
   namespace json = boost::json;
   json::value root_val = json::parse(json_str);
   const json::object& root = root_val.as_object();
-  warn_attr_query_unavailable(json_path, count_attr_query_unavailable(root));
+  warn_attr_query_unavailable(json_path, saved_attr_query_unavailable(root));
 
   auto graph = std::make_shared<CUDAGraph>(true);
   graph->loaded_graph_resources_ = std::make_unique<LoadedGraphResources>();

@@ -43,8 +43,8 @@ CUresult add_restored_kernel_node(CUgraphNode* node, CUgraph graph,
 // LOAD: number of kernel nodes saved with attrQueryAvailable=false (SAVE could not query
 // their launch attributes), from the graph JSON or the binary node table, and the
 // one-line warning for a non-zero count.
-size_t count_attr_query_unavailable(const boost::json::object& root);
-size_t count_attr_query_unavailable(const BinaryGraphFile& bin_file);
+// "kernel_nodes_without_attrs" written by save() (JSON root / .cugraph header); 0 when absent.
+size_t saved_attr_query_unavailable(const boost::json::object& root);
 void warn_attr_query_unavailable(const std::string& graph_path, size_t count);
 
 // Holds deferred metadata for the split start/finish graph loading flow.
