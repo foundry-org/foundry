@@ -171,6 +171,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("generator"))
       .def("replay", &foundry::CUDAGraph::replay, py::call_guard<py::gil_scoped_release>())
       .def("exec_share_stats", &foundry::CUDAGraph::exec_share_stats)
+      .def("loaded_events",
+           [](const ::foundry::CUDAGraph& self) {
+             // foundry.graph.LoadedEvent records (loaded graphs are ops.CUDAGraph objects,
+             // so the Python-side shape lives here, not on foundry.CUDAGraph).
+             py::object record = py::module_::import("foundry.graph").attr("LoadedEvent");
+             py::list out;
+             for (const auto& e : self.loaded_events())
+               out.append(record(e.event_id, reinterpret_cast<uintptr_t>(e.event), e.flags,
+                                 e.record_nodes, e.wait_nodes));
+             return out;
+           })
+      .def(
+          "bind_events",
+          [](::foundry::CUDAGraph& self, const py::dict& events) {
+            // {event_id: torch.cuda.Event | CUevent handle}
+            std::vector<std::pair<int, CUevent>> handles;
+            for (const auto& [key, value] : events) {
+              uintptr_t handle = 0;
+              if (py::isinstance<py::int_>(value)) {
+                handle = value.cast<uintptr_t>();
+              } else {
+                TORCH_CHECK(py::hasattr(value, "cuda_event"),
+                            "bind_events: expected a torch.cuda.Event or an int handle");
+                handle = value.attr("cuda_event").cast<uintptr_t>();
+                if (!handle) {  // torch.cuda.Event creates its CUDA event on first record
+                  value.attr("record")();
+                  handle = value.attr("cuda_event").cast<uintptr_t>();
+                }
+              }
+              handles.emplace_back(key.cast<int>(), reinterpret_cast<CUevent>(handle));
+            }
+            py::gil_scoped_release release;
+            self.bind_events(handles);
+          },
+          py::arg("events"))
       .def("reset", &foundry::CUDAGraph::reset, py::call_guard<py::gil_scoped_release>())
       .def("pool", &foundry::CUDAGraph::pool, py::call_guard<py::gil_scoped_release>())
       .def("debug_dump", &foundry::CUDAGraph::debug_dump, py::call_guard<py::gil_scoped_release>())

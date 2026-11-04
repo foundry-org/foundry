@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -15,6 +15,31 @@ if TYPE_CHECKING:
     from torch.cuda import _POOL_HANDLE
 
 OutputTensors = torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
+
+
+class LoadedEvent(NamedTuple):
+    """One entry of ``loaded_events()``: an event LOAD rebuilt for a loaded
+    graph's EventRecord/EventWait nodes.
+
+    Loaded graphs (``CUDAGraph.load``, ``finish_graph_loads``) are
+    ``foundry.ops.CUDAGraph`` objects; ``loaded_events()`` and
+    ``bind_events(events)`` are methods of that class:
+
+    - ``graph.loaded_events() -> list[LoadedEvent]``, one per archived event_id
+      in order of first appearance (empty for a captured graph);
+    - ``graph.bind_events({event_id: torch.cuda.Event | int})`` makes the
+      graph's exec record / wait the given events (every record and wait node
+      of each event_id) instead of the rebuilt ones. Keep the events alive while
+      the graph replays. Graphs with an exec of their own only (``load``, or
+      ``start_graph_builds`` without FOUNDRY_ENABLE_EXEC_SHARE=1); raises on an
+      exec-share graph.
+    """
+
+    event_id: int  # as in the archive
+    handle: int  # CUevent LOAD created (kept alive with the graph)
+    flags: int  # creation flags SAVE recorded (CU_EVENT_*)
+    record_nodes: list[int]  # indices in the archive's node list
+    wait_nodes: list[int]
 
 
 class CUDAGraph(ops.CUDAGraph):
