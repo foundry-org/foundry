@@ -72,10 +72,10 @@ The SAVE query is in `analyze_captured_graph` (CUDAGraph.cpp:960-1063). If the f
 
 | Attribute | Rec (JSON) | Binary node table | Applied: SER / JT / BT / MEM | Notes |
 |---|---|---|---|---|
-| `CLUSTER_DIMENSION` | yes when >1 (:1344) | `KNA_CLUSTER_DIM` | yes / yes / yes / yes (MEM first resets to 1x1x1, :531-543) | In the topology key (:1664) unless `FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0` |
+| `CLUSTER_DIMENSION` | yes when any dim > 0, an explicit 1x1x1 included (:1344) | `KNA_CLUSTER_DIM` | yes / yes / yes / yes (MEM first resets to 1x1x1, :531-543) | In the topology key (:1664) unless `FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0` |
 | `PREFERRED_CLUSTER_DIMENSION` | yes (:1351) | `KNA_PREFERRED_CLUSTER_DIM` | yes / yes / yes / yes | |
 | `CLUSTER_SCHEDULING_POLICY_PREFERENCE` | yes (:1360) | yes | yes / yes / yes / yes | |
-| `COOPERATIVE` | yes (:1365) | yes | yes / yes / yes / yes (only when the member has a value; sentinel -1 keeps the template's) | **SER ignores `common_kernel_node_attrs`**. A graph where every kernel is cooperative would silently lose it on SER |
+| `COOPERATIVE` | yes (:1365) | yes | yes / yes / yes / yes (only when the member has a value; sentinel -1 keeps the template's) | |
 | `PRIORITY` | yes (:1368) | yes | yes / yes / yes / yes (same sentinel) | Only effective with `INSTANTIATE_FLAG_USE_NODE_PRIORITY`, which no path uses (section 4) **[doc]** |
 | `MEM_SYNC_DOMAIN`, `MEM_SYNC_DOMAIN_MAP` | yes (:1371/:1374) | yes | yes / yes / yes / yes | |
 | `PREFERRED_SHARED_MEMORY_CARVEOUT` (node) | yes (:1381) | yes | yes / yes / yes / yes | |
@@ -109,7 +109,7 @@ The SAVE query is in `analyze_captured_graph` (CUDAGraph.cpp:960-1063). If the f
 | Item | Rec | App | Det | Notes |
 |---|---|---|---|---|
 | Instantiate flags | no | template exec: `AutoFreeOnLaunch` when the driver is >= 11.4 (CUDAGraph.cpp:479-513). Member exec: 0 (:727) | n/a | Matches torch's capture-time flags for the template. `USE_NODE_PRIORITY`, `DEVICE_LAUNCH` and `UPLOAD` are never used. A graph meant for device launch, or whose node priorities matter, would behave differently **[doc]**. No upload: the first launch pays it |
-| Common kernel attributes ("applied last") | yes: extracted only when **all** kernel nodes have identical attributes (CUDAGraph.cpp:1726-1777) | JT (:811-903) and BT (:1806-1814) apply them. **SER does not read them at all**. JT's common block skips `accessPolicyWindow` and `deviceUpdatable` | no | The binary writer sends common PSS / deviceUpdatable / APW graphs to JT (BinaryGraphIO.cpp:110-122). JT applies common PSS but drops common APW and deviceUpdatable silently |
+| Common kernel attributes ("applied last") | yes: extracted only when **all** kernel nodes have identical attributes (CUDAGraph.cpp:1726-1777) | JT (:811-903) and BT (:1806-1814) apply them, SER merges them under each node's attrs. JT's common block skips `accessPolicyWindow` and `deviceUpdatable` | no | The binary writer sends common PSS / deviceUpdatable / APW graphs to JT (BinaryGraphIO.cpp:110-122). JT applies common PSS but drops common APW and deviceUpdatable silently |
 | Edges (ports, type; `cuGraphAddDependencies_v2`) | yes (CUDAGraph.cpp:1211-1245, :1782-1798), binary v2 | SER, JT, BT (`add_graph_dependencies`), PW (:2002-2015) | `add_graph_dependencies` fails loudly | `core/test_graph_dependencies.py` |
 | Topology key (member grouping) | node type sequence + cluster dims only (CUDAGraph.cpp:1664-1723, LOAD fallback CUDAGraphParallel.cpp:2404) | n/a | **no** | **It excludes edges and ports, function identity, PSS, APW, deviceUpdatable, and whether priority / cooperative / carveout are set.** `save_graph_manifest` strips member deps without comparing them (graph.py:237-249). MEM leaves template values for anything the member does not set (sentinel -1) |
 | Node order / ids | yes | yes (`ordered_nodes`) | `updates.size()==num_nodes` check (:1719) | |
@@ -179,8 +179,7 @@ The SAVE query is in `analyze_captured_graph` (CUDAGraph.cpp:960-1063). If the f
    and a wait becomes a no-op race. Event flags are lost too. How to detect at SAVE: fail, or at least warn, on any
    event node whose partner is not in the same graph. Better, record the event's creator or site.
 7. **Path divergence.**
-   - SER (`CUDAGraph.load`, graph.py:65) ignores `common_kernel_node_attrs` and PSS completely. A graph whose
-     kernels are all cooperative or all PDL loses those attributes.
+   - SER (`CUDAGraph.load`, graph.py:65) ignores PSS completely. A graph whose kernels are all PDL loses it.
    - JT drops *common* APW and deviceUpdatable.
    - MEM never applies PSS, APW or deviceUpdatable.
    - Non-portable common cluster dims get no opt-in.
