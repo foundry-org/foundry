@@ -1212,6 +1212,18 @@ void CUDAGraph::analyze_captured_graph() {
 
   graph_nodes.clear();
   graph_dependencies.clear();
+  attr_query_stats_ = AttrQueryStats{};
+
+  // A failed attribute query below is tolerated (the attribute is not recorded) and counted;
+  // save() reports the counts in one line.
+  auto note_attr_failure = [this](int attr_id, CUresult res) {
+    auto it = attr_query_stats_.failures.find(attr_id);
+    if (it == attr_query_stats_.failures.end()) {
+      attr_query_stats_.failures.emplace(attr_id, std::make_pair(size_t{1}, res));
+    } else {
+      it->second.first++;
+    }
+  };
 
   CUgraph cuGraph = reinterpret_cast<CUgraph>(graph_);
 
@@ -1248,6 +1260,7 @@ void CUDAGraph::analyze_captured_graph() {
       metadata.ctx = params.ctx;
       metadata.sharedMemBytes = params.sharedMemBytes;
 
+      attr_query_stats_.kernel_nodes++;
       {
         CUkernelNodeAttrValue attr_val;
         CUresult res = cuGraphKernelNodeGetAttribute(
@@ -1259,7 +1272,28 @@ void CUDAGraph::analyze_captured_graph() {
           metadata.node_attrs.clusterDimY = attr_val.clusterDim.y;
           metadata.node_attrs.clusterDimZ = attr_val.clusterDim.z;
         } else {
+          // Without the cluster dims LOAD rebuilds the node as a non-cluster launch, and
+          // every other attribute below is skipped for it.
+          const char* env = std::getenv("FOUNDRY_ALLOW_ATTR_QUERY_FAILURE");
+          if (!(env && std::string(env) == "1")) {
+            const char* fname = nullptr;
+            if (params.kern) {
+              cuKernelGetName(&fname, params.kern);
+            } else if (params.func) {
+              cuFuncGetName(&fname, params.func);
+            }
+            const char* err = nullptr;
+            cuGetErrorName(res, &err);
+            TORCH_CHECK(false, "[foundry] SAVE: cuGraphKernelNodeGetAttribute(CLUSTER_DIMENSION) ",
+                        "failed on kernel node ", i, " (", fname ? fname : "<unknown function>",
+                        "): ", err ? err : "unknown error", " (", static_cast<int>(res),
+                        "). A graph rebuilt without its cluster dims runs the wrong launch shape ",
+                        "silently. Set FOUNDRY_ALLOW_ATTR_QUERY_FAILURE=1 to save the node ",
+                        "without attribute data (attrQueryAvailable=false).");
+          }
           metadata.node_attrs.attr_query_available = false;
+          attr_query_stats_.unavailable_nodes++;
+          note_attr_failure(CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, res);
         }
 
         if (metadata.node_attrs.attr_query_available) {
@@ -1270,6 +1304,8 @@ void CUDAGraph::analyze_captured_graph() {
             metadata.node_attrs.preferredClusterDimX = attr_val.preferredClusterDim.x;
             metadata.node_attrs.preferredClusterDimY = attr_val.preferredClusterDim.y;
             metadata.node_attrs.preferredClusterDimZ = attr_val.preferredClusterDim.z;
+          } else {
+            note_attr_failure(CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION, res);
           }
 
           res = cuGraphKernelNodeGetAttribute(
@@ -1278,6 +1314,8 @@ void CUDAGraph::analyze_captured_graph() {
             metadata.node_attrs.has_cluster_scheduling_policy = true;
             metadata.node_attrs.clusterSchedulingPolicyPreference =
                 static_cast<int>(attr_val.clusterSchedulingPolicyPreference);
+          } else {
+            note_attr_failure(CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, res);
           }
 
           res = cuGraphKernelNodeGetAttribute(nodes[i], CU_KERNEL_NODE_ATTRIBUTE_COOPERATIVE,
@@ -1285,6 +1323,8 @@ void CUDAGraph::analyze_captured_graph() {
           if (res == CUDA_SUCCESS) {
             metadata.node_attrs.has_cooperative = true;
             metadata.node_attrs.cooperative = attr_val.cooperative;
+          } else {
+            note_attr_failure(CU_KERNEL_NODE_ATTRIBUTE_COOPERATIVE, res);
           }
 
           res =
@@ -1292,6 +1332,8 @@ void CUDAGraph::analyze_captured_graph() {
           if (res == CUDA_SUCCESS) {
             metadata.node_attrs.has_priority = true;
             metadata.node_attrs.priority = attr_val.priority;
+          } else {
+            note_attr_failure(CU_KERNEL_NODE_ATTRIBUTE_PRIORITY, res);
           }
 
           res = cuGraphKernelNodeGetAttribute(nodes[i], CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN,
@@ -1299,6 +1341,8 @@ void CUDAGraph::analyze_captured_graph() {
           if (res == CUDA_SUCCESS) {
             metadata.node_attrs.has_mem_sync_domain = true;
             metadata.node_attrs.memSyncDomain = attr_val.memSyncDomain;
+          } else {
+            note_attr_failure(CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN, res);
           }
 
           res = cuGraphKernelNodeGetAttribute(
@@ -1307,6 +1351,8 @@ void CUDAGraph::analyze_captured_graph() {
             metadata.node_attrs.has_mem_sync_domain_map = true;
             metadata.node_attrs.memSyncDomainMapDefault = attr_val.memSyncDomainMap.default_;
             metadata.node_attrs.memSyncDomainMapRemote = attr_val.memSyncDomainMap.remote;
+          } else {
+            note_attr_failure(CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN_MAP, res);
           }
 
           res = cuGraphKernelNodeGetAttribute(
@@ -1314,6 +1360,8 @@ void CUDAGraph::analyze_captured_graph() {
           if (res == CUDA_SUCCESS) {
             metadata.node_attrs.has_preferred_shared_mem_carveout = true;
             metadata.node_attrs.preferredSharedMemCarveout = attr_val.sharedMemCarveout;
+          } else {
+            note_attr_failure(CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, res);
           }
 
           res = cuGraphKernelNodeGetAttribute(
@@ -1325,6 +1373,8 @@ void CUDAGraph::analyze_captured_graph() {
             metadata.node_attrs.accessPolicyWindowHitRatio = attr_val.accessPolicyWindow.hitRatio;
             metadata.node_attrs.accessPolicyWindowHitProp = attr_val.accessPolicyWindow.hitProp;
             metadata.node_attrs.accessPolicyWindowMissProp = attr_val.accessPolicyWindow.missProp;
+          } else {
+            note_attr_failure(CU_KERNEL_NODE_ATTRIBUTE_ACCESS_POLICY_WINDOW, res);
           }
 
           res = cuGraphKernelNodeGetAttribute(
@@ -1334,22 +1384,13 @@ void CUDAGraph::analyze_captured_graph() {
             metadata.node_attrs.deviceUpdatable =
                 attr_val.deviceUpdatableKernelNode.deviceUpdatable;
             metadata.node_attrs.deviceUpdatableNode = attr_val.deviceUpdatableKernelNode.devNode;
+          } else {
+            note_attr_failure(CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE, res);
           }
 
-          // Programmatic dependent launch: kernels captured from PDL launches
-          // (cudaLaunchKernelExC with PROGRAMMATIC_STREAM_SERIALIZATION, e.g.
-          // FA3 fwd/combine on sm90) carry this node attribute; a rebuilt
-          // node without it loses the launch overlap the attribute permits.
-          res = cuGraphKernelNodeGetAttribute(
-              nodes[i],
-              static_cast<CUkernelNodeAttrID>(
-                  CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION),
-              &attr_val);
-          if (res == CUDA_SUCCESS) {
-            metadata.node_attrs.has_programmatic_stream_serialization = true;
-            metadata.node_attrs.programmaticStreamSerializationAllowed =
-                attr_val.programmaticStreamSerializationAllowed;
-          }
+          // PROGRAMMATIC_STREAM_SERIALIZATION is a launch-only attribute (CUlaunchAttributeID:
+          // "Valid for launches"); a graph node never reports it. Programmatic dependent
+          // launch is carried by the edge data (ports) below instead.
         }
       }
 
@@ -1696,11 +1737,6 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
           kernel_node_attrs["deviceUpdatable"] = metadata.node_attrs.deviceUpdatable;
           kernel_node_attrs["deviceUpdatableNode"] = static_cast<uint64_t>(
               reinterpret_cast<uintptr_t>(metadata.node_attrs.deviceUpdatableNode));
-        }
-        if (metadata.node_attrs.has_programmatic_stream_serialization &&
-            metadata.node_attrs.programmaticStreamSerializationAllowed != 0) {
-          kernel_node_attrs["programmaticStreamSerialization"] =
-              metadata.node_attrs.programmaticStreamSerializationAllowed;
         }
         params["kernel_node_attrs"] = kernel_node_attrs;
       }
@@ -2095,6 +2131,10 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
   }
 
   root["nodes"] = nodes_array;
+  if (attr_query_stats_.unavailable_nodes > 0) {
+    // LOAD warns from this count (JSON root / .cugraph header) without scanning the nodes.
+    root["kernel_nodes_without_attrs"] = attr_query_stats_.unavailable_nodes;
+  }
 
   json::array deps_array;
   for (const auto& dep : graph_dependencies) {
@@ -2164,6 +2204,37 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
     bin_path += ".cugraph";
   }
   save_binary(bin_path, root);
+
+  // Kernel-node attribute queries that analyze_captured_graph tolerated: those attributes are
+  // not in the archive, so LOAD cannot restore them.
+  const AttrQueryStats& aq = attr_query_stats_;
+  if (aq.unavailable_nodes > 0 || !aq.failures.empty()) {
+    std::ostringstream msg;
+    msg << "[foundry] " << json_path << ": attribute queries on " << aq.kernel_nodes
+        << " kernel node(s): " << aq.unavailable_nodes
+        << " saved without attribute data (attrQueryAvailable=false); failed queries, not "
+           "recorded:";
+    for (const auto& [attr_id, entry] : aq.failures) {
+      const char* err = nullptr;
+      cuGetErrorName(entry.second, &err);
+      msg << " attr " << attr_id << " x" << entry.first << " (" << (err ? err : "?") << ")";
+    }
+    fprintf(stderr, "%s\n", msg.str().c_str());
+  }
+}
+
+size_t saved_attr_query_unavailable(const boost::json::object& root) {
+  auto it = root.find("kernel_nodes_without_attrs");
+  return it == root.end() ? 0 : static_cast<size_t>(it->value().to_number<uint64_t>());
+}
+
+void warn_attr_query_unavailable(const std::string& graph_path, size_t count) {
+  if (count == 0)
+    return;
+  fprintf(stderr,
+          "[foundry] %s: %zu kernel node(s) saved without attribute data "
+          "(attrQueryAvailable=false): cluster dims and launch attributes were not restored\n",
+          graph_path.c_str(), count);
 }
 
 // save_binary is implemented in BinaryGraphIO.cpp
@@ -2178,6 +2249,7 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
   namespace json = boost::json;
   json::value root_val = json::parse(json_str);
   const json::object& root = root_val.as_object();
+  warn_attr_query_unavailable(json_path, saved_attr_query_unavailable(root));
 
   auto graph = std::make_shared<CUDAGraph>(true);
   graph->loaded_graph_resources_ = std::make_unique<LoadedGraphResources>();

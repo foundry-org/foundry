@@ -47,9 +47,6 @@ struct __attribute__((visibility("default"))) KernelNodeMetadata {
     int accessPolicyWindowHitProp = 0;
     int accessPolicyWindowMissProp = 0;
 
-    bool has_programmatic_stream_serialization = false;
-    int programmaticStreamSerializationAllowed = 0;
-
     bool has_device_updatable = false;
     int deviceUpdatable = 0;
     CUgraphDeviceNode deviceUpdatableNode = nullptr;

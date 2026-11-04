@@ -365,6 +365,10 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
   memcpy(header.magic, bf::MAGIC, 8);
   header.version = bf::FORMAT_VERSION;
   header.flags = 0;
+  header.kernel_nodes_without_attrs =
+      root.contains("kernel_nodes_without_attrs")
+          ? root.at("kernel_nodes_without_attrs").to_number<uint32_t>()
+          : 0;
   if (has_common_attrs)
     header.flags |= bf::FLAG_HAS_COMMON_KERNEL_ATTRS;
   if (!deps.empty())
@@ -675,6 +679,9 @@ boost::json::value read_and_parse_binary_graph(const std::string& bin_path) {
   // Topology key
   auto [tk_data, tk_size] = section(bf::SECTION_TOPOLOGY_KEY);
   root["topology_key"] = std::string(reinterpret_cast<const char*>(tk_data), tk_size);
+  if (header.kernel_nodes_without_attrs > 0) {
+    root["kernel_nodes_without_attrs"] = header.kernel_nodes_without_attrs;
+  }
 
   // Common kernel attrs
   if (has_common) {

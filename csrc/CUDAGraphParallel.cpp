@@ -1877,9 +1877,13 @@ void CUDAGraph::link_on_demand_shared_exec(CUDAGraph& graph,
       CUkernelNodeAttrValue cluster{}, preferred{};
       C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeGetAttribute(
           shared_exec->ordered_nodes[i], CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &cluster));
-      C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeGetAttribute(
-          shared_exec->ordered_nodes[i], CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION,
-          &preferred));
+      // Not every driver reports this attribute (580.105.08 returns INVALID_VALUE,
+      // "Invalid kernel attribute: 11"); analyze_captured_graph ignores the same
+      // failure at SAVE, so read it as unset here too.
+      if (cuGraphKernelNodeGetAttribute(shared_exec->ordered_nodes[i],
+                                        CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION,
+                                        &preferred) != CUDA_SUCCESS)
+        preferred = CUkernelNodeAttrValue{};
       const auto& attrs = update.kernel_attrs;
       TORCH_CHECK(cluster.clusterDim.x == attrs.clusterDimX &&
                       cluster.clusterDim.y == attrs.clusterDimY &&
@@ -2288,6 +2292,8 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       // ---- Binary path: extract metadata directly from binary sections ----
       namespace bf = binary_format;
       const auto& bf_data = bin_files[i];
+      // Every builder this graph reaches (template, eager member, on-demand) starts here.
+      warn_attr_query_unavailable(json_paths[i], bf_data.header.kernel_nodes_without_attrs);
 
       // Build minimal JSON for prepare_graph_shell (it only reads generators
       // and sets up the graph shell — doesn't touch nodes).
@@ -2339,6 +2345,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
     } else {
       // ---- JSON path: original flow ----
       boost::json::object& pre_root = parsed_jsons[i].as_object();
+      warn_attr_query_unavailable(json_paths[i], saved_attr_query_unavailable(pre_root));
 
       auto gen_it = pre_root.find("generators");
       if (gen_it != pre_root.end()) {
