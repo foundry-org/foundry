@@ -104,9 +104,11 @@ struct CUDAGraph {
   const std::vector<LoadedEvent>& loaded_events() const;
   // Point every record/wait node of each given event_id at the caller's event
   // in this graph's own exec (cuGraphExec{EventRecord,EventWait}NodeSetEvent);
-  // remembered and re-applied if the exec is re-instantiated. The caller keeps
-  // the events alive while the graph replays. Graphs on a shared exec
-  // (FOUNDRY_ENABLE_EXEC_SHARE=1) are not supported.
+  // remembered and re-applied if the exec is re-instantiated. On a shared exec
+  // (FOUNDRY_ENABLE_EXEC_SHARE=1) the events go into this graph's on-demand
+  // updates, which every switch to it applies, and into the exec at once when
+  // this graph is the one on it. The caller keeps the events alive while the
+  // graph replays.
   void bind_events(const std::vector<std::pair<int, CUevent>>& events);
 
   void reset();
@@ -336,6 +338,8 @@ struct CUDAGraph {
   };
   // Apply bound_events to exec (no-op when nothing is bound).
   void apply_event_bindings(CUgraphExec exec);
+  // bind_events on a shared exec in share mode (events already validated).
+  void bind_shared_exec_events(const std::vector<std::pair<int, CUevent>>& events);
   std::unique_ptr<LoadedGraphResources> loaded_graph_resources_;
 
  public:

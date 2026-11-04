@@ -164,9 +164,9 @@ indices in the archive's node list, and `event`, a `foundry.RestoredEvent`: a
 `graph.bind_events({event_id: event})`
 points every record/wait node of that `event_id` in the graph's exec at a
 `torch.cuda.Event` (or `CUevent` handle) of the host process, e.g. to time a
-replay. Supported for graphs with an exec of their own (`CUDAGraph.load`, and
-`start_graph_builds` in eager mode); a graph on a shared exec
-(`FOUNDRY_ENABLE_EXEC_SHARE=1`) raises.
+replay. On a shared exec (`FOUNDRY_ENABLE_EXEC_SHARE=1`) the binding belongs
+to the graph: it is part of the on-demand updates every switch to that graph
+applies, so the other graphs of the group keep recording their own events.
 
 ## Knobs
 

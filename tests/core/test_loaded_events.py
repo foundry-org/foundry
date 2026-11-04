@@ -19,9 +19,12 @@ they measure must match SAVE's, and the outputs stay bit for bit SAVE's.
 LOAD APIs: ``load`` (CUDAGraph.load), ``builds`` (start_graph_builds +
 finish_graph_loads, eager; on ``group`` the member replays its own exec),
 ``builds_json`` (the same from a copy of the JSON without its .cugraph, so the
-template is built from the JSON). A ``builds`` LOAD with
-FOUNDRY_ENABLE_EXEC_SHARE=1 must refuse bind_events (still listing the
-events) and replay unchanged.
+template is built from the JSON). ``share`` (FOUNDRY_ENABLE_EXEC_SHARE=1):
+on ``single`` as above; on ``group`` the template and the member are bound
+to the same two torch events and replayed in turn, each replay measuring
+its own graph's span. ``share_member``: only the member is bound; the
+template's replays record its own events (timed through its RestoredEvents)
+and leave the member's alone.
 """
 
 import json
@@ -192,10 +195,79 @@ def _check_restored(graph, events):
     torch.cuda.synchronize()
 
 
+def _check_span(label, bound, native):
+    print(
+        f"[test] {label}: bound span {bound * 1e3:.1f} us vs native {native * 1e3:.1f} us "
+        f"({(bound / native - 1) * 100:+.1f} %)"
+    )
+    assert abs(bound - native) <= max(REL_TOL * native, ABS_TOL_MS), (
+        f"{label}: bound span {bound:.4f} ms vs native {native:.4f} ms"
+    )
+
+
+def _replay_in_turn(loaded, rounds, after=None):
+    """Replay the graphs in turn (graph 0, 1, ..., 0, 1, ...) ``rounds`` times,
+    synchronizing after each replay; ``after(gi)`` runs after graph gi's."""
+    for _ in range(rounds):
+        for gi, (graph, _) in enumerate(loaded):
+            graph.replay()
+            torch.cuda.synchronize()
+            if after:
+                after(gi)
+
+
+def _check_outputs_in_turn(loaded, want, what):
+    replays = [[] for _ in loaded]
+    _replay_in_turn(loaded, 2, lambda gi: replays[gi].append(loaded[gi][1].cpu().clone()))
+    for gi, got in enumerate(replays):
+        assert_bit_exact(got, want[gi], f"{what} graph {gi}")
+
+
+def _share_alternating(loaded, listings, native, want):
+    """Template and member bound to the same two torch events, replayed in turn:
+    each replay's span is the replayed graph's."""
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    for (graph, _), events in zip(loaded, listings):
+        graph.bind_events({events[0].event_id: start, events[-1].event_id: end})
+    spans = [[] for _ in loaded]
+    _replay_in_turn(loaded, TIMING_REPLAYS, lambda gi: spans[gi].append(start.elapsed_time(end)))
+    for gi, times in enumerate(spans):
+        _check_span(f"share, in turn: graph {gi}", statistics.median(times), native[gi])
+    _check_outputs_in_turn(loaded, want, "share, in turn")
+
+
+def _share_member_only(loaded, listings, native, want):
+    """Only the member bound: the template's replays keep recording its own
+    events (RestoredEvents) and leave the member's bound ones alone."""
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    member = listings[1]
+    loaded[1][0].bind_events({member[0].event_id: start, member[-1].event_id: end})
+    tmpl_first, tmpl_last = listings[0][0].event, listings[0][-1].event
+    spans = [[], []]
+
+    def after(gi):
+        if gi == 0:
+            assert tmpl_first.query() and tmpl_last.query()
+            spans[0].append(tmpl_first.elapsed_time(tmpl_last))
+            if spans[1]:
+                assert start.elapsed_time(end) == spans[1][-1], (
+                    "the template's replay recorded the member's bound events"
+                )
+        else:
+            spans[1].append(start.elapsed_time(end))
+
+    _replay_in_turn(loaded, TIMING_REPLAYS, after)
+    tmpl_span = statistics.median(spans[0])
+    _check_span("share, member bound: template (own events)", tmpl_span, native[0])
+    _check_span("share, member bound: member", statistics.median(spans[1]), native[1])
+    _check_outputs_in_turn(loaded, want, "share, member bound")
+
+
 def _run_load(archive, layout, load_api, share):
     import foundry as fdry
 
-    share = share == "share"
     fdry.load_cuda_modules_and_libraries("hook_archive")
     x = _prefix()
     want = load_reference(archive, [x])
@@ -221,37 +293,28 @@ def _run_load(archive, layout, load_api, share):
     listings = [_check_listing(graph, path) for (graph, _), path in zip(loaded, paths)]
     for (graph, _), events in zip(loaded, listings):
         _check_restored(graph, events)
+        with pytest.raises(RuntimeError, match="no event_id"):
+            graph.bind_events({EVENT_CHAIN + 100: torch.cuda.Event(enable_timing=True)})
+    if share != "eager" and layout == "group":
+        {"share": _share_alternating, "share_member": _share_member_only}[share](
+            loaded, listings, native, want
+        )
+        for gi, (graph, _) in enumerate(loaded):
+            assert [e.handle for e in graph.loaded_events()] == [e.handle for e in listings[gi]]
+        fdry.stop_allocation_region()
+        return
     timers = []
-    for gi, ((graph, out), events) in enumerate(zip(loaded, listings)):
-        name = os.path.basename(paths[gi])
+    for (graph, out), events in zip(loaded, listings):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        first, last = events[0].event_id, events[-1].event_id
-        if share:
-            with pytest.raises(RuntimeError, match="FOUNDRY_ENABLE_EXEC_SHARE"):
-                graph.bind_events({first: start, last: end})
-            print(f"[test] {name} exec share: bind_events refused")
-            continue
-        with pytest.raises(RuntimeError, match="no event_id"):
-            graph.bind_events({EVENT_CHAIN + 100: start})
-        graph.bind_events({first: start, last: end})
+        graph.bind_events({events[0].event_id: start, events[-1].event_id: end})
         timers.append((start, end))
     for gi, (graph, out) in enumerate(loaded):
         assert [e.handle for e in graph.loaded_events()] == [e.handle for e in listings[gi]]
         assert_bit_exact(_replay_twice(graph, out), want[gi], f"{load_api} graph {gi} replays")
-    if share:
-        fdry.stop_allocation_region()
-        return
     for gi, ((graph, out), (start, end)) in enumerate(zip(loaded, timers)):
         bound = _span_ms(graph, start, end)
-        print(
-            f"[test] {layout}/{load_api} {os.path.basename(paths[gi])}: bound span "
-            f"{bound * 1e3:.1f} us vs native {native[gi] * 1e3:.1f} us "
-            f"({(bound / native[gi] - 1) * 100:+.1f} %)"
-        )
-        assert abs(bound - native[gi]) <= max(REL_TOL * native[gi], ABS_TOL_MS), (
-            f"graph {gi}: bound span {bound:.4f} ms vs native {native[gi]:.4f} ms"
-        )
+        _check_span(f"{layout}/{load_api}/{share} {os.path.basename(paths[gi])}", bound, native[gi])
         assert_bit_exact(_replay_twice(graph, out), want[gi], f"graph {gi} after timing")
     fdry.stop_allocation_region()
 
@@ -281,10 +344,11 @@ def saved(tmp_path_factory):
         ("group", "builds", "eager"),
         ("group", "builds_json", "eager"),
         ("group", "builds", "share"),
+        ("group", "builds", "share_member"),
     ],
 )
 def test_loaded_events(saved, layout, load_api, share):
-    env = {"FOUNDRY_ENABLE_EXEC_SHARE": "1"} if share == "share" else {}
+    env = {"FOUNDRY_ENABLE_EXEC_SHARE": "1"} if share != "eager" else {}
     log = run_phase(__file__, "load", saved(layout), layout, load_api, share, env=env)
     if layout == "group" and share == "eager":
         assert "1 on-demand" in log, "group archive did not load as template + member"

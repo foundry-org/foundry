@@ -83,9 +83,9 @@ class LoadedEvent(NamedTuple):
     - ``graph.bind_events({event_id: torch.cuda.Event | int})`` makes the
       graph's exec record / wait the given events (every record and wait node
       of each event_id) instead of the rebuilt ones. Keep the events alive while
-      the graph replays. Graphs with an exec of their own only (``load``, or
-      ``start_graph_builds`` without FOUNDRY_ENABLE_EXEC_SHARE=1); raises on an
-      exec-share graph.
+      the graph replays. With FOUNDRY_ENABLE_EXEC_SHARE=1 the binding belongs
+      to the graph, not the shared exec: every switch of the exec to the graph
+      applies it, and other graphs of the group keep their own events.
     """
 
     event_id: int  # as in the archive
