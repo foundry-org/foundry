@@ -12,6 +12,8 @@
 #include "metadata.h"
 
 #include <vector>
+#include <map>
+#include <utility>
 #include <memory>
 #include <atomic>
 #include <variant>
@@ -87,6 +89,26 @@ struct CUDAGraph {
   void instantiate();
   void replay();
   std::string exec_share_stats() const;
+
+  // LOAD rebuilds each EventRecord/EventWait node's event privately (with the
+  // flags SAVE recorded). One entry per archived event_id, in order of first
+  // appearance; node indices are positions in the archive's node list.
+  struct LoadedEvent {
+    int event_id = -1;
+    CUevent event = nullptr;  // the event LOAD created (kept alive with the graph)
+    unsigned int flags = 0;
+    std::vector<size_t> record_nodes;
+    std::vector<size_t> wait_nodes;
+  };
+  // Empty for a captured (not loaded) graph.
+  const std::vector<LoadedEvent>& loaded_events() const;
+  // Point every record/wait node of each given event_id at the caller's event
+  // in this graph's own exec (cuGraphExec{EventRecord,EventWait}NodeSetEvent);
+  // remembered and re-applied if the exec is re-instantiated. The caller keeps
+  // the events alive while the graph replays. Graphs on a shared exec
+  // (FOUNDRY_ENABLE_EXEC_SHARE=1) are not supported.
+  void bind_events(const std::vector<std::pair<int, CUevent>>& events);
+
   void reset();
   MempoolId_t pool();
   void enable_debug_mode();
@@ -304,7 +326,16 @@ struct CUDAGraph {
 
   struct LoadedGraphResources {
     std::vector<CUevent> created_events;
+    std::vector<LoadedEvent> events;
+    // CUDAGraph::load: event node handles by node index (on-demand graphs use
+    // shared_exec->ordered_nodes).
+    std::map<size_t, CUgraphNode> event_nodes;
+    std::map<int, CUevent> bound_events;  // bind_events, re-applied on re-instantiate
+    // Record a rebuilt event's node; the first sighting of event_id adds its entry.
+    void note_event(int event_id, CUevent event, unsigned int flags, size_t node_idx, bool record);
   };
+  // Apply bound_events to exec (no-op when nothing is bound).
+  void apply_event_bindings(CUgraphExec exec);
   std::unique_ptr<LoadedGraphResources> loaded_graph_resources_;
 
  public:

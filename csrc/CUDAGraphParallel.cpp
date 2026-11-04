@@ -364,6 +364,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
 
   std::unordered_map<int, CUgraphNode> id_to_node;
   std::unordered_map<int, CUevent> event_id_to_event;
+  graph->loaded_graph_resources_->events.clear();
 
   // Owning storage for kernel params (must outlive cuGraphAddKernelNode)
   std::vector<std::vector<std::vector<uint8_t>>> all_kernel_params;
@@ -782,6 +783,9 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         event = event_id_to_event[event_id];
       }
       C10_CUDA_DRIVER_CHECK(cuGraphAddEventRecordNode(&cuNode, cuGraph, nullptr, 0, event));
+      graph->loaded_graph_resources_->note_event(
+          event_id, event, saved_event_flags(params),
+          static_cast<size_t>(&node_val - nodes_array.data()), true);
 
     } else if (node_type == "EventWaitNode") {
       int event_id = params.at("event_id").to_number<int>();
@@ -794,6 +798,9 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         event = event_id_to_event[event_id];
       }
       C10_CUDA_DRIVER_CHECK(cuGraphAddEventWaitNode(&cuNode, cuGraph, nullptr, 0, event));
+      graph->loaded_graph_resources_->note_event(
+          event_id, event, saved_event_flags(params),
+          static_cast<size_t>(&node_val - nodes_array.data()), false);
 
     } else if (node_type == "EmptyNode") {
       C10_CUDA_DRIVER_CHECK(cuGraphAddEmptyNode(&cuNode, cuGraph, nullptr, 0));
@@ -1063,6 +1070,13 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
 
   // Track events by ID so record/wait pairs share the same CUevent
   std::unordered_map<int, CUevent> event_id_to_event;
+  // Reuse the events of a graph built before (JSON template: build_graph_from_parsed
+  // created the events its exec records); the node list below is rebuilt.
+  if (graph->loaded_graph_resources_) {
+    for (const auto& e : graph->loaded_graph_resources_->events)
+      event_id_to_event.emplace(e.event_id, e.event);
+    graph->loaded_graph_resources_->events.clear();
+  }
 
   for (size_t idx = 0; idx < nodes_array.size(); ++idx) {
     const json::object& node_obj = nodes_array[idx].as_object();
@@ -1284,6 +1298,11 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
         event = eit->second;
       }
       u.event = event;
+      if (!graph->loaded_graph_resources_) {
+        graph->loaded_graph_resources_ = std::make_unique<LoadedGraphResources>();
+      }
+      graph->loaded_graph_resources_->note_event(event_id, event, saved_event_flags(params), idx,
+                                                 true);
 
     } else if (node_type == "EventWaitNode") {
       u.type = OnDemandNodeUpdate::EventWait;
@@ -1301,6 +1320,11 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
         event = eit->second;
       }
       u.event = event;
+      if (!graph->loaded_graph_resources_) {
+        graph->loaded_graph_resources_ = std::make_unique<LoadedGraphResources>();
+      }
+      graph->loaded_graph_resources_->note_event(event_id, event, saved_event_flags(params), idx,
+                                                 false);
 
     } else if (node_type == "EmptyNode") {
       u.type = OnDemandNodeUpdate::Empty;
@@ -1415,6 +1439,13 @@ void CUDAGraph::prepare_on_demand_graph_binary(const BinaryGraphFile& bin_file,
   const uint8_t* abd = bin_file.arg_buffer_data();
 
   std::unordered_map<int, CUevent> event_id_to_event;
+  // Reuse the events of a graph built before (JSON template: build_graph_from_parsed
+  // created the events its exec records); the node list below is rebuilt.
+  if (graph->loaded_graph_resources_) {
+    for (const auto& e : graph->loaded_graph_resources_->events)
+      event_id_to_event.emplace(e.event_id, e.event);
+    graph->loaded_graph_resources_->events.clear();
+  }
 
   for (uint32_t idx = 0; idx < num_nodes; idx++) {
     const bf::BinNodeEntry& entry = nodes[idx];
@@ -1571,6 +1602,11 @@ void CUDAGraph::prepare_on_demand_graph_binary(const BinaryGraphFile& bin_file,
           event = eit->second;
         }
         u.event = event;
+        if (!graph->loaded_graph_resources_) {
+          graph->loaded_graph_resources_ = std::make_unique<LoadedGraphResources>();
+        }
+        graph->loaded_graph_resources_->note_event(event_id, event, entry.event.flags, idx,
+                                                   entry.type == bf::NODE_EVENT_RECORD);
         break;
       }
       case bf::NODE_EMPTY:
