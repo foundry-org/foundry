@@ -153,6 +153,21 @@ it, so archives saved before this need no migration. If the recorded dims miss
 a compiled cluster, the add retries once after reading the compiled dims from
 the driver. Test: `tests/core/test_cluster_optin.py` (driver-level, no archive).
 
+## Events of a loaded graph
+
+LOAD rebuilds each EventRecord/EventWait node with an event of its own,
+created with the flags SAVE recorded. `graph.loaded_events()` lists them per
+archived `event_id` (`LoadedEvent`: handle, flags, record and wait node
+indices in the archive's node list, and `event`, a `foundry.RestoredEvent`: a
+`torch.cuda.Event` subclass whose `query`, `synchronize`, `elapsed_time`,
+`record` and `wait` act on the LOAD-created handle);
+`graph.bind_events({event_id: event})`
+points every record/wait node of that `event_id` in the graph's exec at a
+`torch.cuda.Event` (or `CUevent` handle) of the host process, e.g. to time a
+replay. On a shared exec (`FOUNDRY_ENABLE_EXEC_SHARE=1`) the binding belongs
+to the graph: it is part of the on-demand updates every switch to that graph
+applies, so the other graphs of the group keep recording their own events.
+
 ## Knobs
 
 | Knob | Where | Effect |

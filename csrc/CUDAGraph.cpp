@@ -640,6 +640,7 @@ void CUDAGraph::instantiate() {
   }
   graph_exec_ = instantiate_graph_exec(graph_);
   has_graph_exec_ = true;
+  apply_event_bindings(reinterpret_cast<CUgraphExec>(graph_exec_));
 }
 
 cudaGraphExec_t CUDAGraph::instantiate_graph_exec(cudaGraph_t graph) {
@@ -895,6 +896,7 @@ void CUDAGraph::instantiate_member_exec() {
   }
   on_demand_data_->own_exec = reinterpret_cast<CUgraphExec>(exec);
   on_demand_data_->owns_exec = true;
+  apply_event_bindings(on_demand_data_->own_exec);
 }
 
 void CUDAGraph::replay() {
@@ -2728,6 +2730,12 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
       }
 
       C10_CUDA_DRIVER_CHECK(cuGraphAddEventRecordNode(&cuNode, cuGraph, nullptr, 0, event));
+      {
+        const size_t node_idx = static_cast<size_t>(&node_val - nodes_array.data());
+        auto& res = *graph->loaded_graph_resources_;
+        res.note_event(event_id, event, saved_event_flags(params), node_idx, true);
+        res.event_nodes[node_idx] = cuNode;
+      }
 
     } else if (node_type == "EventWaitNode") {
       int event_id = params.at("event_id").to_number<int>();
@@ -2742,6 +2750,12 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
       }
 
       C10_CUDA_DRIVER_CHECK(cuGraphAddEventWaitNode(&cuNode, cuGraph, nullptr, 0, event));
+      {
+        const size_t node_idx = static_cast<size_t>(&node_val - nodes_array.data());
+        auto& res = *graph->loaded_graph_resources_;
+        res.note_event(event_id, event, saved_event_flags(params), node_idx, false);
+        res.event_nodes[node_idx] = cuNode;
+      }
 
     } else if (node_type == "EmptyNode") {
       C10_CUDA_DRIVER_CHECK(cuGraphAddEmptyNode(&cuNode, cuGraph, nullptr, 0));
@@ -2829,6 +2843,139 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
   }
 
   return result;
+}
+
+void CUDAGraph::LoadedGraphResources::note_event(int event_id, CUevent event, unsigned int flags,
+                                                 size_t node_idx, bool record) {
+  auto it = std::find_if(events.begin(), events.end(),
+                         [&](const LoadedEvent& e) { return e.event_id == event_id; });
+  if (it == events.end()) {
+    events.push_back(LoadedEvent{event_id, event, flags, {}, {}});
+    it = std::prev(events.end());
+  }
+  (record ? it->record_nodes : it->wait_nodes).push_back(node_idx);
+}
+
+const std::vector<CUDAGraph::LoadedEvent>& CUDAGraph::loaded_events() const {
+  static const std::vector<LoadedEvent> none;
+  return loaded_graph_resources_ ? loaded_graph_resources_->events : none;
+}
+
+void CUDAGraph::apply_event_bindings(CUgraphExec exec) {
+  if (!loaded_graph_resources_ || loaded_graph_resources_->bound_events.empty() || !exec)
+    return;
+  auto& res = *loaded_graph_resources_;
+  const std::vector<CUgraphNode>* ordered = on_demand_data_ && on_demand_data_->shared_exec
+                                                ? &on_demand_data_->shared_exec->ordered_nodes
+                                                : nullptr;
+  auto node_at = [&](size_t idx) -> CUgraphNode {
+    if (ordered) {
+      TORCH_CHECK(idx < ordered->size(), "bind_events: node ", idx, " out of range (",
+                  ordered->size(), " nodes)");
+      return (*ordered)[idx];
+    }
+    auto it = res.event_nodes.find(idx);
+    TORCH_CHECK(it != res.event_nodes.end(), "bind_events: no node handle for node ", idx);
+    return it->second;
+  };
+  for (const auto& e : res.events) {
+    auto b = res.bound_events.find(e.event_id);
+    if (b == res.bound_events.end())
+      continue;
+    for (size_t idx : e.record_nodes)
+      C10_CUDA_DRIVER_CHECK(cuGraphExecEventRecordNodeSetEvent(exec, node_at(idx), b->second));
+    for (size_t idx : e.wait_nodes)
+      C10_CUDA_DRIVER_CHECK(cuGraphExecEventWaitNodeSetEvent(exec, node_at(idx), b->second));
+  }
+}
+
+void CUDAGraph::bind_events(const std::vector<std::pair<int, CUevent>>& events) {
+  TORCH_CHECK(loaded_graph_resources_ && !loaded_graph_resources_->events.empty(),
+              "bind_events: graph has no events rebuilt by LOAD");
+  auto& res = *loaded_graph_resources_;
+  for (const auto& [event_id, event] : events) {
+    TORCH_CHECK(event, "bind_events: null event for event_id ", event_id);
+    TORCH_CHECK(std::any_of(res.events.begin(), res.events.end(),
+                            [&](const LoadedEvent& e) { return e.event_id == event_id; }),
+                "bind_events: graph has no event_id ", event_id);
+  }
+  CUgraphExec exec = nullptr;
+  if (on_demand_data_) {
+    TORCH_CHECK(on_demand_data_->shared_exec, "bind_events: ", on_demand_data_->graph_name,
+                " is not linked to its template (LOAD Phase 2 did not finish)");
+    if (on_demand_data_->shared_exec->share) {
+      bind_shared_exec_events(events);
+      return;
+    }
+    exec = on_demand_data_->own_exec;
+    TORCH_CHECK(exec, "bind_events: ", on_demand_data_->graph_name,
+                " has no exec (LOAD Phase 2 did not finish)");
+  } else {
+    TORCH_CHECK(has_graph_exec_, "bind_events: graph has no exec");
+    exec = reinterpret_cast<CUgraphExec>(graph_exec_);
+  }
+  auto previous = res.bound_events;
+  for (const auto& [event_id, event] : events)
+    res.bound_events[event_id] = event;
+  try {
+    apply_event_bindings(exec);
+  } catch (...) {
+    res.bound_events = std::move(previous);
+    throw;
+  }
+}
+
+void CUDAGraph::bind_shared_exec_events(const std::vector<std::pair<int, CUevent>>& events) {
+  // A switch to this graph (replay) writes its updates, events included, onto the builder
+  // graph and cuGraphExecUpdate carries them into the shared exec, so the binding goes into
+  // the updates. When this graph is the one on the exec (current_params_id), the exec and the
+  // builder graph get the events directly. replay_mutex keeps a switch out meanwhile.
+  auto& res = *loaded_graph_resources_;
+  auto& shared = *on_demand_data_->shared_exec;
+  auto& updates = on_demand_data_->updates;
+  std::lock_guard<std::mutex> lock(shared.replay_mutex);
+  const bool resident = shared.current_params_id == on_demand_data_->graph_id;
+  auto previous_bound = res.bound_events;
+  std::vector<std::pair<size_t, CUevent>> previous_events;  // (update index, event)
+  auto set_event = [&](size_t idx, CUevent event, bool record) {
+    TORCH_CHECK(idx < updates.size() && idx < shared.ordered_nodes.size(), "bind_events: node ",
+                idx, " out of range (", updates.size(), " updates)");
+    auto& u = updates[idx];
+    const auto want = record ? OnDemandNodeUpdate::EventRecord : OnDemandNodeUpdate::EventWait;
+    TORCH_CHECK(u.type == want, "bind_events: ", on_demand_data_->graph_name, " node ", idx,
+                " is not an event ", record ? "record" : "wait", " node");
+    previous_events.emplace_back(idx, u.event);
+    u.event = event;
+    if (!resident)
+      return;
+    CUgraphNode node = shared.ordered_nodes[idx];
+    if (record) {
+      C10_CUDA_DRIVER_CHECK(cuGraphEventRecordNodeSetEvent(node, event));
+      C10_CUDA_DRIVER_CHECK(cuGraphExecEventRecordNodeSetEvent(shared.exec, node, event));
+    } else {
+      C10_CUDA_DRIVER_CHECK(cuGraphEventWaitNodeSetEvent(node, event));
+      C10_CUDA_DRIVER_CHECK(cuGraphExecEventWaitNodeSetEvent(shared.exec, node, event));
+    }
+  };
+  try {
+    for (const auto& [event_id, event] : events) {
+      const auto& e = *std::find_if(res.events.begin(), res.events.end(),
+                                    [&](const LoadedEvent& le) { return le.event_id == event_id; });
+      for (size_t idx : e.record_nodes)
+        set_event(idx, event, true);
+      for (size_t idx : e.wait_nodes)
+        set_event(idx, event, false);
+      res.bound_events[event_id] = event;
+    }
+  } catch (...) {
+    for (auto it = previous_events.rbegin(); it != previous_events.rend(); ++it)
+      updates[it->first].event = it->second;
+    res.bound_events = std::move(previous_bound);
+    // The exec may hold part of the binding: the next replay switches it from the updates.
+    if (resident)
+      shared.current_params_id = -1;
+    throw;
+  }
 }
 
 std::shared_ptr<PendingGraphLoads> CUDAGraph::start_graph_builds(

@@ -23,6 +23,8 @@ from .allocation_region import (
 from .ops import *  # isort: skip
 from .graph import (
     CUDAGraph,
+    LoadedEvent,
+    RestoredEvent,
     graph,
     save_graph_manifest,
 )
@@ -33,6 +35,8 @@ from .graph import (
 # (We also configure per-file-ignores for F401 in pyproject.toml as a backstop.)
 __all__ = [
     "CUDAGraph",
+    "LoadedEvent",
+    "RestoredEvent",
     "allocation_region",
     "free_preallocated_region",
     "get_current_alloc_offset",
