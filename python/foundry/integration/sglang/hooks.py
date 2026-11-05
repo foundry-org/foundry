@@ -157,6 +157,47 @@ def _after_runner_distributed_init() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _waited(barrier):
+    def waited_barrier(self, *args, **kwargs):
+        work = barrier(self, *args, **kwargs)
+        if work is not None:
+            work.wait()
+        return work
+
+    return waited_barrier
+
+
+_barrier_wait_installed = False
+
+
+def _wait_on_barrier_works() -> None:
+    """Make ``ProcessGroup.barrier()`` finish on the calling thread.
+
+    The barrier is an async all-reduce of a 4-byte CUDA tensor that torch keeps
+    alive until the returned Work is waited on. A caller that drops the Work
+    (DeepEP v2's ``ElasticBuffer.__init__``) leaves the release to the NCCL
+    watchdog thread, at a run-dependent moment: the freed block then is or is
+    not a hole in torch's small pool when the graph layout allocates its host
+    buffers, and LOAD's buffers miss the addresses SAVE's graphs hold (EAGLE3
+    on a DeepEP v2 target: draft-decode index out of bounds, or a lower accept
+    length). Waiting releases the tensor at the call, on both modes."""
+    global _barrier_wait_installed
+    if _barrier_wait_installed:
+        return
+    from torch._C import _distributed_c10d as c10d
+
+    patched = []
+    for name in ("ProcessGroup", "Backend"):
+        cls = getattr(c10d, name, None)
+        if cls is not None and "barrier" in vars(cls):
+            cls.barrier = _waited(cls.barrier)
+            patched.append(name)
+    _barrier_wait_installed = True
+    logger.info(
+        "[Foundry] barrier works are waited on at the call (%s)", ", ".join(patched) or "none"
+    )
+
+
 def _disable_dynamo() -> None:
     """Scheduler process: besides the ``TORCHDYNAMO_DISABLE=1`` pin (read when
     ``torch.compile`` decorates), set ``torch._dynamo.config.disable``, which
@@ -175,6 +216,8 @@ def before_parallel_init(device: str) -> None:
     if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
         return
     _disable_dynamo()
+    _wait_on_barrier_works()
+    rt.hold_cyclic_gc()
     from sglang.srt.runtime_context import get_device, get_parallel
 
     parallel = get_parallel()

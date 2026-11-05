@@ -274,6 +274,33 @@ def allocation_region_suspended():
         cge.resume_allocation_region()
 
 
+_gc_held = False
+
+
+def hold_cyclic_gc() -> None:
+    """Keep Python's cyclic collector off until the layout starts.
+
+    Model loading leaves tensors in reference cycles (EAGLE3: two draft linear
+    weights, 110 MB). The collector frees them when its allocation counters
+    trip, which the weight-loading threads move from run to run, so a later
+    allocation (the draft's RoPE cache) takes the freed block on some runs and
+    another one on others, and LOAD's buffers miss the addresses SAVE's graphs
+    hold. With the collector off, cycles are freed only by the explicit
+    collections both modes run at the same points (memory-pool resolution,
+    layout start)."""
+    global _gc_held
+    if gc.isenabled():
+        gc.disable()
+        _gc_held = True
+
+
+def _release_cyclic_gc() -> None:
+    global _gc_held
+    if _gc_held:
+        gc.enable()
+        _gc_held = False
+
+
 def mark_layout_start() -> None:
     """Begin the deterministic layout; the same sequence point on SAVE and LOAD.
 
@@ -292,6 +319,7 @@ def mark_layout_start() -> None:
         return
     gc.collect()
     torch.cuda.empty_cache()
+    _release_cyclic_gc()
     if cfg.mode != CUDAGraphExtensionMode.SAVE:
         return
     _layout_start_offset = cge.get_current_alloc_offset()

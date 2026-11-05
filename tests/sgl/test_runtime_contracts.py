@@ -72,3 +72,50 @@ def test_capture_state_check_names_unbuilt_dispatchers():
         check_capture_state_prebuilt(model)
     model.moe.dispatcher.prebuild()
     check_capture_state_prebuilt(model)
+
+
+def test_barrier_work_is_waited_on_at_the_call():
+    """A barrier Work dropped unwaited leaves its 4-byte CUDA tensor to the NCCL
+    watchdog thread, whose release time shifts the host buffers of the graph
+    layout; the wrapper must wait before returning the Work."""
+    from foundry.integration.sglang.hooks import _waited
+
+    class Work:
+        waits = 0
+
+        def wait(self):
+            self.waits += 1
+
+    work = Work()
+    assert _waited(lambda self, *args, **kwargs: work)(None) is work
+    assert work.waits == 1
+    assert _waited(lambda self: None)(None) is None
+
+
+def test_process_group_exposes_barrier():
+    """_wait_on_barrier_works wraps ``barrier`` on torch's ProcessGroup class."""
+    from torch._C import _distributed_c10d as c10d
+
+    assert "barrier" in vars(c10d.ProcessGroup)
+
+
+def test_cyclic_gc_is_held_until_the_layout_starts():
+    """Between before_parallel_init and mark_layout_start only explicit collections
+    may free reference cycles; the collector's own timing moves allocations."""
+    import gc
+
+    from foundry.integration.sglang import runtime as rt
+
+    was_enabled = gc.isenabled()
+    gc.enable()
+    try:
+        rt.hold_cyclic_gc()
+        assert not gc.isenabled()
+        rt._release_cyclic_gc()
+        assert gc.isenabled()
+        gc.disable()
+        rt.hold_cyclic_gc()  # already off: not ours to turn back on
+        rt._release_cyclic_gc()
+        assert not gc.isenabled()
+    finally:
+        gc.enable() if was_enabled else gc.disable()
