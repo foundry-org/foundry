@@ -70,15 +70,13 @@ with its all-reduce through torch symmetric memory (validated attn-TP + EP rows 
   collective, which a capturing stream rejects (seen on the attention-TP sub-group's first reduce-scatter of
   Qwen3.5-35B-A3B attention-TP2 + EP4). Foundry issues small and large all-reduce / all-gather / reduce-scatter on
   every initialized group through sglang's coordinators before capture.
-- **SAVE-side runtime-init bootstrap** (`bootstrap_lazy_runtimes`, first capture scope). Two
-  one-time initializations are illegal while a stream is capturing and would otherwise fire
-  inside the first captured forward: inductor's pattern-matcher lazy init (an unpinned
-  host-to-device copy) and DeepGEMM's runtime init (`cudaFree(nullptr)`). SAVE runs them
-  directly, with the allocation region suspended so their transient tensors never move the
-  deterministic cursor. Everything else the model does lazily (torch.compile of its
-  functions, DeepGEMM per-shape JIT compile and `cuLibraryLoadFromFile`) happens inside the
-  captured forward and is recorded like any other capture-time event. No eager forward runs
-  on either mode, and SAVE and LOAD reach the layout start at the same cursor.
+- **SAVE-side runtime-init bootstrap** (`bootstrap_lazy_runtimes`, first capture scope). DeepGEMM's
+  one-time runtime init (`cudaFree(nullptr)`) is illegal while a stream is capturing and would
+  otherwise fire inside the first captured forward, so SAVE runs it directly (allocation-free).
+  `torch.compile` is pinned off (`TORCHDYNAMO_DISABLE=1`). Everything else the model does lazily
+  (DeepGEMM per-shape JIT compile and `cuLibraryLoadFromFile`) happens inside the captured forward
+  and is recorded like any other capture-time event. No eager forward runs on either mode, and
+  SAVE and LOAD reach the layout start at the same cursor.
 - **No backend-specific code.** LOAD runs the upstream loop, so sglang itself re-creates all per-shape host state
   (FlashInfer / fa3 / hybrid decode metadata, the `deepep_adapter` captured mode, TBO / LoRA buffers) exactly as on
   SAVE. Restored graphs never run `run_once`, so they carry no in-graph shared-read marker; SGLang's

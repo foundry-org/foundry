@@ -319,11 +319,9 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
     # 2. sglang's prebuilt state (both modes): DeepEP / Mooncake /
     #    symmetric-memory state is built by sglang's warmup; check it.
     check_capture_state_prebuilt(model)
-    # 3. SAVE only, every model: the two one-time runtime initializations
-    #    capture rejects (inductor's lazy init, DeepGEMM's runtime init), with
-    #    the allocation region suspended so their transient tensors never move
-    #    the deterministic cursor. The model's own compiles and JIT kernel
-    #    loads then happen inside the captured forward.
+    # 3. SAVE only: DeepGEMM's one-time runtime init, which capture rejects
+    #    (allocation-free; the region stays suspended around it). The model's
+    #    JIT kernel loads then happen inside the captured forward.
     if mode == CUDAGraphExtensionMode.SAVE:
         with rt.allocation_region_suspended():
             bootstrap_lazy_runtimes()

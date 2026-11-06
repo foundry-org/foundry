@@ -733,99 +733,19 @@ def bootstrap_flashinfer_tactics(cache_path: str | None) -> None:
     )
 
 
-def install_capture_autotune_guard() -> None:
-    """SAVE-only: turn inductor's Triton autotuning inside the capture window
-    into a clear error.
-
-    A freshly compiled inductor kernel with several candidate configs is
-    benchmarked on its first run (``CachingAutotuner.benchmark_all_configs``),
-    and the benchmark synchronizes the device, which the capturing stream
-    rejects ("operation not permitted when stream is capturing") and the whole
-    capture then fails with an unrelated-looking error. With a warm inductor
-    cache (``autotune_local_cache``) the best config is loaded and nothing is
-    benchmarked, so SAVE succeeds; this is why SAVE passes after a plain sglang
-    run of the same model on the same machine and fails cold. The guard does
-    not change behaviour, it names the cause and the remedy.
-    """
-    try:
-        import torch
-        from torch._inductor.runtime import triton_heuristics
-    except Exception as exc:  # pragma: no cover - inductor layout changed
-        logger.warning("[Foundry] capture-time autotune guard not installed: %s", exc)
-        return
-    cls = triton_heuristics.CachingAutotuner
-    orig = cls.benchmark_all_configs
-    if getattr(orig, "_foundry_capture_guard", False):
-        return
-
-    def benchmark_all_configs(self, *args, **kwargs):
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "[Foundry] inductor wants to autotune a freshly compiled Triton kernel inside "
-                "the capture window; its benchmark synchronizes the device, which capture "
-                "forbids. Warm the JIT caches first: run plain sglang with the same decode-graph "
-                "set once for this model on this machine (same SGLANG_CACHE_DIR / "
-                "TORCHINDUCTOR_CACHE_DIR), then SAVE."
-            )
-        return orig(self, *args, **kwargs)
-
-    benchmark_all_configs._foundry_capture_guard = True  # type: ignore[attr-defined]
-    cls.benchmark_all_configs = benchmark_all_configs
-
-
 def bootstrap_lazy_runtimes() -> None:
-    """SAVE-only: perform, outside any stream capture, the one-time runtime
-    initializations that capture rejects, so that the model's own compiles and
-    JIT kernel loads can happen inside the captured forward and be recorded
-    like every other capture-time event (no eager warmup forward).
+    """SAVE-only: DeepGEMM's one-time runtime init, outside any stream capture.
 
-    * torch.compile / inductor: its pattern-matcher lazy init traces example
-      graphs and copies unpinned host tensors to the device, which fails inside
-      capture ("Cannot copy between CPU and CUDA tensors during CUDA graph
-      capture"). The three lazy_init entry points run it once; the tensors are
-      transient. Dynamo tracing, inductor codegen and Triton compiles are host
-      work and module loads, legal during capture.
-    * DeepGEMM: the first JIT call builds its runtime, which calls
-      cudaFree(nullptr) and probes nvcc; get_num_sms() goes through the same
-      device object. Allocation-free.
+    The first DeepGEMM JIT call builds its runtime, which calls
+    cudaFree(nullptr) and probes nvcc, both rejected inside a capture;
+    get_num_sms() goes through the same device object. Allocation-free. LOAD
+    does not need it: restore compiles nothing, and its first eager request
+    performs the init outside capture, as native sglang does.
 
-    LOAD needs neither: restore compiles nothing, and LOAD's first eager
-    request performs these inits outside capture, as native sglang does. The
-    caller runs this with the allocation region suspended, so the transient
-    tensors are plain driver allocations and the deterministic cursor is the
-    same on SAVE and LOAD afterwards.
+    torch.compile needs nothing here: TORCHDYNAMO_DISABLE=1 is pinned
+    (pins.ENV_PINS), so no inductor compile runs in an engine.
     """
-    import torch
-
     t0 = time.perf_counter()
-    device = torch.device("cuda", torch.cuda.current_device())
-    # inductor guards its pattern-matcher initializers with a functools.cache
-    # keyed on the "input device" it derives from the compiled function's first
-    # tensor input (None when there is none). Warm every key a compile can
-    # produce: a trivial compile of a CUDA function runs the whole pipeline
-    # (dynamo, joint-graph and post-grad passes, one Triton kernel) for the
-    # CUDA key; the initializers are then run directly for the None and CPU
-    # keys.
-    torch.compile(lambda x: x * 2 + 1, dynamic=True)(torch.ones(8, device=device))
-    # Only the joint-graph initializers are device-keyed (pad_mm / sfdp / misc
-    # patterns trace example tensors on `input_device`, which is where the
-    # unpinned host-to-device copy happens). pre_grad and post_grad register
-    # global patterns once, and a second call raises "Duplicate pattern";
-    # the trivial compile above already ran them. Guard every call on its
-    # own: one failure must not skip the remaining keys (that skip let
-    # GLM-5.3-Flash's DSA indexer compile run _sfdp_init inside capture).
-    try:
-        from torch._inductor.fx_passes import joint_graph
-
-        keys = (None, torch.device("cpu"), torch.device("cuda"), device)
-        for key in keys:
-            try:
-                joint_graph.lazy_init(key)
-            except Exception as exc:
-                logger.warning("[Foundry] inductor joint_graph.lazy_init(%s) failed: %s", key, exc)
-    except Exception as exc:
-        logger.warning("[Foundry] inductor lazy_init warm-up unavailable: %s", exc)
-    install_capture_autotune_guard()
     try:
         import deep_gemm
 
