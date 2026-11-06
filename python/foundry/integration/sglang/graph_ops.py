@@ -659,7 +659,7 @@ def bootstrap_flashinfer_tactics(cache_path: str | None) -> None:
     before any capture): give the captured kernels FlashInfer's tuned tactics
     without a tuning pass.
 
-    The plugin pins ``--disable-flashinfer-autotune`` because the tuning pass
+    Foundry pins ``--disable-flashinfer-autotune`` because the tuning pass
     benchmarks every tactic of every shape inside the recorded allocation
     sequence, with timing-dependent allocations SAVE and LOAD cannot repeat.
     The tactics themselves are static: a plain SGLang start of the same model

@@ -34,9 +34,9 @@ installed (or its integration API major mismatches), SGLang stops at startup wit
 reason instead of running natively; see
 [`recipe/sglang/README.md`](../../recipe/sglang/README.md#activation---cuda-graph-persistence).
 
-On SAVE / LOAD, Foundry's resolution hooks pin the configs that select unreplayable state
+On SAVE / LOAD, Foundry's resolution steps pin the configs that select unreplayable state
 (NCCL registration / cuMem / NVLS, DeepGEMM precompile, and the rest) and stop the launch
-if one was set to the contrary ([`overview.md`](overview.md#what-the-plugin-pins-and-why));
+if one was set to the contrary ([`overview.md`](overview.md#what-foundry-pins-and-why));
 the scripts pass the collective flags (`--disable-custom-all-reduce --enable-torch-symm-mem`)
 in every mode so baseline, SAVE and LOAD capture the same graph set.
 
@@ -122,8 +122,7 @@ archives too.
 SAVE (success):
 
 ```
-[Foundry] SGLang hooks installing: mode=save workspace=foundry_archive_qwen_1.7b
-[Foundry] SGLang hooks installed
+[Foundry] SGLang graph persistence active: mode=save workspace=foundry_archive_qwen_1.7b
 Foundry SGLang integration activated from .../save_qwen_1.7b.toml
 [Foundry] SGLang rank=0 workspace_dir=foundry_archive_qwen_1.7b/rank_0
 [Foundry] SGLang graph extension setup completed in 0.x s
@@ -144,8 +143,7 @@ INFO:     Application startup complete.
 LOAD (success):
 
 ```
-[Foundry] SGLang hooks installing: mode=load workspace=foundry_archive_qwen_1.7b
-[Foundry] SGLang hooks installed
+[Foundry] SGLang graph persistence active: mode=load workspace=foundry_archive_qwen_1.7b
 [Foundry] SGLang graph extension setup completed in 0.x s
 [Foundry] SGLang reused saved memory pool config
 [Foundry] SGLang kernel_warmup skipped in load mode

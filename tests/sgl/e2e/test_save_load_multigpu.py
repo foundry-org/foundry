@@ -27,9 +27,6 @@ backend's out-of-graph metadata is decode-only; the DSV4 backend rejects EXTEND)
 
 Overrides: FOUNDRY_E2E_MAXBS (decode max batch size per rank, default 64; the recipes use 256),
 FOUNDRY_E2E_WEIGHTS=dummy|real (default per case).
-
-Runs on whichever route the installed sglang has (_sglang_helpers.foundry_launch): the --cuda-graph-persistence
-flags when sglang has the Foundry adapter, the plugin's environment variable otherwise.
 """
 
 import os

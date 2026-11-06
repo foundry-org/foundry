@@ -2,14 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Tier markers by directory, device-count skips, and the shared fixtures.
 
-    tests/unit         no marker      no GPU device; foundry.ops importable
-    tests/core         gpu            1 GPU
-    tests/multigpu     gpu multigpu   2 GPUs
-    tests/sgl          sglang         sglang installed, no GPU (dir named sgl: tests/ is on sys.path,
-                                      a tests/sglang/ would shadow the package)
-    tests/sgl/e2e      + gpu slow     engine launches (multi-GPU cases add multigpu / xlarge)
-
-test_plugin_route.py and test_plugin_hook_points.py also get ``plugin_route``.
+tests/unit         no marker      no GPU device; foundry.ops importable
+tests/core         gpu            1 GPU
+tests/multigpu     gpu multigpu   2 GPUs
+tests/sgl          sglang         sglang installed, no GPU (dir named sgl: tests/ is on sys.path,
+                                  a tests/sglang/ would shadow the package)
+tests/sgl/e2e      + gpu slow     engine launches (multi-GPU cases add multigpu / xlarge)
 """
 
 from __future__ import annotations
@@ -26,7 +24,6 @@ _DIR_MARKS = {
     "sgl": ("sglang",),
 }
 _E2E_MARKS = ("gpu", "slow")
-_PLUGIN_ROUTE_FILES = {"test_plugin_route.py", "test_plugin_hook_points.py"}
 _MIN_DEVICES = {"gpu": 1, "multigpu": 2, "xlarge": 4}
 
 
@@ -38,8 +35,6 @@ def _tier_marks(path: Path) -> list[str]:
     marks = list(_DIR_MARKS.get(parts[0], ())) if len(parts) > 1 else []
     if parts[:2] == ("sgl", "e2e"):
         marks += _E2E_MARKS
-    if parts[-1] in _PLUGIN_ROUTE_FILES:
-        marks.append("plugin_route")
     return marks
 
 

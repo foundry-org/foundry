@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 """Runtime call-site functions of the Foundry SGLang integration, called
-from SGLang's own call sites (dependency route, through ``api.py``), and the
-plugin route's wrappers (``install``) that call them from patched SGLang
-functions."""
+from SGLang's own call sites through ``api.py``."""
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
-import functools
 import gc
 import logging
-import os
 import threading
 import time
 from dataclasses import asdict
@@ -21,12 +17,9 @@ from foundry.integration.sglang import runtime as rt
 from foundry.integration.sglang.config import (
     CUDAGraphExtensionMode,
     get_graph_extension_mode,
-    get_workspace_root,
-    load_graph_extension_config,
 )
 
 logger = logging.getLogger(__name__)
-_INSTALLED = False
 
 
 def _workspace_ranks(parallel) -> tuple[int, int, int | None]:
@@ -44,41 +37,6 @@ def _workspace_ranks(parallel) -> tuple[int, int, int | None]:
     ``config.compute_workspace_rank`` takes the replica from it
     (``config.dp_replica``)."""
     return parallel.tp_rank, parallel.pp_rank, parallel.dp_rank
-
-
-def install(cfg_path: str | None) -> None:
-    """Install the runtime patches for the TOML at ``cfg_path`` (idempotent).
-    Reached from the sglang plugin (``foundry.integration.sglang.plugin``) in
-    every process that runs ``load_plugins()``."""
-    global _INSTALLED
-    if not cfg_path:
-        return
-    if _INSTALLED:
-        return
-
-    t0_ns = os.environ.get("FOUNDRY_SPAWN_T0_NS")
-    if t0_ns:
-        logger.info(
-            "[Foundry] SGLang spawn -> install: %.1f ms",
-            (time.perf_counter_ns() - int(t0_ns)) / 1e6,
-        )
-
-    load_graph_extension_config(cfg_path)
-    logger.info(
-        "[Foundry] SGLang hooks installing: mode=%s workspace=%s",
-        get_graph_extension_mode().value,
-        get_workspace_root(),
-    )
-
-    from sglang.srt.distributed import bootstrap
-
-    _patch_init_parallel_runtime(bootstrap)
-    _patch_alloc_memory_pool()
-    _patch_cuda_graph_capture()
-    _patch_spawn_sites()
-
-    _INSTALLED = True
-    logger.info("[Foundry] SGLang hooks installed")
 
 
 def _resolve_triton_key():
@@ -157,9 +115,7 @@ def _after_runner_distributed_init() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Call-site functions. The dependency route (api.py) calls them from SGLang's
-# own call sites; the plugin route (install) wraps SGLang's functions with
-# them. Both routes therefore run the same code at the same sequence points.
+# Call-site functions (api.py calls them from SGLang's own call sites).
 # ---------------------------------------------------------------------------
 
 
@@ -237,13 +193,6 @@ def before_parallel_init(device: str) -> None:
     )
 
 
-def after_parallel_init() -> None:
-    """End of ``bootstrap.init_parallel_runtime``."""
-    if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
-        return
-    rt.log_alloc_offset("after_init_parallel_runtime")
-
-
 def after_runner_distributed_init(is_draft_worker: bool) -> None:
     """End of ``ModelRunner.init_torch_distributed``. Draft
     workers reuse the target's groups and never reach init_parallel_runtime;
@@ -260,7 +209,7 @@ def after_runner_distributed_init(is_draft_worker: bool) -> None:
 # (get_context().override, e.g. max_mamba_cache_size for hybrid
 # Mamba/GDN/KDA models); the pool factories read them from the bags, so LOAD
 # must replay them when it skips the resolver. Filled by
-# record_memory_pool_overrides, persisted by after_alloc_memory_pool.
+# record_memory_pool_overrides, persisted by record_memory_pool_config.
 _resolve_overrides: list = []
 _resolve_log_start: int | None = None
 
@@ -346,33 +295,13 @@ def _save_memory_pool_state(memory_pool_config) -> None:
 def record_memory_pool_config(memory_pool_config) -> None:
     """End of ``_resolve_memory_pool_config`` (API 2.3), SAVE: keep the
     resolver's context overrides and write them with the resolved
-    MemoryPoolConfig into ``warmup_state.json``. Same content as the 2.2 pair
-    record_memory_pool_overrides + after_alloc_memory_pool: the configurator
-    hands this config object unchanged to the pools and back to
+    MemoryPoolConfig into ``warmup_state.json``. The configurator hands this
+    config object unchanged to the pools and back to
     ``ModelRunner.memory_pool_config``."""
     if get_graph_extension_mode() != CUDAGraphExtensionMode.SAVE:
         return
     record_memory_pool_overrides()
     _save_memory_pool_state(memory_pool_config)
-
-
-def before_alloc_memory_pool(is_draft_worker: bool) -> None:
-    """Head of ``ModelRunner.alloc_memory_pool``. Draft-worker pools reuse the
-    target's resolved config upstream and are left alone."""
-    if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE or is_draft_worker:
-        return
-    rt.log_alloc_offset("before_init_memory_pool")
-
-
-def after_alloc_memory_pool(memory_pool_config, is_draft_worker: bool) -> None:
-    """End of ``ModelRunner.alloc_memory_pool``: SAVE records the resolved
-    MemoryPoolConfig and the resolver's context overrides."""
-    mode = get_graph_extension_mode()
-    if mode == CUDAGraphExtensionMode.NONE or is_draft_worker:
-        return
-    rt.log_alloc_offset("after_init_memory_pool")
-    if mode == CUDAGraphExtensionMode.SAVE:
-        _save_memory_pool_state(memory_pool_config)
 
 
 def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> None:
@@ -507,7 +436,7 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
 
     # SAVE: capture directly, no warm-up forwards (their freed activations
     # would leave cached segments LOAD cannot reproduce). Dynamo is pinned off
-    # (plugin.ENV_PINS), as it refuses to trace inside a capture.
+    # (pins.ENV_PINS), as it refuses to trace inside a capture.
     from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
 
     from foundry.integration.sglang.graph_ops import capture_graph, save_graph
@@ -685,7 +614,7 @@ def capture_scope(
     kind: str | None = None,
     flashinfer_tactics: str | None = None,
 ):
-    """Prefill or decode capture scope (both routes): ``phase`` is
+    """Prefill or decode capture scope: ``phase`` is
     ``"prefill"`` (with the runner's ``req_slots``, which every
     :func:`capture_one` inside uses) or ``"decode"`` (with the decode-type
     runner's ``kind``; None means ``target_decode``, the integration API 2.0
@@ -716,246 +645,12 @@ def capture_scope(
         _scope = None
 
 
-def shared_read_ends_override(runner, attn_backend, forward_mode):
-    """LOAD-mode WAR barrier for ``DecodeCudaGraphRunner._resolve_shared_read_ends``.
-
-    Restored graphs carry no usable in-graph shared-read marker
-    (in_graph_metadata_prep_done stays None), and upstream's fallback for that
-    case is PRE_REPLAY — which fences the scheduler's shared-buffer writes
-    BEFORE the replay that still reads them (upstream's own TODO calls
-    POST_REPLAY the sound one). Fence after replay instead. Returns None to
-    keep upstream's answer. Called on every decode replay."""
-    if (
-        get_graph_extension_mode() != CUDAGraphExtensionMode.LOAD
-        or runner.in_graph_metadata_prep_done is not None
-    ):
-        return None
-    from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-
-    if attn_backend.shared_read_ends(forward_mode) is SharedReadEnds.IN_REPLAY:
-        return SharedReadEnds.POST_REPLAY
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Plugin route: wrap SGLang's functions with the call-site functions above.
-# ---------------------------------------------------------------------------
-
-
-def _patch_init_parallel_runtime(bootstrap) -> None:
-    from sglang.srt.model_executor import model_runner as mr
-
-    orig = bootstrap.init_parallel_runtime
-
-    @functools.wraps(orig)
-    def patched(*args, **kwargs):
-        if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
-            return orig(*args, **kwargs)
-        # Keyword-only upstream: (*, server_args, device, dist_port).
-        from sglang.srt.runtime_context import get_device
-
-        before_parallel_init(kwargs.get("device", get_device().device))
-        result = orig(*args, **kwargs)
-        after_parallel_init()
-        return result
-
-    # Scheduler.__init__ calls it as ``bootstrap.init_parallel_runtime``, so
-    # the module attribute is the dispatch target.
-    bootstrap.init_parallel_runtime = patched
-
-    cls = mr.ModelRunner
-    orig_runner_init = cls.init_torch_distributed
-
-    @functools.wraps(orig_runner_init)
-    def patched_runner_init(self, *args, **kwargs):
-        result = orig_runner_init(self, *args, **kwargs)
-        after_runner_distributed_init(self.is_draft_worker)
-        return result
-
-    cls.init_torch_distributed = patched_runner_init
-
-
-def _patch_alloc_memory_pool() -> None:
-    """Plugin route for begin/record_memory_pool_overrides and
-    before/after_alloc_memory_pool."""
-    from sglang.srt.mem_cache import kv_cache_configurator as kvc_mod
-    from sglang.srt.model_executor import model_runner as mr
-
-    orig_resolve = kvc_mod.KVCacheConfigurator._resolve_memory_pool_config
-
-    @functools.wraps(orig_resolve)
-    def patched_resolve(self, pre_model_load_memory):
-        replayed = replay_saved_memory_pool_config()
-        if replayed is not None:
-            return replayed
-        config = orig_resolve(self, pre_model_load_memory)
-        record_memory_pool_overrides()
-        return config
-
-    kvc_mod.KVCacheConfigurator._resolve_memory_pool_config = patched_resolve
-
-    cls = mr.ModelRunner
-    orig_alloc = cls.alloc_memory_pool
-
-    @functools.wraps(orig_alloc)
-    def patched_alloc(self, *args, **kwargs):
-        before_alloc_memory_pool(self.is_draft_worker)
-        result = orig_alloc(self, *args, **kwargs)
-        after_alloc_memory_pool(self.memory_pool_config, self.is_draft_worker)
-        return result
-
-    cls.alloc_memory_pool = patched_alloc
-
-
-def _patch_cuda_graph_capture() -> None:
-    from sglang.srt.model_executor.runner import (
-        decode_cuda_graph_runner as dcgr,
-    )
-    from sglang.srt.model_executor.runner import (
-        prefill_cuda_graph_runner as pcgr,
-    )
-    from sglang.srt.model_executor.runner_backend import (
-        full_cuda_graph_backend as fcgb,
-    )
-
-    # Graph-pool borrow / precarve, the metadata glue graph and the
-    # memory-saver graph context are pinned off by the plugin's environment
-    # pins (plugin.ENV_PINS), applied before this process started.
-
-    backend_cls = fcgb.FullCudaGraphBackend
-    runner_cls = dcgr.DecodeCudaGraphRunner
-    prefill_runner_cls = pcgr.PrefillCudaGraphRunner
-    orig_capture_one = backend_cls.capture_one
-    orig_capture = runner_cls.capture
-    orig_prefill_capture = prefill_runner_cls.capture
-    orig_resolve_ends = runner_cls._resolve_shared_read_ends
-
-    @functools.wraps(orig_capture_one)
-    def patched_capture_one(
-        self, shape_key, forward_fn, capture_inputs=None, post_warmup_hook=None
-    ):
-        if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
-            return orig_capture_one(
-                self,
-                shape_key,
-                forward_fn,
-                capture_inputs=capture_inputs,
-                post_warmup_hook=post_warmup_hook,
-            )
-        graph, out = capture_one(
-            shape_key, forward_fn, pool=self._pool, stream=self._capture_stream
-        )
-        self._graphs[shape_key] = graph
-        self._outputs[shape_key] = out
-
-    @functools.wraps(orig_prefill_capture)
-    def patched_prefill_capture(self):
-        if not self._is_full_backend:
-            raise RuntimeError(
-                "[Foundry] prefill CUDA graphs are persisted for the full backend only, "
-                f"got {self.prefill_backend_name!r}: use --cuda-graph-backend-prefill "
-                "full or disabled"
-            )
-        with capture_scope("prefill", self.model_runner.model, self._capture_req_slots):
-            return orig_prefill_capture(self)
-
-    @functools.wraps(orig_capture)
-    def patched(self):
-        reject_unsupported_decode_runner(self)
-        with capture_scope("decode", self.model_runner.model, kind=decode_runner_kind(self)):
-            return orig_capture(self)
-
-    @functools.wraps(orig_resolve_ends)
-    def patched_resolve_ends(self, attn_backend, forward_mode):
-        override = shared_read_ends_override(self, attn_backend, forward_mode)
-        if override is not None:
-            return override
-        return orig_resolve_ends(self, attn_backend, forward_mode)
-
-    backend_cls.capture_one = patched_capture_one
-    runner_cls.capture = patched
-    prefill_runner_cls.capture = patched_prefill_capture
-    runner_cls._resolve_shared_read_ends = patched_resolve_ends
-
-    if os.environ.get("FOUNDRY_SGLANG_CAPTURE_TRACE") == "1":
-        # Diagnostic: log every shape the capture loop (SAVE and LOAD) asks
-        # sglang for, and which one fails. sglang's per-shape metadata sizing runs inside
-        # capture_one_shape before any foundry code for that shape, so a
-        # failure there is state carried over from earlier shapes.
-        orig_capture_one_shape = runner_cls.capture_one_shape
-
-        @functools.wraps(orig_capture_one_shape)
-        def traced_capture_one_shape(self, size, forward, *args, **kwargs):
-            width = getattr(self, "captured_req_width", 1)
-            logger.info(
-                "[Foundry] capture shape size=%d num_tokens=%d ragged=%s max_bs=%s",
-                size,
-                size * width,
-                getattr(self, "ragged_verify_mode", None),
-                getattr(self, "max_bs", None),
-            )
-            t0 = time.perf_counter()
-            try:
-                result = orig_capture_one_shape(self, size, forward, *args, **kwargs)
-            except Exception:
-                logger.error("[Foundry] capture shape size=%d FAILED", size)
-                raise
-            logger.info(
-                "[Foundry] capture shape size=%d done in %.1f ms",
-                size,
-                1000 * (time.perf_counter() - t0),
-            )
-            return result
-
-        runner_cls.capture_one_shape = traced_capture_one_shape
-
-
-def _patch_spawn_sites() -> None:
-    try:
-        from sglang.srt.entrypoints import engine as engine_mod
-    except Exception:
-        engine_mod = None
-
-    if engine_mod is not None:
-        engine_cls = engine_mod.Engine
-        # Upstream calls it as ``cls._launch_scheduler_processes(...)`` and
-        # subclasses override it (RayEngine): keep it a classmethod so a
-        # subclass inheriting it still receives its own ``cls``.
-        orig_launch = engine_cls.__dict__["_launch_scheduler_processes"].__func__
-
-        @functools.wraps(orig_launch)
-        def patched_launch(cls, *args, **kwargs):
-            if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-                server_args = args[0] if args else kwargs.get("server_args")
-                _check_resolved_graph_config(server_args)
-                rt.setup_ld_preload_env(server_args)
-            return orig_launch(cls, *args, **kwargs)
-
-        engine_cls._launch_scheduler_processes = classmethod(patched_launch)
-
-    try:
-        from sglang.srt.managers import data_parallel_controller as dpc
-    except Exception:
-        dpc = None
-
-    if dpc is not None:
-        orig_start = dpc.DataParallelController.launch_tensor_parallel_group
-
-        @functools.wraps(orig_start)
-        def patched_start(self, *args, **kwargs):
-            if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-                rt.setup_ld_preload_env()
-            return orig_start(self, *args, **kwargs)
-
-        dpc.DataParallelController.launch_tensor_parallel_group = patched_start
-
-
 def _check_resolved_graph_config(server_args) -> None:
     """Launcher, before any scheduler is spawned: the record must have been
     resolved with Foundry's graph pins (decode ``full``, prefill ``full`` or
-    ``disabled``). They are declared by the plugin's resolution hooks; a
-    record resolved before the plugin loaded would otherwise
-    start without them and SAVE / LOAD would disagree with the archive."""
+    ``disabled``). They are declared by :func:`api.pin_server_args`; a record
+    resolved without them would start without them and SAVE / LOAD would
+    disagree with the archive."""
     if server_args is None:
         return
     try:
@@ -973,56 +668,5 @@ def _check_resolved_graph_config(server_args) -> None:
             "[Foundry] the resolved CUDA-graph config is "
             f"decode={decode!r} prefill={prefill!r}; Foundry needs decode 'full' and "
             "prefill 'full' or 'disabled'. The server args were resolved without "
-            "Foundry's resolution hooks: load plugins (sglang.srt.plugins.load_plugins) "
-            "before resolving them, or pass the Foundry config at launch."
-        )
-
-
-def decode_runner_kind(runner) -> str:
-    """Plugin route: the decode-type scope kind of ``runner`` (a
-    ``DecodeCudaGraphRunner`` or subclass), derived as SGLang's dependency
-    route derives it at its call site (``DecodeCudaGraphRunner.capture``):
-    ``<target|draft>_<verify|extend|forward mode>``."""
-    role = "draft" if runner.model_runner.is_draft_worker else "target"
-    mode = runner.capture_forward_mode
-    if mode.is_target_verify():
-        return f"{role}_verify"
-    if mode.is_draft_extend_v2():
-        return f"{role}_extend"
-    return f"{role}_{mode.name.lower()}"
-
-
-def reject_unsupported_decode_runner(runner) -> None:
-    """Runtime guard at the first decode capture, both modes and layouts.
-
-    Things Foundry's archive cannot represent and that cannot all be seen
-    from the server args (they depend on the GPU or on the model config):
-    - a decode backend other than ``FullCudaGraphBackend``;
-    - attention graph variants (``ShapeKey.attention_variant``, e.g. DSV4.1
-      candidate-indexer graphs on SM100, the HIP DSA dual graph);
-    - elastic-EP CUDA-graph recapture (upstream #33723): a scale event drops
-      and recaptures the decode graphs after startup, which LOAD cannot
-      replay from the archive."""
-    from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
-        FullCudaGraphBackend,
-    )
-
-    backend = getattr(runner, "backend", None)
-    if not isinstance(backend, FullCudaGraphBackend):
-        raise RuntimeError(
-            "[Foundry] decode CUDA graphs must use the full backend, got "
-            f"{type(backend).__name__}; Foundry pins --cuda-graph-backend-decode full"
-        )
-    if getattr(runner, "attention_graph_variants", None) is not None:
-        raise RuntimeError(
-            "[Foundry] this model captures attention graph variants "
-            f"({type(runner.attention_graph_variants).__name__}); Foundry save/load "
-            "does not support graph variants"
-        )
-    model_runner = getattr(runner, "model_runner", None)
-    elastic = getattr(model_runner, "_elastic_cuda_graph_enabled", None)
-    if callable(elastic) and elastic():
-        raise RuntimeError(
-            "[Foundry] elastic-EP CUDA-graph recapture is enabled (elastic EP with "
-            "--max-ep-size > tp size); Foundry cannot restore recaptured graphs"
+            "Foundry's pins (--cuda-graph-persistence)."
         )

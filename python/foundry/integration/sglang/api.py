@@ -1,17 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
-"""Stable API for SGLang's in-tree Foundry adapter (dependency route).
+"""Stable API for SGLang's in-tree Foundry adapter.
 
 SGLang declares Foundry as an optional dependency and calls these functions
 from its own call sites, through ``sglang.srt.utils.foundry_adapter``, when
-``--cuda-graph-persistence {save,load}`` is given. Nothing here patches SGLang
-and nothing reads ``FOUNDRY_GRAPH_EXTENSION_CONFIG`` (that variable belongs to
-the general-plugin route, ``foundry_sglang_plugin``, which refuses to run on
-an SGLang that has the adapter).
-
-The implementation is shared with the plugin route: the resolution pins and
-rejects live in :mod:`.plugin`, the call-site functions in :mod:`.hooks`, so
-both routes run the same code at the same sequence points.
+``--cuda-graph-persistence {save,load}`` is given. Nothing here patches SGLang.
+The resolution pins and rejects live in :mod:`.pins`, the call-site functions
+in :mod:`.hooks`.
 
 Compatibility: SGLang checks :data:`INTEGRATION_API_VERSION` at activation.
 The major number changes when a function below is removed or changes its
@@ -55,7 +50,7 @@ prefill runner ``capture``                       :func:`capture_scope`
 ``FullCudaGraphBackend.capture_one``             :func:`capture_one` (replaces the body)
 ===============================================  =========================================
 
-Every function except :func:`activate` and :func:`is_active` requires an
+Every function except :func:`activate` requires an
 active process (:func:`activate` ran in it).
 """
 
@@ -75,10 +70,6 @@ MODES = ("save", "load")
 FLAG = "--cuda-graph-persistence"
 
 _active: tuple[str, str | None] | None = None
-
-
-def is_active() -> bool:
-    return _active is not None
 
 
 def activate(*, mode: str, config_path: str | None = None) -> None:
@@ -103,25 +94,19 @@ def activate(*, mode: str, config_path: str | None = None) -> None:
             )
         return
 
-    from foundry.integration.sglang import hooks, plugin
+    from foundry.integration.sglang import pins
     from foundry.integration.sglang.config import (
         get_graph_extension_mode,
         get_workspace_root,
         load_graph_extension_config,
     )
 
-    if hooks._INSTALLED or plugin._ACTIVATED:
-        raise RuntimeError(
-            "[Foundry] the general plugin already patched this process "
-            f"({plugin.CONFIG_ENV} is set); use either {FLAG} or the plugin, not both"
-        )
     if config_path is not None and not os.path.isfile(config_path):
         raise FileNotFoundError(f"{FLAG}-config {config_path!r} does not exist")
 
     t0_ns = os.environ.get("FOUNDRY_SPAWN_T0_NS")
     load_graph_extension_config(config_path, mode=mode)
-    plugin.use_flag_labels(FLAG)
-    plugin.apply_env_pins()
+    pins.apply_env_pins()
     _active = key
     if t0_ns:
         logger.info(
@@ -156,12 +141,12 @@ def pin_server_args(server_args: Any) -> None:
     """Before ``apply_inkling_prefill_cuda_graph_default``: pin decode ``full``,
     prefill ``full`` / ``disabled`` (default ``disabled``), profiling and
     FlashInfer autotune off, and every flag that selects state Foundry cannot
-    replay (``plugin.FIELD_PINS``); conflicting user values raise."""
+    replay (``pins.FIELD_PINS``); conflicting user values raise."""
     _require_active()
-    from foundry.integration.sglang import plugin
+    from foundry.integration.sglang import pins
 
-    plugin.pin_graph_fields(server_args)
-    plugin.pin_unreplayable_fields(server_args)
+    pins.pin_graph_fields(server_args)
+    pins.pin_unreplayable_fields(server_args)
 
 
 def validate_resolved_server_args(server_args: Any) -> None:
@@ -172,12 +157,12 @@ def validate_resolved_server_args(server_args: Any) -> None:
     after the later cascades, and pin the environment including
     ``NCCL_CUMEM_ENABLE`` (left alone for ``--moe-a2a-backend deepep_v2``)."""
     _require_active()
-    from foundry.integration.sglang import plugin
+    from foundry.integration.sglang import pins
 
-    plugin.reject_unsupported_features(server_args)
-    plugin.validate_resolved_graph_config(server_args)
-    plugin.validate_pinned_fields(server_args)
-    plugin.apply_env_pins(server_args)
+    pins.reject_unsupported_features(server_args)
+    pins.validate_resolved_graph_config(server_args)
+    pins.validate_pinned_fields(server_args)
+    pins.apply_env_pins(server_args)
 
 
 # ---------------------------------------------------------------------------
@@ -193,14 +178,14 @@ def configure_subprocess(server_args: Any = None):
     ``FOUNDRY_MODE``; the parent's environment is restored on exit. With
     ``server_args``, first checks that the record was resolved with Foundry's
     graph pins and re-asserts the environment pins (both permanent and
-    idempotent, as on the plugin route)."""
+    idempotent)."""
     _require_active()
-    from foundry.integration.sglang import hooks, plugin
+    from foundry.integration.sglang import hooks, pins
     from foundry.integration.sglang import runtime as rt
 
     if server_args is not None:
         hooks._check_resolved_graph_config(server_args)
-    plugin.apply_env_pins(server_args)
+    pins.apply_env_pins(server_args)
     with rt.subprocess_preload_env():
         yield
 

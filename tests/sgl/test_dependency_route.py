@@ -4,7 +4,7 @@
 ``foundry.integration.sglang.api`` from its own call sites
 (``sglang.srt.utils.foundry_adapter``, ``--cuda-graph-persistence``).
 
-Activation is process-global (the config, the message labels), so every
+Activation is process-global (the config, the environment pins), so every
 check that activates runs in a fresh interpreter. No GPU needed.
 
     pytest tests/sgl/test_dependency_route.py -v
@@ -18,12 +18,11 @@ pytest.importorskip("sglang")
 adapter = pytest.importorskip("sglang.srt.utils.foundry_adapter")
 
 from _sglang_helpers import run_python  # noqa: E402
-from foundry.integration.sglang import api, plugin  # noqa: E402
+from foundry.integration.sglang import api, pins  # noqa: E402
 
-_PIN_ENV_NAMES = [pin.name for pin in plugin.ENV_PINS] + [
-    plugin.NCCL_CUMEM_PIN.name,
-    plugin._ENV_PINNED_MARK,
-    plugin.CONFIG_ENV,
+_PIN_ENV_NAMES = [pin.name for pin in pins.ENV_PINS] + [
+    pins.NCCL_CUMEM_PIN.name,
+    pins._ENV_PINNED_MARK,
     "LD_PRELOAD",
     "FOUNDRY_MODE",
 ]
@@ -67,16 +66,16 @@ def test_flag_pins_graph_fields_and_environment(model_dir, tmp_path):
         + """
         import os
         from sglang.srt.model_executor.cuda_graph_config import Backend
-        from foundry.integration.sglang import plugin
+        from foundry.integration.sglang import pins
         from foundry.integration.sglang.config import get_config
         assert cfg.decode.backend == Backend.FULL, cfg.decode.backend
         assert cfg.prefill.backend == Backend.DISABLED, cfg.prefill.backend
-        for pin in plugin.FIELD_PINS:
+        for pin in pins.FIELD_PINS:
             if pin.strict:
                 assert resolution_result(sa, pin.field) == pin.value, pin.field
-        for pin in plugin.ENV_PINS:
+        for pin in pins.ENV_PINS:
             assert os.environ.get(pin.name) == pin.value, pin.name
-        assert os.environ[plugin.NCCL_CUMEM_PIN.name] == "0"
+        assert os.environ[pins.NCCL_CUMEM_PIN.name] == "0"
         assert get_config().mode.value == "save"
         assert get_config().workspace_root == "foundry_archive"
         print("OK")
@@ -100,7 +99,7 @@ def test_contrary_flag_is_rejected_naming_the_sglang_flag(model_dir, tmp_path):
         result.stderr
     ), result.stderr[-4000:]
     assert "--enable-two-batch-overlap=True: not validated with Foundry" in result.stderr
-    assert plugin.CONFIG_ENV not in result.stderr
+    assert "FOUNDRY_GRAPH_EXTENSION_CONFIG" not in result.stderr
 
 
 def test_config_without_mode_is_rejected(model_dir, tmp_path):
@@ -202,20 +201,3 @@ def test_reactivation_with_other_arguments_is_refused(tmp_path):
         cwd=tmp_path,
     )
     assert "REFUSED" in result.stdout, result.stderr[-4000:]
-
-
-def test_plugin_refuses_to_patch_an_sglang_with_the_adapter(tmp_path):
-    toml = tmp_path / "foundry.toml"
-    toml.write_text('mode = "save"\n')
-    result = _run_python(
-        """
-        from sglang.srt.plugins import load_plugins
-        load_plugins()
-        print("SHOULD NOT GET HERE")
-        """,
-        cwd=tmp_path,
-        env_extra={plugin.CONFIG_ENV: str(toml)},
-    )
-    assert result.returncode != 0
-    assert "SHOULD NOT GET HERE" not in result.stdout
-    assert "use --cuda-graph-persistence" in result.stderr, result.stderr[-4000:]

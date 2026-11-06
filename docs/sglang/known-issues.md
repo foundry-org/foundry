@@ -9,29 +9,6 @@ order, and LOAD cannot replay that layout. `region_layout.json` (per rank) recor
 or with another value: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the
 current code`. Rule: re-SAVE every archive saved by the old code.
 
-## DeepEP v2 (NCCL windows + GIN) not validated on the plugin route (TODO, 2026-09-30)
-
-`--moe-a2a-backend deepep_v2` was validated on the earlier fork route only (H100 EP2 / EP4, all 256 decode graphs,
-foundry e24186b). On the plugin route (upstream main) it has not run: the plugin leaves `NCCL_CUMEM_ENABLE` to
-sglang for v2 (its NCCL windows need cuMem), and that exception is the one pin without a measurement behind it.
-
-Two attempts on the bare 4xH200 radix hosts failed before any Foundry code ran:
-
-- `sgl-deep-ep` 0.1.2 is built against NCCL 2.30.7 while torch pins 2.29.7 (`NCCL library version is too old`);
-  fixed for the run with `uv pip install --no-deps nvidia-nccl-cu13==2.30.7` plus the CUDA 13.3 compat libcuda.
-- With NCCL 2.30.7, plain sglang asserts at the first MoE dispatch: `NCCL GIN is unavailable` (`ElasticBuffer.__init__`,
-  `csrc/kernels/backend/nccl.cu:87`). v2 requires NCCL GIN even for a single-node EP4, i.e. an RDMA NIC visible to
-  the process. These hosts are 4-GPU slices of 8xH200 nodes with IB disabled, so v2 cannot start there at all.
-
-What to check once an RDMA-capable host is available (Qwen3-30B-A3B-FP8 EP4, decode graphs; sglang forces prefill
-graphs off for v2): the `[Foundry] pin:` line saying `NCCL_CUMEM_ENABLE` was left to sglang; the ElasticBuffer
-bootstrap time on SAVE and LOAD; `Loaded 128 SGLang graphs in`; SAVE `final_alloc_offset` == LOAD
-`after_load_all_graphs`; no `[HOOK] WARNING: cuMemAddressReserve returned address ... != hint` (NCCL cuMem
-allocations made outside the hook's thread-local region would show up there); greedy parity and TPOT vs native.
-Why it is expected to work: v2's windows are library-owned physical memory at a hook-carved VA, registered at the
-pre-capture bootstrap on both SAVE and LOAD, the same model as DeepEP v1's NVSHMEM heap; the
-`NCCL_GRAPH_REGISTER=0` / `NCCL_LOCAL_REGISTER=0` / `NCCL_NVLS_ENABLE=0` pins stay in force.
-
 ## DeepEP v2: NCCL's window descriptor is placed by the driver (NOTE, 2026-11-06)
 
 DeepEP v2 kernels take NCCL's window by address, and NCCL allocates the window descriptor from a CUDA memory pool
@@ -76,12 +53,7 @@ therefore records into an event that only Foundry holds: the link from the node 
 all of a runner's graphs. (Not checked against a SGLang archive for this particular node; the statement is
 from the SAVE / LOAD code, which handles every event node this way.)
 
-Upstream's fallback for "`IN_REPLAY` declared, no marker" is `PRE_REPLAY`, which fences too early: the scheduler may
-overwrite buffers the graph is still about to read (upstream's own TODO in `_resolve_shared_read_ends` says
-`POST_REPLAY` is the sound one). Foundry's `shared_read_ends_override` (`integration/sglang/hooks.py`, called from
-`_resolve_shared_read_ends`; patch 3d in [`hooks.md`](hooks.md)) therefore returns `POST_REPLAY` on LOAD in that case
-on the plugin route. On the dependency route upstream's own fallback is already `POST_REPLAY`, so no Foundry call is
-needed there.
+SGLang's fallback for "`IN_REPLAY` declared, no marker" is `POST_REPLAY` (`_resolve_shared_read_ends`).
 That is correct, but the scheduler's writes for batch N+1 now wait for the whole forward of batch N, so the overlap the
 marker buys is lost. The loss was not measurable in our bs 1-128 TPOT runs; it may matter for small-batch, CPU-bound
 serving, where the scheduler's next-batch preparation is a large share of the step (not measured).
@@ -89,8 +61,8 @@ serving, where the scheduler's next-batch preparation is a large share of the st
 **TODO (next phase).** Give events a stable identity across the archive instead of a per-graph index: SAVE records,
 per event node, an id for the host event (shared by every graph that records it) and, where the integration registers
 one, which host object it is. LOAD creates one event per id, adds the nodes with it, and hands the event back to the
-integration (SGLang: set `runner.in_graph_metadata_prep_done`). Then the plugin route's `shared_read_ends_override`
-patch can go, and upstream's own `IN_REPLAY` path runs unchanged. The generic mechanism
+integration (SGLang: set `runner.in_graph_metadata_prep_done`). Then upstream's own `IN_REPLAY` path runs on LOAD
+too. The generic mechanism
 is "graph nodes that reference host objects": events now, conditional handles and child-graph handles later.
 
 ## SAVE spends ~30 s in `Init torch distributed` (and ~20 s more elsewhere) copying over-read fatbins (FIXED, 2026-09-25)

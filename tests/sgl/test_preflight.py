@@ -7,11 +7,9 @@ recipe TOML: SAVE and LOAD checks, the FAILED line and the exit codes
     pytest tests/sgl/test_preflight.py -v
 
 recipe/sglang/foundry.toml has no ``mode`` key (the mode comes from
---cuda-graph-persistence), so it passes only on the dependency route; on the
-plugin route the CLI must refuse it.
+--cuda-graph-persistence).
 """
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -20,7 +18,7 @@ import pytest
 
 pytest.importorskip("sglang")
 
-from _sglang_helpers import CONFIG_ENV, plugin_route_only, sglang_has_adapter  # noqa: E402
+from _sglang_helpers import sglang_has_adapter  # noqa: E402
 from foundry.integration.sglang import preflight  # noqa: E402
 
 RECIPE_TOML = Path(__file__).resolve().parents[2] / "recipe" / "sglang" / "foundry.toml"
@@ -33,11 +31,9 @@ dependency_route_only = pytest.mark.skipif(
 
 def _preflight(cwd, *args):
     """Run the CLI from ``cwd`` (no sglang checkout to shadow the package)."""
-    env = {k: v for k, v in os.environ.items() if k not in (CONFIG_ENV, "SGLANG_PLUGINS")}
     proc = subprocess.run(
         [sys.executable, "-P", "-m", "foundry.integration.sglang.preflight", *args],
         cwd=cwd,
-        env=env,
         capture_output=True,
         text=True,
         timeout=300,
@@ -90,13 +86,6 @@ def test_recipe_toml_needs_a_mode_flag(tmp_path):
     assert "pass --save or --load" in proc.stderr
 
 
-@plugin_route_only
-def test_recipe_toml_is_refused_on_the_plugin_route(tmp_path):
-    proc = _recipe(tmp_path, "--save")
-    assert proc.returncode == 1
-    assert "has mode = 'none', expected 'save'" in proc.stderr
-
-
 def test_missing_toml_fails(tmp_path):
     proc = _preflight(tmp_path, "--toml", str(tmp_path / "missing.toml"), "--save")
     assert proc.returncode == 1
@@ -111,13 +100,3 @@ def test_missing_toml_fails(tmp_path):
 )
 def test_bad_arguments_exit_2(tmp_path, args):
     assert _preflight(tmp_path, *args).returncode == 2
-
-
-@pytest.mark.parametrize("value", ["", "foundry", "other, foundry"])
-def test_plugin_allowlist_accepts(value):
-    preflight.check_plugin_allowlist({"SGLANG_PLUGINS": value} if value else {})
-
-
-def test_plugin_allowlist_without_foundry_fails():
-    with pytest.raises(preflight.PreflightError, match="does not include 'foundry'"):
-        preflight.check_plugin_allowlist({"SGLANG_PLUGINS": "other"})

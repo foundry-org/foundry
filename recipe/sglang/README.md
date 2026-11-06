@@ -9,9 +9,7 @@ These recipes use the **dependency route**: SGLang declares Foundry as an option
 dependency (`sglang[foundry]`) and switches it on with its own server arguments
 `--cuda-graph-persistence {save,load}` (plus optional `--cuda-graph-persistence-config`).
 That is the route in the foundry-org SGLang branch `foundry-dep` and in upstream SGLang
-once the Foundry adapter lands there. The older plugin route
-(`FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>`, entry point `foundry_sglang_plugin:load`) still
-exists for an SGLang without the adapter; these scripts no longer use it.
+once the Foundry adapter lands there.
 
 | Component | Version | Notes |
 |---|---|---|
@@ -138,7 +136,7 @@ memory-saver / graph-pool variants off, `--dsv4-attn-backend` not `trtllm`), pri
 `[Foundry] pin:` line per value, and stop with the reason on a contrary explicit value;
 unsupported features (speculative decoding, LoRA, PD multiplexing, elastic-EP recapture,
 non-full graph backends) are rejected. Full table:
-[`docs/sglang/overview.md`](../../docs/sglang/overview.md#what-the-plugin-pins-and-why).
+[`docs/sglang/overview.md`](../../docs/sglang/overview.md#what-foundry-pins-and-why).
 The scripts pass the collective flags (`--disable-custom-all-reduce --enable-torch-symm-mem`)
 and source `set_env.sh` in every mode, so baseline, SAVE and LOAD capture the same
 graph set; everything else they set is model/topology, not Foundry policy:
@@ -522,7 +520,7 @@ Not usable in plain sglang on Hopper, because the native engine already fails to
 all-to-all over DeepEP v2 (`--moe-a2a-backend deepep_v2`), i.e. NCCL
 symmetric-memory windows and NCCL GIN (GDAKI/DOCA) rather than NVSHMEM.
 Prototype status: validated on H100 EP=2/EP=4 with all 256 decode graphs.
-Not yet validated on the plugin route (upstream main). v2 needs NCCL GIN, i.e.
+v2 needs NCCL GIN, i.e.
 an RDMA-capable NIC visible to the process: on a host whose verbs devices are
 blocked, `ElasticBuffer.__init__` asserts `NCCL GIN is unavailable` at the
 first MoE dispatch in plain SGLang, before any Foundry code runs (4xH200 bare
@@ -546,7 +544,7 @@ same pre-capture point on SAVE and LOAD (sglang's warmup prebuild),
 reports success for `cuPointerSetAttribute(SYNC_MEMOPS)` on region memory
 (DOCA requires it), and pins `NCCL_GRAPH_REGISTER=0`/`NCCL_LOCAL_REGISTER=0`
 so no collective in a captured graph depends on registration state that a
-restored graph cannot replay. `NCCL_CUMEM_ENABLE`, which the plugin pins to 0
+restored graph cannot replay. `NCCL_CUMEM_ENABLE`, which Foundry pins to 0
 for every other all-to-all backend, is left to sglang (1) with v2: do not
 force it to 0.
 

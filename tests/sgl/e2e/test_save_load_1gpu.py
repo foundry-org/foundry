@@ -5,9 +5,6 @@ model with dummy weights and a small decode set. Greedy output must be
 identical across the three, LOAD must restore every decode graph once, and
 Foundry must report itself active in the launcher and the scheduler. SAVE and LOAD
 first pass the preflight CLI's checks (foundry.integration.sglang.preflight).
-Runs on whichever route the installed sglang has (_sglang_helpers.foundry_launch): the
---cuda-graph-persistence flags when sglang has the Foundry adapter, the plugin's
-environment variable otherwise.
 
 Needs sglang, a CUDA GPU and the model's config (HF cache or network).
 Model override: FOUNDRY_E2E_MODEL (default Qwen/Qwen3-1.7B: ungated; sglang's

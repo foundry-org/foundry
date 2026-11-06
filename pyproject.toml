@@ -36,14 +36,6 @@ Homepage = "https://github.com/foundry-org/foundry"
 Source = "https://github.com/foundry-org/foundry"
 Changelog = "https://github.com/foundry-org/foundry/blob/main/RELEASE.md"
 
-# Plugin route: SGLang discovers general plugins through this entry-point group
-# (sglang.srt.plugins.load_plugins). The entry module imports only the
-# standard library; Foundry activates when FOUNDRY_GRAPH_EXTENSION_CONFIG is set.
-# An SGLang that declares Foundry as a dependency (sglang[foundry],
-# --cuda-graph-persistence) calls foundry.integration.sglang.api instead.
-[project.entry-points."sglang.srt.plugins"]
-foundry = "foundry_sglang_plugin:load"
-
 [project.optional-dependencies]
 dev = [
     "pytest",
@@ -56,7 +48,6 @@ packages = [
     "foundry.integration.vllm",
     "foundry.integration.sglang",
 ]
-py-modules = ["foundry_sglang_plugin"]
 package-dir = {"" = "python"}
 include-package-data = true
 zip-safe = false
@@ -140,6 +131,5 @@ markers = [
     "sglang: needs sglang (tests/sgl)",
     "slow: engine launches and model downloads (tests/sgl/e2e); deselected by default",
     "xlarge: 4-GPU, 100+ GB model cases; deselected by default, run with -m 'slow and xlarge'",
-    "plugin_route: sglang plugin route only; delete together with the plugin",
 ]
 filterwarnings = ["ignore:TORCH_CUDA_ARCH_LIST is not set"]

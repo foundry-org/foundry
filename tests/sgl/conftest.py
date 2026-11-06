@@ -30,9 +30,9 @@ def restore_environ():
 @pytest.fixture
 def clean_pin_env(restore_environ):
     """No pinned variable inherited from the calling shell."""
-    from foundry.integration.sglang import plugin
+    from foundry.integration.sglang import pins
 
-    names = [pin.name for pin in plugin.ENV_PINS]
-    for name in names + [plugin.NCCL_CUMEM_PIN.name, plugin._ENV_PINNED_MARK]:
+    names = [pin.name for pin in pins.ENV_PINS]
+    for name in names + [pins.NCCL_CUMEM_PIN.name, pins._ENV_PINNED_MARK]:
         os.environ.pop(name, None)
     yield

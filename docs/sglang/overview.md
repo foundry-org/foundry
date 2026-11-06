@@ -2,24 +2,21 @@
 
 Foundry persists SGLang's decode (and optionally prefill) CUDA graphs to disk on SAVE and restores them on LOAD, skipping graph capture, kernel warmup, and the per-batch-size attention metadata setup costs.
 
-Foundry runs as an **SGLang plugin**: installing the `foundry-core` package registers the entry point `foundry = "foundry_sglang_plugin:load"` in group `sglang.srt.plugins`, and `FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>` in the launcher's environment switches it on. No SGLang change is needed (validated on upstream main `fa090f7755`, fork branch `foundry-plugin`). The plugin wraps three whitelisted resolution steps to pin the graph settings and installs the runtime patches in [`hooks.md`](hooks.md) in the launcher and in every scheduler process.
-
-**Dependency route.** An SGLang that declares Foundry as an optional dependency (`sglang[foundry]`, fork branch
-`foundry-dep`) calls `foundry.integration.sglang.api` from its own call sites instead of being patched:
+SGLang declares Foundry as an optional dependency (`sglang[foundry]`, fork branch `foundry-dep`) and calls
+`foundry.integration.sglang.api` from its own call sites ([`hooks.md`](hooks.md)):
 `--cuda-graph-persistence {save,load}` switches it on and `--cuda-graph-persistence-config <TOML>` names the
-Foundry TOML (optional; the flag's mode wins over the TOML's `mode`). The pins, rejects and runtime steps are the
-same code as the plugin's (`plugin.py`, `hooks.py`); only the messages name the flag. `INTEGRATION_API_VERSION` in
-`api.py` is checked by SGLang's adapter (major must match). The scheduler preload is set only around each spawn
-(`api.configure_subprocess`), not for the rest of the launcher. On such an SGLang the plugin refuses to activate
-(`FOUNDRY_GRAPH_EXTENSION_CONFIG` set -> exit with a pointer to the flag).
+Foundry TOML (optional; the flag's mode wins over the TOML's `mode`). The pins and rejects are in `pins.py`, the
+runtime steps in `hooks.py`. `INTEGRATION_API_VERSION` in `api.py` is checked by SGLang's adapter (same major, at
+least its minor). The scheduler preload is set only around each spawn (`api.configure_subprocess`), not for the rest
+of the launcher.
 
 ## Parallelism
 
 | Mode | Status | Notes |
 |---|:---:|---|
 | Single GPU | ✅ | Qwen3-1.7B / 4B / 14B |
-| Data parallel (DP) | ✅ | One full replica per rank; validated DP=2. Requires the per-rank device binding (below); `NCCL_CUMEM_ENABLE=0` / `NCCL_NVLS_ENABLE=0` are pinned by the plugin. |
-| Tensor parallel (TP) | ✅ | torch symmetric-memory allreduce inside the decode graphs (`--enable-torch-symm-mem --disable-custom-all-reduce`, pinned by the plugin); validated TP=2 (Qwen3-1.7B, Qwen3-32B) and TP=4 (Qwen3-32B). Without multicast (no IMEX channels) LOAD needs the optional sglang branch `symm-mem-no-multicast-fallback` (two-shot instead of disabling the communicator). |
+| Data parallel (DP) | ✅ | One full replica per rank; validated DP=2. Requires the per-rank device binding (below); `NCCL_CUMEM_ENABLE=0` / `NCCL_NVLS_ENABLE=0` are pinned by Foundry. |
+| Tensor parallel (TP) | ✅ | torch symmetric-memory allreduce inside the decode graphs (`--enable-torch-symm-mem --disable-custom-all-reduce`, pinned by Foundry); validated TP=2 (Qwen3-1.7B, Qwen3-32B) and TP=4 (Qwen3-32B). Without multicast (no IMEX channels) LOAD needs the optional sglang branch `symm-mem-no-multicast-fallback` (two-shot instead of disabling the communicator). |
 | Expert parallel (DeepEP) | ✅ | DP attention + DeepEP low-latency, TP attention + EP, and attention-TP inside DP groups + EP; DeepEP v2. Validated up to EP8 (Qwen3.5-122B/397B, DeepSeek-V4-Flash, GLM, Inkling; see `recipe/sglang/README.md` **Validation**). See **Expert parallel** below. |
 
 **Expert parallel (DeepEP).** The default EP recipe runs DP-attention + DeepEP for the
@@ -43,20 +40,20 @@ C++ fix binding the CUDA context on the graph-build pool workers.
 
 **Per-rank device binding (DP/TP/EP).** Foundry's `set_allocation_region` binds the
 VMM region to the CUDA device current at call time. Upstream sets the device
-*inside* the distributed bring-up (`bootstrap.init_parallel_runtime`), which the integration wraps and front-runs, so
-the hook explicitly calls `set_device(self.gpu_id)` before reserving the region —
-otherwise rank > 0 reserves on `cuda:0` and faults. See [`hooks.md`](hooks.md) (patch 1).
+*inside* the distributed bring-up (`bootstrap.init_parallel_runtime`), whose head calls Foundry first, so
+Foundry explicitly calls `set_device(self.gpu_id)` before reserving the region —
+otherwise rank > 0 reserves on `cuda:0` and faults. See [`hooks.md`](hooks.md) (call site 1).
 The DP serve script lives at `recipe/sglang/serve_qwen3-1.7b_dp.sh`
 (`<dp_size> [--save|--load]`); pick GPUs with `CUDA_VISIBLE_DEVICES`.
 
-## What the plugin pins and why
+## What Foundry pins and why
 
 Foundry's rule: state that cannot be made static across processes is not supported; Foundry uses the cuMem-backed
 alternatives instead. A graph restored on LOAD replays only what was recorded inside the capture region. A buffer
 registration, IPC handle exchange or pool carve-out made outside it (when `graph_capture()` exits, at first use
 inside the forward, by a second graph or allocator) does not exist in the LOAD process, and the restored kernels read
 addresses nobody set up. Every such feature that a flag or an environment variable can switch off is therefore a
-config the plugin sets, not a recipe requirement:
+config Foundry sets, not a recipe requirement:
 
 - each pin prints one `[Foundry] pin: <name>=<value> (<sglang default | as given | overrides sglang default X |
   was unset | already set>): <reason>` line;
@@ -65,12 +62,13 @@ config the plugin sets, not a recipe requirement:
 - a later sglang resolution step (model override, platform fallback) that turns a strict pin back is rejected,
   naming the step, instead of being re-pinned after other fields were derived from it.
 
-Flags are declared by the plugin's resolution hook on `apply_inkling_prefill_cuda_graph_default` (before the CUDA-graph,
-platform and memory steps read them) and re-checked on `handle_other_validations`. Environment variables are set in
-the launcher's `activate()` (before the server args are built and before any engine process is spawned: spawned
-processes inherit `os.environ`, and sglang reads some of them once at import time), re-asserted at the top of every
-scheduler process and at each spawn site (`setup_ld_preload_env`). `NCCL_CUMEM_ENABLE` depends on the all-to-all
-backend and is pinned by the `handle_other_validations` hook, once `--moe-a2a-backend` is resolved.
+Flags are declared in SGLang's `handle_cuda_graph_persistence` step (before the CUDA-graph, platform and memory
+steps read them) and re-checked in `validate_cuda_graph_persistence` (after `handle_other_validations`).
+Environment variables are set in the launcher's `activate()` (at the first resolution step and before any engine
+process is spawned: spawned processes inherit `os.environ`, and sglang reads some of them once at import time),
+re-asserted at the top of every scheduler process and at each spawn site (`configure_subprocess`).
+`NCCL_CUMEM_ENABLE` depends on the all-to-all backend and is pinned in `validate_cuda_graph_persistence`, once
+`--moe-a2a-backend` is resolved.
 
 | Pinned | Value | Why | Error when |
 |---|---|---|---|
@@ -115,13 +113,13 @@ pip install foundry-core                                   # prebuilt wheel (see
 pushd foundry && pip install -e . --no-build-isolation && popd
 ```
 
-Install it into the venv that runs `sglang serve`. On the dependency route the same package comes in as `pip install "sglang[foundry]"`. To check an install before serving, run `python -P -m foundry.integration.sglang.preflight --toml recipe/sglang/foundry.toml --save|--load` (the recipe scripts no longer run it; SGLang itself fails at startup when Foundry is missing or the integration API major mismatches).
+Install it into the venv that runs `sglang serve`, or with it as `pip install "sglang[foundry]"`. To check an install before serving, run `python -P -m foundry.integration.sglang.preflight --toml recipe/sglang/foundry.toml --save|--load` (the recipe scripts no longer run it; SGLang itself fails at startup when Foundry is missing or the integration API major mismatches).
 
 ### 2. Write a TOML config
 
 ```toml
 # recipe/sglang/foundry.toml (shared by SAVE and LOAD; the mode comes from
-# --cuda-graph-persistence, a `mode` key here is ignored on that route)
+# --cuda-graph-persistence, a `mode` key here is ignored)
 base_addr = 0x600000000000
 region_size = "256GB"
 workspace_root = "foundry_archive"
@@ -154,7 +152,7 @@ A single SAVE pass is enough — SGLang doesn't run a profile-forward at startup
 
 ## What the integration does
 
-(This outline predates the move to per-phase runners; [`hooks.md`](hooks.md) lists the current patch points.)
+(This outline predates the move to per-phase runners; [`hooks.md`](hooks.md) lists the current call sites.)
 
 SAVE:
 
@@ -162,7 +160,7 @@ SAVE:
 2. Distributed init / NCCL warmup runs in scratch space; the cursor is then forced to `scratch_space_size`.
 3. Model weights, KV pool, and FlashInfer workspace buffers allocate inside the VMM region at byte-deterministic offsets.
 4. `kernel_warmup` is a no-op.
-5. `DecodeCudaGraphRunner.capture` runs the upstream capture loop unchanged (per-shape FlashInfer wrappers and other metadata allocate where sglang puts them); only `FullCudaGraphBackend.capture_one` is patched, to capture into a foundry graph without the two pre-capture warmup forwards.
+5. `DecodeCudaGraphRunner.capture` runs the upstream capture loop unchanged (per-shape FlashInfer wrappers and other metadata allocate where sglang puts them); only `FullCudaGraphBackend.capture_one` calls Foundry, to capture into a foundry graph without the two pre-capture warmup forwards.
 6. Each captured graph is written to disk; a manifest groups topologically equivalent graphs.
 7. The final VMM cursor is recorded as `final_alloc_offset` in `region_layout.json`, with `capture_loop_version = 2`.
 
@@ -171,13 +169,13 @@ LOAD:
 1. `setup_graph_extension(...)` restores the VMM region and replays captured fatbins into device code memory; an archive without `capture_loop_version = 2` is refused here (re-SAVE).
 2. Distributed init runs as usual; the cursor advances to the same `scratch_space_size`.
 3. Model weights and KV pool re-allocate at the same deterministic offsets. `init_memory_pool` reuses the saved `MemoryPoolConfig` (and calls `torch.cuda.empty_cache()` to mirror SAVE's `_resolve_memory_pool_config` side effect).
-4. `DecodeCudaGraphRunner.capture` preallocates the deterministic range up to `final_alloc_offset`, starts all decode graph builds in one `start_graph_builds(all_paths)` call (the manifest's template/on-demand linking needs one call), then runs the same upstream capture loop as SAVE. The patched `capture_one` takes the next archived graph for each shape (`finish_one_graph_load`: its allocator events replay where SAVE captured it) instead of capturing; `forward_fn` never runs.
+4. `DecodeCudaGraphRunner.capture` preallocates the deterministic range up to `final_alloc_offset`, starts all decode graph builds in one `start_graph_builds(all_paths)` call (the manifest's template/on-demand linking needs one call), then runs the same upstream capture loop as SAVE. Foundry's `capture_one` takes the next archived graph for each shape (`finish_one_graph_load`: its allocator events replay where SAVE captured it) instead of capturing; `forward_fn` never runs.
 5. The restored graphs sit in the backend's `_graphs` / `_outputs` under the loop's own shape keys; the rest of SGLang's serving path runs unchanged.
 
 ## Doc set
 
 - [`overview.md`](overview.md) — this file
-- [`hooks.md`](hooks.md) — every monkey-patch foundry installs and what it does on SAVE / LOAD
+- [`hooks.md`](hooks.md) — every SGLang call site and what Foundry does there on SAVE / LOAD
 - [`memory-lifecycle.md`](memory-lifecycle.md) — VMM region setup, the SAVE↔LOAD allocation parity contract, and the `final_alloc_offset` watermark
 - [`save-load-workflow.md`](save-load-workflow.md) — serve scripts, TOML schema, expected logs, validation checks
 - [`memory-consistency.md`](memory-consistency.md) — the five known divergences that caused silent LOAD failures and how each was fixed

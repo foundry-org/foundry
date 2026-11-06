@@ -480,20 +480,6 @@ def _set_subprocess_preload_env() -> None:
     os.environ["FOUNDRY_SPAWN_T0_NS"] = str(time.perf_counter_ns())
 
 
-def setup_ld_preload_env(server_args=None) -> None:
-    """Plugin route, spawn sites (launcher before the schedulers, DP
-    controller before its TP groups): the preload environment for the
-    children, set for the rest of the process, and the plugin's environment
-    pins re-asserted (``plugin.apply_env_pins``; with ``server_args`` also
-    the all-to-all-dependent ``NCCL_CUMEM_ENABLE``) so every child inherits
-    them whichever route loaded Foundry."""
-    _set_subprocess_preload_env()
-    if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-        from foundry.integration.sglang.plugin import apply_env_pins
-
-        apply_env_pins(server_args)
-
-
 _SUBPROCESS_ENV_KEYS = ("LD_PRELOAD", "FOUNDRY_MODE", "FOUNDRY_SPAWN_T0_NS")
 
 
@@ -509,10 +495,10 @@ def _start_resource_tracker() -> None:
 
 @contextlib.contextmanager
 def subprocess_preload_env():
-    """Dependency route (``foundry.integration.sglang.api``): the same
-    preload environment, set only around ``Process.start()`` (the child
-    copies ``os.environ`` at that point) and restored afterwards, so the
-    launcher's other processes do not load the hook."""
+    """``api.configure_subprocess``: the children's preload environment, set
+    only around ``Process.start()`` (the child copies ``os.environ`` at that
+    point) and restored afterwards, so the launcher's other processes do not
+    load the hook."""
     _start_resource_tracker()
     saved = {key: os.environ.get(key) for key in _SUBPROCESS_ENV_KEYS}
     try:
