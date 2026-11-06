@@ -103,17 +103,6 @@ def _before_distributed_init(server_args, device: str, gpu_id: int, ranks) -> No
         start_exec_pool_prewarm()
 
 
-def _after_runner_distributed_init() -> None:
-    """End of ModelRunner.init_torch_distributed: the groups
-    exist and pre-model-load memory has been measured; everything allocated
-    since the region was bound sits in the scratch space, and the cursor jumps
-    to the scratch boundary so weight loading starts at the same offset on
-    SAVE and LOAD."""
-    rt.log_alloc_offset("after_init_torch_dist")
-    rt.skip_to_scratch_boundary()
-    rt.log_alloc_offset("after_scratch_skip")
-
-
 # ---------------------------------------------------------------------------
 # Call-site functions (api.py calls them from SGLang's own call sites).
 # ---------------------------------------------------------------------------
@@ -191,18 +180,6 @@ def before_parallel_init(device: str) -> None:
         get_device().gpu_id,
         _workspace_ranks(parallel),
     )
-
-
-def after_runner_distributed_init(is_draft_worker: bool) -> None:
-    """End of ``ModelRunner.init_torch_distributed``. Draft
-    workers reuse the target's groups and never reach init_parallel_runtime;
-    only the target runner closes the window."""
-    if (
-        get_graph_extension_mode() != CUDAGraphExtensionMode.NONE
-        and not is_draft_worker
-        and rt.get_state() is not None
-    ):
-        _after_runner_distributed_init()
 
 
 # Context overrides the memory-pool resolver issued on SAVE

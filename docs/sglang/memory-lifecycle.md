@@ -11,7 +11,6 @@ mode               = "save" | "load"        # required
 base_addr          = 0x600000000000          # required; start of VMM region
 region_size        = "256GB"                 # required; total VMM reservation
 workspace_root     = "foundry_archive_…"     # required; on-disk workspace
-scratch_space_size = "1024MB"                # required; pre-deterministic scratch budget
 
 hook_library_path  = "…/libcuda_hook.so"     # optional; auto-discovered
 nvshmem_host_path  = "…/libnvshmem_host.so"  # optional; for EP parity
@@ -19,7 +18,6 @@ nvshmem_host_path  = "…/libnvshmem_host.so"  # optional; for EP parity
 
 - `base_addr` must be high enough not to collide with model weights or PyTorch's default heap. `0x600000000000` is a safe pick on x86_64.
 - `region_size` must exceed `final_alloc_offset` for the model + KV pool + graphs. 256 GiB is generous for a 14 B model.
-- `scratch_space_size` should be larger than the sum of NCCL workspace, cuBLAS workspace, and any other one-time allocations that aren't deterministic across runs.
 - `workspace_root` is shared across ranks; per-rank artifacts go in `workspace_root/rank_{N}/`. Delete `workspace_root` before any SAVE.
 
 ## Lifecycle
@@ -30,7 +28,6 @@ flowchart TD
     TORCH["ModelRunner.init_torch_distributed"]
     TORCH_PRE["setup_graph_extension<br/>(reserve VMM region, eager cuBLAS,<br/>LOAD: load cached fatbins)"]
     TORCH_ORIG["&lt;upstream init_torch_distributed&gt;<br/>NCCL warmup + comm bring-up"]
-    TORCH_POST["skip_to_scratch_boundary<br/>cursor → scratch_space_size"]
     LOAD_MODEL["ModelRunner.load_model<br/>(passthrough today)"]
     POOL["ModelRunnerKVCacheMixin.init_memory_pool"]
     POOL_SAVE["SAVE: orig + save resolved<br/>MemoryPoolConfig to warmup_state.json"]
@@ -41,8 +38,8 @@ flowchart TD
     LOAD_CAP["LOAD: preallocate_for_load_mode<br/>+ start_decode_graph_restore<br/>+ upstream capture loop<br/>(capture_one: finish_one_graph_load)<br/>+ finish_decode_graph_restore"]
 
     INIT --> TORCH
-    TORCH --> TORCH_PRE --> TORCH_ORIG --> TORCH_POST
-    TORCH_POST --> LOAD_MODEL --> POOL
+    TORCH --> TORCH_PRE --> TORCH_ORIG
+    TORCH_ORIG --> LOAD_MODEL --> POOL
     POOL --> POOL_SAVE
     POOL --> POOL_LOAD
     POOL_SAVE --> KWARM
@@ -53,10 +50,6 @@ flowchart TD
 ```
 
 ## Allocation buckets
-
-### Bucket A — pre-deterministic scratch
-
-CUDA context, cuBLAS handle, NCCL warmup, distributed bring-up. These run **inside** the VMM region but are released by `skip_to_scratch_boundary` — the cursor is forced to `cfg.scratch_space_size` regardless of what landed below it. Any non-determinism in this region is invisible to the rest of the lifecycle.
 
 ### Bucket B — deterministic runtime state
 
@@ -107,10 +100,8 @@ Persisting the resolved `MemoryPoolConfig` (via `dataclasses.asdict`) and re-app
     - `cge.set_skip_fatbin_processing(True)`
     - `cge.load_cuda_modules_and_libraries(workspace_dir)` — restores the fatbins SAVE wrote, into device code memory
 - `cge.set_allocation_region(cfg.base_addr, parse_size(cfg.region_size))` — reserves a VMM address range; the cursor starts at `base_addr`
-- `torch._C._cuda_getCurrentBlasHandle()` — eager cuBLAS handle so the workspace it wants lands in scratch instead of post-scratch territory
+- `torch._C._cuda_getCurrentBlasHandle()` — eager cuBLAS handle
 - creates the `CUDAGraphExtensionState` singleton
-
-After upstream `init_torch_distributed` returns, `skip_to_scratch_boundary` forces the cursor to `cfg.scratch_space_size` (default 1 GiB). Allocations below that line are scratch and don't need to be deterministic.
 
 ## Region layout
 

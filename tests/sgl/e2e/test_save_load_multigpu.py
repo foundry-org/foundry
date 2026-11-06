@@ -168,8 +168,7 @@ def _engine_env(case):
 
 
 def _toml(path, mode, workspace):
-    # 4 GB scratch: TP/EP dist init takes 1.8-2.9 GB before the region opens (1 GB default is too small).
-    return foundry_toml(path, mode, workspace, scratch_space_size="4096MB")
+    return foundry_toml(path, mode, workspace)
 
 
 def _server_args(case):

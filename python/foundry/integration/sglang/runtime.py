@@ -222,23 +222,6 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
     )
 
 
-def skip_to_scratch_boundary() -> None:
-    cfg = get_config()
-    if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
-        return
-    scratch = parse_size(cfg.scratch_space_size)
-    current = cge.get_current_alloc_offset()
-    if current > scratch:
-        logger.warning(
-            "[Foundry] Current allocation offset %d exceeds scratch size %d",
-            current,
-            scratch,
-        )
-        return
-    cge.set_current_alloc_offset(scratch)
-    logger.info("[Foundry] SGLang skipped allocator to scratch boundary %d", scratch)
-
-
 @contextlib.contextmanager
 def allocation_region_suspended():
     """Run a block whose device allocations must not touch the deterministic

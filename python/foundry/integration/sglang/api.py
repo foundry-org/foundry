@@ -22,10 +22,8 @@ apart; a 2.0 caller passes none, which means the plain target decode runner.
 ``_resolve_memory_pool_config``. 2.2 callers are not supported: the functions
 only they called (``record_memory_pool_overrides``,
 ``before_alloc_memory_pool``, ``after_alloc_memory_pool``,
-``validate_graph_config``, ``apply_env_pins``, ``after_parallel_init``) are
-gone. SGLang's 2.3 call sites do not call
-:func:`after_runner_distributed_init` (the scratch skip, a no-op once the
-cursor is past ``scratch_space_size``) either.
+``validate_graph_config``, ``apply_env_pins``, ``after_parallel_init``,
+``after_runner_distributed_init``) are gone.
 
 Call sites (SGLang side, in process order):
 
@@ -203,17 +201,6 @@ def before_parallel_init(device: str) -> None:
     from foundry.integration.sglang import hooks
 
     hooks.before_parallel_init(device)
-
-
-def after_runner_distributed_init(is_draft_worker: bool) -> None:
-    """End of ``ModelRunner.init_torch_distributed``: move the allocation
-    cursor to the scratch boundary so weight loading starts at the same offset
-    on SAVE and LOAD. A draft worker (``is_draft_worker``) reuses the target's
-    groups and is skipped."""
-    _require_active()
-    from foundry.integration.sglang import hooks
-
-    hooks.after_runner_distributed_init(is_draft_worker)
 
 
 def replay_saved_memory_pool_config():

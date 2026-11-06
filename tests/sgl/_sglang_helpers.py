@@ -81,12 +81,12 @@ def run_python(code, cwd=None, *, env_drop=(), env_extra=None):
     )
 
 
-def foundry_toml(path, mode, workspace, scratch_space_size="1024MB"):
+def foundry_toml(path, mode, workspace):
     """Write a Foundry TOML for an end-to-end engine. The region must hold
     everything sglang allocates after setup, the KV pool included."""
     path.write_text(
         f'mode = "{mode}"\nbase_addr = 0x600000000000\nregion_size = "256GB"\n'
-        f'workspace_root = "{workspace}"\nscratch_space_size = "{scratch_space_size}"\n'
+        f'workspace_root = "{workspace}"\n'
     )
     return str(path)
 

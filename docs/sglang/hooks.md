@@ -10,7 +10,6 @@ prefill `full` / `disabled`, profiling and FlashInfer autotune off) run in SGLan
 | # | SGLang call site | SAVE | LOAD |
 |---|---|---|---|
 | 1 | `sglang.srt.distributed.bootstrap.init_parallel_runtime` (head; called from `Scheduler.__init__` before any `ModelRunner`) | `set_device(gpu_id)`, then `setup_graph_extension` reserves the rank's VMM region before any process group exists | same, plus the binary restore (`load_cuda_modules_and_libraries`) and the exec-memory prewarm thread |
-| 1b | `ModelRunner.init_torch_distributed` (end; target runner only) | `skip_to_scratch_boundary()`: weights start at `scratch_space_size` (SGLang's 2.3 call sites no longer call `after_runner_distributed_init`) | same |
 | 2 | `KVCacheConfigurator._resolve_memory_pool_config` | run upstream, record the context overrides it issued (e.g. the Mamba/GDN state-pool size) and write `warmup_state.json` (pool config + overrides) | skip profiling: `gc.collect()` + `empty_cache()` (mirrors SAVE's side effects), return the saved `MemoryPoolConfig`, replay the overrides |
 | 3 | `FullCudaGraphBackend.capture_one` | capture into a `foundry.CUDAGraph` (no warmup forwards), `save_graph` | both runners: hand back the next archived graph for this shape (`restore_next_decode_graph` / `restore_next_prefill_graph`, order checked against the archive); its allocator events replay here (`finish_one_graph_load`); `forward_fn` is not run. `hooks.capture_one` takes the shape, `forward_fn`, the pool and the stream (the prefill request-slot count comes from the enclosing `capture_scope("prefill", ...)`) and returns `(graph, output)`; SGLang's backend stores them |
 | 3b | `DecodeCudaGraphRunner.capture` | pre-capture bootstraps and layout start, upstream capture loop, manifest, `pack_fatbins`, `record_region_layout` (with `capture_loop_version`) | bootstraps, `preallocate_for_load_mode`, `start_decode_graph_restore` (one `start_graph_builds`), upstream capture loop with 3 swapping each capture for the archived graph, `finish_decode_graph_restore` (count check), `empty_cache()` |
@@ -47,7 +46,7 @@ before the weight load) and refuses an archive without it or with another value;
 must be re-saved.
 
 The alloc-offset log lines (`[Foundry] SGLang alloc_offset[<point>]=...`) mark each step: `after_setup_graph_ext`,
-`after_init_torch_dist`, `after_scratch_skip`, `before_memory_pool_config`, `before/after_collective_bootstrap`,
+`before_memory_pool_config`, `before/after_collective_bootstrap`,
 `after_lazy_runtimes` (SAVE), `before/after_preallocate`,
 `before/after_prefill_restore` (prefill graphs on),
 `before_decode_restore`, `after_load_all_graphs` (must equal SAVE's `final_alloc_offset`),
