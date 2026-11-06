@@ -368,9 +368,12 @@ def preallocate_for_load_mode() -> None:
     LOAD's current cursor and the watermark, then checks the cursor against
     SAVE's recorded layout start (equal by construction; a difference means
     the allocation sequences diverged and is logged, moving the cursor up when
-    LOAD is behind). Allocations inside the span are pointer bumps; a hole is
-    backed on demand by the hook and logged, since it too means the sequences
-    diverged."""
+    LOAD is behind). Allocations inside the span are pointer bumps. A range
+    SAVE allocated and freed again before the end is not in the layout: when
+    LOAD's replay of the same sequence allocates it, the hook backs it on
+    demand and logs it at INFO (the same ranges on every LOAD of an archive,
+    e.g. the segments sglang's ``empty_cache`` releases between the EAGLE
+    draft scopes)."""
     cfg = get_config()
     if cfg is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
         return
