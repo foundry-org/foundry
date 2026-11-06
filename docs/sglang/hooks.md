@@ -11,7 +11,7 @@ steps (`apply_inkling_prefill_cuda_graph_default`, `handle_cuda_graph_config`, `
 
 | # | patched symbol | SAVE | LOAD |
 |---|---|---|---|
-| 1 | `sglang.srt.distributed.bootstrap.init_parallel_runtime` (called from `Scheduler.__init__` before any `ModelRunner`) | `set_device(gpu_id)`, then `setup_graph_extension` reserves the rank's VMM region before any process group exists | same; the binary restore (`load_cuda_modules_and_libraries`) and the exec-memory prewarm thread start later, after the pre-capture bootstraps (`runtime.restore_binaries`) |
+| 1 | `sglang.srt.distributed.bootstrap.init_parallel_runtime` (called from `Scheduler.__init__` before any `ModelRunner`) | `set_device(gpu_id)`, then `setup_graph_extension` reserves the rank's VMM region before any process group exists | same, plus the binary restore (`load_cuda_modules_and_libraries`) and the exec-memory prewarm thread |
 | 1b | `ModelRunner.init_torch_distributed` (end; target runner only) | `skip_to_scratch_boundary()`: weights start at `scratch_space_size` (dependency route: only 2.2 callers; SGLang's 2.3 call sites no longer call `after_runner_distributed_init`) | same |
 | 2 | `KVCacheConfigurator._resolve_memory_pool_config` | run upstream, record the context overrides it issued (e.g. the Mamba/GDN state-pool size) | skip profiling: `gc.collect()` + `empty_cache()` (mirrors SAVE's side effects), return the saved `MemoryPoolConfig`, replay the overrides |
 | 2b | `ModelRunner.alloc_memory_pool` | write `warmup_state.json` (pool config + overrides) | pass-through with offset logging |
@@ -54,7 +54,7 @@ must be re-saved.
 The alloc-offset log lines (`[Foundry] SGLang alloc_offset[<point>]=...`) mark each step: `after_setup_graph_ext`,
 `after_init_parallel_runtime`, `after_init_torch_dist`, `after_scratch_skip`, `before_memory_pool_config`,
 `before/after_init_memory_pool` (plugin route and 2.2 callers), `before/after_collective_bootstrap`,
-`after_binary_restore` (LOAD), `after_lazy_runtimes` (SAVE), `before/after_preallocate`,
+`after_lazy_runtimes` (SAVE), `before/after_preallocate`,
 `before/after_prefill_restore` (prefill graphs on),
 `before_decode_restore`, `after_load_all_graphs` (must equal SAVE's `final_alloc_offset`),
 `after_post_load_empty_cache`.
@@ -72,7 +72,7 @@ with its all-reduce through torch symmetric memory (validated attn-TP + EP rows 
   Mooncake, NIXL; `BaseDispatcher.prebuild`), the standard dispatcher's expert mapping (EP > 1,
   `--moe-a2a-backend none`) and the logits all-gather's symmetric-memory state (`MultimemAllGatherer`).
   Foundry only checks, at the first scope, that none is still pending (it raises naming the object), so all
-  of it exists before LOAD's `restore_binaries` grows the driver's VA arena.
+  of it exists before the first capture.
 - **NCCL communicator bootstrap** (`bootstrap_collective_connections`). NCCL connects a communicator on its first
   collective, which a capturing stream rejects (seen on the attention-TP sub-group's first reduce-scatter of
   Qwen3.5-35B-A3B attention-TP2 + EP4). Foundry issues small and large all-reduce / all-gather / reduce-scatter on

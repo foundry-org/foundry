@@ -137,6 +137,12 @@ def _before_distributed_init(server_args, device: str, gpu_id: int, ranks) -> No
     rt.log_alloc_offset("after_setup_graph_ext")
     if mode == CUDAGraphExtensionMode.LOAD:
         rt.check_capture_loop_version()
+        # Grow the driver's graph-exec memory now, on a background thread,
+        # so Phase 2's instantiates at the capture point reuse it (see
+        # graph_ops.start_exec_pool_prewarm).
+        from foundry.integration.sglang.graph_ops import start_exec_pool_prewarm
+
+        start_exec_pool_prewarm()
 
 
 def _after_runner_distributed_init() -> None:
@@ -404,20 +410,10 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
     rt.log_alloc_offset("before_collective_bootstrap")
     bootstrap_collective_connections()
     rt.log_alloc_offset("after_collective_bootstrap")
-    # 2. sglang's prebuilt state (both modes) must exist before step 3: DeepEP /
-    #    Mooncake / symmetric-memory state sits at driver-chosen addresses.
+    # 2. sglang's prebuilt state (both modes): DeepEP / Mooncake /
+    #    symmetric-memory state is built by sglang's warmup; check it.
     check_capture_state_prebuilt(model)
-    # 3. LOAD only: the archived binaries and the graph-exec memory prewarm,
-    #    after all library state at driver-chosen addresses exists (sglang's
-    #    prebuilt state, step 2): both grow the driver's VA arena, which SAVE
-    #    grows only inside its captures (rt.restore_binaries).
-    if mode == CUDAGraphExtensionMode.LOAD:
-        from foundry.integration.sglang.graph_ops import start_exec_pool_prewarm
-
-        rt.restore_binaries()
-        start_exec_pool_prewarm()
-        rt.log_alloc_offset("after_binary_restore")
-    # 4. SAVE only, every model: the two one-time runtime initializations
+    # 3. SAVE only, every model: the two one-time runtime initializations
     #    capture rejects (inductor's lazy init, DeepGEMM's runtime init), with
     #    the allocation region suspended so their transient tensors never move
     #    the deterministic cursor. The model's own compiles and JIT kernel
@@ -426,7 +422,7 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
         with rt.allocation_region_suspended():
             bootstrap_lazy_runtimes()
         rt.log_alloc_offset("after_lazy_runtimes")
-    # 5. Both modes, before the first eager extend: the FlashInfer SM90 GDN
+    # 4. Both modes, before the first eager extend: the FlashInfer SM90 GDN
     #    prefill kernels load from FlashInfer's .o cache instead of compiling
     #    8-10 s in every scheduler (host-side patch, see flashinfer_cute_cache).
     from foundry.integration.sglang import flashinfer_cute_cache

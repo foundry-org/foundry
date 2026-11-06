@@ -166,7 +166,7 @@ def load_warmup_state() -> WarmupState:
     return WarmupState(**{k: v for k, v in data.items() if k in valid})
 
 
-@nvtx_traced("foundry.setup_graph_ext")
+@nvtx_traced("foundry.setup_graph_ext (binary restore)")
 def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int | None) -> None:
     """Set up the VMM region before SGLang initializes NCCL/process groups."""
     global _state
@@ -195,11 +195,14 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
         if workspace_dir.exists():
             shutil.rmtree(workspace_dir)
         workspace_dir.mkdir(parents=True, exist_ok=True)
+    t_bin = 0.0
     if cfg.mode == CUDAGraphExtensionMode.LOAD:
         cge.set_skip_fatbin_processing(True)
         if not workspace_dir.exists():
             raise RuntimeError(f"Foundry workspace for rank {rank} does not exist: {workspace_dir}")
-        # The archived binaries load later, in restore_binaries (see there).
+        t1 = time.perf_counter()
+        cge.load_cuda_modules_and_libraries(str(workspace_dir))
+        t_bin = time.perf_counter() - t1
 
     region_size = parse_size(cfg.region_size)
     t1 = time.perf_counter()
@@ -211,34 +214,12 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
     _state = CUDAGraphExtensionState(rank=rank)
     logger.info(
         "[Foundry] SGLang graph extension setup completed in %.3f s "
-        "(region reserve %.3f s, cuBLAS handle %.3f s)",
+        "(binary restore %.3f s, region reserve %.3f s, cuBLAS handle %.3f s)",
         time.perf_counter() - t0,
+        t_bin,
         t_region,
         t_blas,
     )
-
-
-@nvtx_traced("foundry.restore_binaries (binary restore)")
-def restore_binaries() -> None:
-    """LOAD: load the archived CUDA modules and libraries, once, after the
-    pre-capture state exists (sglang's warmup prebuild, Foundry's collective
-    bootstrap) and before any graph restore.
-
-    Loading ~0.2-0.5 GB of fatbins grows the driver's own VA arena, which
-    SAVE grows only later (its kernels load lazily inside the captures).
-    Library objects the driver places there and the graphs reference by
-    address must see the same arena on both modes: NCCL's per-communicator
-    shadow pool (a CUDA mempool) holds DeepEP v2's ``ncclWindow_t`` and
-    device-communicator state, created by sglang's warmup prebuild; with
-    the binaries loaded first it sits one 512 MB arena chunk higher on LOAD
-    and the restored dispatch kernels read a stale window (peer counts never
-    arrive: "DeepEP notify timeout")."""
-    cfg = get_config()
-    if cfg is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
-        return
-    t0 = time.perf_counter()
-    cge.load_cuda_modules_and_libraries(str(cfg.workspace_dir))
-    logger.info("[Foundry] SGLang binary restore in %.3f s", time.perf_counter() - t0)
 
 
 def skip_to_scratch_boundary() -> None:

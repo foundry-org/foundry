@@ -549,10 +549,10 @@ def pack_fatbins() -> None:
 
 @nvtx_traced("foundry.graph_restore.prewarm")
 def start_exec_pool_prewarm() -> None:
-    """LOAD, right after the recorded binaries are loaded (after the
-    pre-capture bootstraps, see runtime.restore_binaries): start growing the
-    driver's graph-exec memory for every archived graph (decode and prefill)
-    on a background thread. Phase 2's instantiates then reuse that
+    """LOAD, at setup (right after the recorded binaries are loaded): start
+    growing the driver's graph-exec memory for every archived graph (decode and
+    prefill) on a background thread, while torch-distributed init, weight
+    loading and the memory pools run. Phase 2's instantiates then reuse that
     memory instead of growing it per exec (~3/4 of an instantiate's cost with
     earlier execs alive). Nothing is launched and no torch/VMM allocation is
     made. Phase 2 never waits for it: one still running at the capture point
@@ -840,9 +840,8 @@ def check_capture_state_prebuilt(model) -> None:
     (``BaseRunner._prepare_capture_state``) built the communication state the
     first forward otherwise creates lazily: every MoE dispatcher's buffer or
     expert mapping and the logits all-gather state. Built inside a capture, they
-    record garbage (the expert mapping) or abort (DeepEP buffers); built after
-    LOAD's ``restore_binaries`` (hooks step 3), their driver-placed memory lands at
-    other addresses than on SAVE. Raises naming what is still unbuilt."""
+    record garbage (the expert mapping) or abort (DeepEP buffers). Raises naming
+    what is still unbuilt."""
     from sglang.srt.layers.logits_processor import LogitsProcessor
     from sglang.srt.layers.moe.token_dispatcher.base import iter_dispatchers
 

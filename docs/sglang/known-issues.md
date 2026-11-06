@@ -32,6 +32,17 @@ Why it is expected to work: v2's windows are library-owned physical memory at a 
 pre-capture bootstrap on both SAVE and LOAD, the same model as DeepEP v1's NVSHMEM heap; the
 `NCCL_GRAPH_REGISTER=0` / `NCCL_LOCAL_REGISTER=0` / `NCCL_NVLS_ENABLE=0` pins stay in force.
 
+## DeepEP v2: NCCL's window descriptor is placed by the driver (NOTE, 2026-11-06)
+
+DeepEP v2 kernels take NCCL's window by address, and NCCL allocates the window descriptor from a CUDA memory pool
+(`ncclCommWindowRegister`), which the driver places itself: the pool API takes no address, so this is the one device
+address in the graphs that the region does not control. The driver's choice is deterministic: SAVE and LOAD get the
+same address when they run with the same environment and the same steps before the first capture scope (measured on
+drivers 580 and 595, in either position of LOAD's binary restore and exec prewarm). Foundry relies on that and does
+not interpose the pool API. Consequence: SAVE and LOAD must use identical environment variables (for example
+`CUDA_MODULE_LOADING`); a difference can move the pool by 512 MiB, and the restored dispatch then fails at the first
+replay with an illegal memory access while the region offsets still match.
+
 ## Event-record nodes (TODO, 2026-10-02)
 
 **Why SGLang has an in-graph event.** The overlap scheduler writes batch N+1's shared buffers (`req_to_token`,
