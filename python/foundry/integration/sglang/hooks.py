@@ -499,8 +499,6 @@ def _decode_capture_scope(model, kind: str, flashinfer_tactics: str | None = Non
     _begin_graph_layout(model, mode, flashinfer_tactics)
 
     if mode == CUDAGraphExtensionMode.LOAD:
-        import torch
-
         from foundry.integration.sglang.graph_ops import (
             finish_decode_graph_restore,
             has_prefill_graphs,
@@ -550,13 +548,6 @@ def _decode_capture_scope(model, kind: str, flashinfer_tactics: str | None = Non
             # with the caching allocator as SAVE left it: no empty_cache here.
             return
         rt.log_alloc_offset("after_load_all_graphs")
-
-        # Surrender torch-cached-but-free segments so later eager allocations
-        # cannot reuse VA ranges that restored graphs may reference internally
-        # (torch graph pools provide this protection on SAVE; LOAD rebuilds
-        # graph memory at the driver level with no pool bookkeeping).
-        torch.cuda.empty_cache()
-        rt.log_alloc_offset("after_post_load_empty_cache")
         return
 
     # SAVE: the same upstream loop; capture_one captures and saves each graph.

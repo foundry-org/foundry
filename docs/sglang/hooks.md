@@ -49,8 +49,7 @@ The alloc-offset log lines (`[Foundry] SGLang alloc_offset[<point>]=...`) mark e
 `before_memory_pool_config`, `before/after_collective_bootstrap`,
 `after_lazy_runtimes` (SAVE), `before/after_preallocate`,
 `before/after_prefill_restore` (prefill graphs on),
-`before_decode_restore`, `after_load_all_graphs` (must equal SAVE's `final_alloc_offset`),
-`after_post_load_empty_cache`.
+`before_decode_restore`, `after_load_all_graphs` (must equal SAVE's `final_alloc_offset`).
 
 ## Pre-capture bootstraps and EP additions
 
