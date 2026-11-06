@@ -24,15 +24,13 @@ decoding runners (EAGLE target verify, draft decode, draft extend) are told
 apart; a 2.0 caller passes none, which means the plain target decode runner.
 2.2 adds ``flashinfer_tactics`` to :func:`capture_scope`. 2.3 adds
 :func:`record_memory_pool_config`, one call at the end of
-``_resolve_memory_pool_config`` that replaces :func:`record_memory_pool_overrides`
-plus the two ``alloc_memory_pool`` calls (:func:`before_alloc_memory_pool`,
-:func:`after_alloc_memory_pool`); those three stay for 2.2 callers.
-SGLang's 2.3 call sites also no longer call :func:`validate_graph_config`
-(:func:`validate_resolved_server_args` checks the same), :func:`apply_env_pins`
-(resolution and every :func:`configure_subprocess` apply the pins),
-:func:`after_parallel_init` (an offset log) or
+``_resolve_memory_pool_config``. 2.2 callers are not supported: the functions
+only they called (``record_memory_pool_overrides``,
+``before_alloc_memory_pool``, ``after_alloc_memory_pool``,
+``validate_graph_config``, ``apply_env_pins``, ``after_parallel_init``) are
+gone. SGLang's 2.3 call sites do not call
 :func:`after_runner_distributed_init` (the scratch skip, a no-op once the
-cursor is past ``scratch_space_size``); they stay for 2.2 callers.
+cursor is past ``scratch_space_size``) either.
 
 Call sites (SGLang side, in process order):
 
@@ -166,16 +164,6 @@ def pin_server_args(server_args: Any) -> None:
     plugin.pin_unreplayable_fields(server_args)
 
 
-def validate_graph_config(server_args: Any) -> None:
-    """After ``handle_cuda_graph_config``: the resolved ``cuda_graph_config``
-    (which also covers ``--cuda-graph-config`` JSON) must be decode ``full``
-    and prefill ``full`` / ``disabled``."""
-    _require_active()
-    from foundry.integration.sglang import plugin
-
-    plugin.validate_resolved_graph_config(server_args)
-
-
 def validate_resolved_server_args(server_args: Any) -> None:
     """After ``handle_other_validations``: reject what Foundry cannot persist
     (speculative decoding other than EAGLE / EAGLE3, LoRA, PD multiplexing,
@@ -189,15 +177,6 @@ def validate_resolved_server_args(server_args: Any) -> None:
     plugin.reject_unsupported_features(server_args)
     plugin.validate_resolved_graph_config(server_args)
     plugin.validate_pinned_fields(server_args)
-    plugin.apply_env_pins(server_args)
-
-
-def apply_env_pins(server_args: Any = None) -> None:
-    """Set ``plugin.ENV_PINS`` (and, with ``server_args``, ``NCCL_CUMEM_ENABLE``)
-    in ``os.environ``; a contrary user value raises. Idempotent."""
-    _require_active()
-    from foundry.integration.sglang import plugin
-
     plugin.apply_env_pins(server_args)
 
 
@@ -241,14 +220,6 @@ def before_parallel_init(device: str) -> None:
     hooks.before_parallel_init(device)
 
 
-def after_parallel_init() -> None:
-    """End of ``bootstrap.init_parallel_runtime`` (allocation-offset log)."""
-    _require_active()
-    from foundry.integration.sglang import hooks
-
-    hooks.after_parallel_init()
-
-
 def after_runner_distributed_init(is_draft_worker: bool) -> None:
     """End of ``ModelRunner.init_torch_distributed``: move the allocation
     cursor to the scratch boundary so weight loading starts at the same offset
@@ -276,42 +247,11 @@ def record_memory_pool_config(memory_pool_config: Any) -> None:
     resolver issued and writes both into the rank's ``warmup_state.json`` for
     LOAD (whose resolver returns early through
     :func:`replay_saved_memory_pool_config`). The resolver runs for the target
-    runner only (draft workers reuse its config), so no draft flag is needed.
-    Replaces :func:`record_memory_pool_overrides` + :func:`before_alloc_memory_pool`
-    + :func:`after_alloc_memory_pool`, which remain for 2.2 callers."""
+    runner only (draft workers reuse its config), so no draft flag is needed."""
     _require_active()
     from foundry.integration.sglang import hooks
 
     hooks.record_memory_pool_config(memory_pool_config)
-
-
-def record_memory_pool_overrides() -> None:
-    """2.2 (superseded by :func:`record_memory_pool_config`): end of
-    ``_resolve_memory_pool_config`` (SAVE keeps the overrides the resolver
-    issued)."""
-    _require_active()
-    from foundry.integration.sglang import hooks
-
-    hooks.record_memory_pool_overrides()
-
-
-def before_alloc_memory_pool(is_draft_worker: bool) -> None:
-    """2.2 (not called by a 2.3 caller): head of ``ModelRunner.alloc_memory_pool``
-    (allocation-offset log; draft workers skipped)."""
-    _require_active()
-    from foundry.integration.sglang import hooks
-
-    hooks.before_alloc_memory_pool(is_draft_worker)
-
-
-def after_alloc_memory_pool(memory_pool_config: Any, is_draft_worker: bool) -> None:
-    """2.2 (superseded by :func:`record_memory_pool_config`): end of
-    ``ModelRunner.alloc_memory_pool``: SAVE records the resolved
-    ``MemoryPoolConfig`` (a dataclass) for LOAD; draft workers skipped."""
-    _require_active()
-    from foundry.integration.sglang import hooks
-
-    hooks.after_alloc_memory_pool(memory_pool_config, is_draft_worker)
 
 
 def capture_scope(
