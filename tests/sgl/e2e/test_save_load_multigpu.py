@@ -19,7 +19,9 @@ Native, SAVE and LOAD all run with the variables of recipe/sglang/set_env.sh (a 
 already exported wins, as there), plus NCCL_CUMEM_ENABLE=0 and NCCL_NVLS_ENABLE=0.
 
 Qwen3.5 (hybrid gated DeltaNet) and DeepSeek-V4 cannot capture full-backend prefill graphs in plain SGLang (the GDN
-backend's out-of-graph metadata is decode-only; the DSV4 backend rejects EXTEND), so every case here is decode-only.
+backend's out-of-graph metadata is decode-only; the DSV4 backend rejects EXTEND), so the recipe cases are decode-only.
+q35_tp2_breakable adds breakable prefill graphs (SGLang's CUDA default; integration API 2.5), which Qwen3.5 can
+capture: its LOAD must also restore them on every rank.
 
     pytest tests/sgl/e2e/test_save_load_multigpu.py -m "slow and multigpu and not xlarge" -v -s   # 35B, 2 GPUs
     pytest tests/sgl/e2e/test_save_load_multigpu.py -m "slow and xlarge" -v -s                    # 4 GPUs
@@ -66,6 +68,7 @@ _PROMPTS = [
 _SAMPLING = {"temperature": 0, "max_new_tokens": 64, "ignore_eos": True}
 
 _LOADED = re.compile(r"\[Foundry\] Loaded (\d+) SGLang graphs in ([0-9.]+)s")
+_LOADED_BREAKABLE = re.compile(r"\[Foundry\] Loaded (\d+) SGLang breakable prefill graphs")
 _CAPTURED = re.compile(
     r"Capture (?:target decode CUDA graph|cuda graph) end\..*?(?:elapsed=|Time elapsed: )([0-9.]+) ?s"
 )
@@ -145,6 +148,9 @@ CASES = [
           ["--tp-size", "2", "--ep-size", "2"] + _DEEPEP
           + ["--chunked-prefill-size", "256", "--attention-backend", "fa3", "--max-running-requests", "512"],
           _decode_step(2, MAXBS), memfrac=0.8, weights="real", env=_EP_ENV),
+    # Not a recipe case: q35_tp2 with breakable prefill graphs (the later flag wins over _COMMON_ARGS).
+    _case("q35_tp2_breakable", _Q35, 2, ["--tp-size", "2", "--cuda-graph-backend-prefill", "breakable"],
+          _decode_max(MAXBS), memfrac=0.8, weights="real"),
     # serve_qwen3.5-122ba10b.sh ep4 (common args :49-53): model :8, mamba :17 / :51,
     # GRAPHS :18-19, TOPO :22-24, env :39, MEMFRAC :43.
     _case("q35_122b_fp8_ep4", "Qwen/Qwen3.5-122B-A10B-FP8", 4,
@@ -259,6 +265,10 @@ def test_save_then_load_multigpu(case, tmp_path):
         save_offsets,
         load_offsets,
     )
+
+    if "breakable" in case["args"]:
+        restored = _LOADED_BREAKABLE.findall(load["log"])
+        assert len(restored) == case["gpus"] and len(set(restored)) == 1, restored
 
     # (a)
     assert save["ids"] == native["ids"]

@@ -307,13 +307,40 @@ def test_explicit_full_prefill_is_honoured(model_dir, persistence):
     ],
 )
 def test_non_full_backend_flag_falls_back(model_dir, persistence, field, match):
-    """Nothing is declared: the record resolves as without the flag."""
+    """Nothing is declared: the record resolves as without the flag. With an
+    SGLang whose breakable backend does not call Foundry (before integration
+    API 2.5), breakable falls back for both phases."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
-    sa = _resolve_unsupported(model_dir, persistence, match, **{field: Backend.BREAKABLE})
+    with mock.patch.object(pins, "sglang_calls_breakable_capture", return_value=False):
+        sa = _resolve_unsupported(model_dir, persistence, match, **{field: Backend.BREAKABLE})
     declared = dict(sa._resolved_overrides)
     assert pins.RESOLUTION_SOURCE not in declared
     assert pins.PIN_RESOLUTION_SOURCE not in declared
+
+
+def test_breakable_prefill_is_accepted_when_sglang_calls_foundry(model_dir, persistence):
+    """2.5: SGLang's breakable backend hands its capture to Foundry, so an
+    explicit breakable prefill backend is honoured; decode stays full."""
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    with mock.patch.object(pins, "sglang_calls_breakable_capture", return_value=True):
+        sa = _resolve(model_dir, cuda_graph_backend_prefill=Backend.BREAKABLE)
+    cfg = resolution_result(sa, "cuda_graph_config")
+    assert cfg.prefill.backend == Backend.BREAKABLE
+    assert cfg.decode.backend == Backend.FULL
+
+
+def test_breakable_decode_stays_rejected(model_dir, persistence):
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    with mock.patch.object(pins, "sglang_calls_breakable_capture", return_value=True):
+        _resolve_unsupported(
+            model_dir,
+            persistence,
+            "Foundry persists full decode graphs only",
+            cuda_graph_backend_decode=Backend.BREAKABLE,
+        )
 
 
 @pytest.mark.parametrize(
@@ -326,7 +353,8 @@ def test_non_full_backend_flag_falls_back(model_dir, persistence, field, match):
 def test_cuda_graph_config_json_is_validated(model_dir, persistence, json_cfg, match):
     """JSON outranks the per-phase flags, so the flag check alone misses it.
     (Passed as the parsed dict: parse_cuda_graph_config reads ``.items()``.)"""
-    _resolve_unsupported(model_dir, persistence, match, cuda_graph_config=json_cfg)
+    with mock.patch.object(pins, "sglang_calls_breakable_capture", return_value=False):
+        _resolve_unsupported(model_dir, persistence, match, cuda_graph_config=json_cfg)
 
 
 @pytest.mark.parametrize("field", ["disable_cuda_graph", "disable_decode_cuda_graph"])

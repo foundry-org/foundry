@@ -19,14 +19,18 @@ decoding runners (EAGLE target verify, draft decode, draft extend) are told
 apart; a 2.0 caller passes none, which means the plain target decode runner.
 2.2 adds ``flashinfer_tactics`` to :func:`capture_scope`. 2.3 adds
 :func:`record_memory_pool_config`, one call at the end of
-``_resolve_memory_pool_config``. 2.2 callers are not supported: the functions
+``_resolve_memory_pool_config``. 2.2 callers are
+not supported: the functions
 only they called (``record_memory_pool_overrides``,
 ``before_alloc_memory_pool``, ``after_alloc_memory_pool``,
 ``validate_graph_config``, ``apply_env_pins``, ``after_parallel_init``,
 ``after_runner_distributed_init``) are gone. 2.4 adds the fallback contract:
 the detection points raise :class:`Unsupported` (never another type), the
 adapter catches exactly that type, calls :func:`deactivate` and continues
-natively; :func:`log_init_summary` closes the scheduler's init.
+natively; :func:`log_init_summary` closes the scheduler's init. 2.5 adds
+:func:`capture_one_breakable`, called by ``BreakableCudaGraphBackend.capture_one``;
+the breakable prefill backend is accepted only when SGLang's adapter has that
+call (an older SGLang with it falls back).
 
 Call sites (SGLang side, in process order):
 
@@ -50,6 +54,8 @@ decode runner ``capture``                        :func:`capture_scope`
 prefill runner ``capture``                       :func:`capture_scope`
 ``FullCudaGraphBackend.capture_one``             :func:`capture_one` (replaces the body)
 ``run_scheduler_process``, after ``Scheduler``   :func:`log_init_summary` (2.4)
+``BreakableCudaGraphBackend.capture_one``       :func:`capture_one_breakable` (2.5;
+                                                 replaces warm-up + capture)
 ===============================================  =========================================
 
 Fallback (2.4). Outside the configurations Foundry supports, a detection point
@@ -80,7 +86,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-INTEGRATION_API_VERSION = (2, 4)
+INTEGRATION_API_VERSION = (2, 5)
 MODES = ("save", "load")
 FLAG = "--cuda-graph-persistence"
 # Set only around the spawns of a launcher that fell back (configure_subprocess),
@@ -359,3 +365,19 @@ def capture_one(shape_key: Any, forward_fn, *, pool: Any, stream: Any):
     from foundry.integration.sglang import hooks
 
     return hooks.capture_one(shape_key, forward_fn, pool=pool, stream=stream)
+
+
+def capture_one_breakable(shape_key: Any, capture):
+    """Replaces the warm-up and capture of ``BreakableCudaGraphBackend.capture_one``
+    (2.5, inside the prefill :func:`capture_scope`) and returns ``(graph,
+    output)`` for SGLang to store. ``capture(segment_graph_factory=...)`` is the
+    backend's capture body: SAVE calls it once, without warm-up forwards, with
+    foundry graphs for the segments, and archives the segments and the breaks;
+    LOAD does not call it, restores the segments and rebuilds the breaks, and
+    runs no forward. SAVE raises :class:`Unsupported` (``step="capture"``, on
+    every rank alike) as :func:`capture_one` does when the capture created an
+    attribute of a dispatcher or logits processor."""
+    _require_active()
+    from foundry.integration.sglang import hooks
+
+    return hooks.capture_one_breakable(shape_key, capture)

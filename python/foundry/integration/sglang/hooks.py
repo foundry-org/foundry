@@ -187,7 +187,11 @@ def log_init_summary() -> None:
     if mode == CUDAGraphExtensionMode.SAVE:
         done = f"{state.capture_index} graphs saved"
     else:
-        done = f"{len(state.loaded_graphs)} graphs restored"
+        from foundry.integration.sglang import breakable_ops
+
+        # A breakable shape is one entry holding its segment graphs.
+        graphs = sum(1 for key in state.loaded_graphs if key[0] != "breakable")
+        done = f"{graphs + breakable_ops.restored_segment_count()} graphs restored"
     logger.info(
         "[Foundry] init summary: cuda-graph persistence %s, %s (%s)",
         mode.value,
@@ -505,11 +509,9 @@ def _save_capture(shape_key, variant, forward_fn, *, pool, stream):
     from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
 
     from foundry.integration.sglang.graph_ops import (
-        agree_unsupported,
         attribute_snapshot,
         capture_graph,
         created_attributes,
-        reset_created_attributes,
     )
 
     graph = out = None
@@ -521,16 +523,28 @@ def _save_capture(shape_key, variant, forward_fn, *, pool, stream):
         with graph_pool_capture_scope():
             graph, out = capture_graph(pool, stream, forward_fn)
         created = created_attributes(_snapshot_objects, before)
-        reason = None
-        if created:
-            counts: dict[str, int] = {}
-            for obj, name, _ in created:
-                key = f"{type(obj).__name__}.{name}"
-                counts[key] = counts.get(key, 0) + 1
-            names = ", ".join(
-                key if n == 1 else f"{key} ({n} objects)" for key, n in counts.items()
-            )
-            reason = f"{names} created during graph capture"
+        reason = _created_reason(created)
+    _agree_capture_supported(reason, created, graph)
+    return graph, out
+
+
+def _created_reason(created: list) -> str | None:
+    if not created:
+        return None
+    counts: dict[str, int] = {}
+    for obj, name, _ in created:
+        key = f"{type(obj).__name__}.{name}"
+        counts[key] = counts.get(key, 0) + 1
+    names = ", ".join(key if n == 1 else f"{key} ({n} objects)" for key, n in counts.items())
+    return f"{names} created during graph capture"
+
+
+def _agree_capture_supported(reason: str | None, created: list, graph) -> None:
+    """SAVE, after one capture: the vote of :func:`graph_ops.agree_unsupported`;
+    on a fallback the created attributes are reset and ``graph`` is kept alive
+    (see ``_discarded_graphs``)."""
+    from foundry.integration.sglang.graph_ops import agree_unsupported, reset_created_attributes
+
     try:
         agree_unsupported("capture", reason)
     except Unsupported:
@@ -538,7 +552,59 @@ def _save_capture(shape_key, variant, forward_fn, *, pool, stream):
         if graph is not None:
             _discarded_graphs.append(graph)
         raise
-    return graph, out
+
+
+def capture_one_breakable(shape_key, capture):
+    """Replaces ``BreakableCudaGraphBackend.capture_one`` for one shape inside
+    the prefill :func:`capture_scope` (integration API 2.5). ``capture`` is
+    the backend's capture body, ``capture(segment_graph_factory=...)``
+    returning ``(graph, output)``: SAVE runs it once, without warm-up
+    forwards, and archives the segments and breaks; LOAD restores them and
+    runs no forward (see :mod:`.breakable_ops`)."""
+    from foundry.integration.sglang import breakable_ops
+
+    mode = get_graph_extension_mode()
+    if mode == CUDAGraphExtensionMode.NONE:
+        raise RuntimeError("[Foundry] capture_one_breakable called without SAVE or LOAD")
+    if _scope is None or _scope[0] != "prefill":
+        raise RuntimeError(
+            "[Foundry] capture_one_breakable called outside the prefill capture_scope"
+        )
+    if mode == CUDAGraphExtensionMode.LOAD:
+        return breakable_ops.restore_shape(shape_key)
+    variant = getattr(shape_key, "attention_variant", None)
+    if variant is not None:
+        _agree_capture_supported(
+            f"shape {shape_key} is an attention graph variant ({variant!r})", [], None
+        )
+    else:
+        _agree_capture_supported(None, [], None)
+
+    def checked_capture(**kwargs):
+        # As _save_capture: a capture that created a dispatcher or logits
+        # processor attribute falls back on every rank (raised before
+        # save_shape writes this shape's files).
+        from foundry.integration.sglang.graph_ops import attribute_snapshot, created_attributes
+
+        before = attribute_snapshot(_snapshot_objects)
+        graph, out = capture(**kwargs)
+        created = created_attributes(_snapshot_objects, before)
+        _agree_capture_supported(_created_reason(created), created, graph)
+        return graph, out
+
+    return breakable_ops.save_shape(shape_key, checked_capture)
+
+
+def _prefill_backend_is_breakable() -> bool:
+    """The prefill backend this process resolved (published in the runtime
+    context before any runner is built)."""
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.runtime_context import get_exec
+
+    cfg = get_exec().graph.cuda_graph_config
+    if cfg is None:
+        raise RuntimeError("[Foundry] no CUDA graph config is published for this process")
+    return cfg.prefill.backend == Backend.BREAKABLE
 
 
 @contextlib.contextmanager
@@ -547,7 +613,8 @@ def _prefill_capture_scope(model, req_slots: int, flashinfer_tactics: str | None
     loop, runs inside on both modes). ``model``: the loaded model (the
     first scope checks its prebuilt state); ``req_slots``: the runner's fixed request-
     slot count, recorded with the prefill graphs. The prefill backend is
-    full: the resolution step validated it (full or disabled)."""
+    full or breakable: the resolution step validated it (full, breakable when
+    SGLang calls :func:`capture_one_breakable`, or disabled)."""
     mode = get_graph_extension_mode()
     if mode == CUDAGraphExtensionMode.NONE:
         yield
@@ -562,6 +629,10 @@ def _prefill_capture_scope(model, req_slots: int, flashinfer_tactics: str | None
 
     _begin_graph_layout(model, mode, flashinfer_tactics)
     dp_flags = get_flags().dp
+    if _prefill_backend_is_breakable():
+        with _breakable_prefill_scope(model, mode, req_slots, dp_flags):
+            yield
+        return
     if mode == CUDAGraphExtensionMode.LOAD:
         _preallocate_once()
         record = start_prefill_graph_restore()
@@ -589,6 +660,36 @@ def _prefill_capture_scope(model, req_slots: int, flashinfer_tactics: str | None
         return  # fell back inside the scope (capture_one); the archive is invalid
     rt.log_alloc_offset("save_after_prefill_capture")
     save_prefill_graph_state(
+        req_slots=req_slots,
+        has_dp_gather=bool(dp_flags.prefill_graph_has_dp_gather),
+    )
+
+
+@contextlib.contextmanager
+def _breakable_prefill_scope(model, mode, req_slots: int, dp_flags):
+    """The prefill scope with the breakable backend: as for full prefill
+    graphs, SGLang's capture loop runs on both modes and only each shape's
+    capture is replaced (:func:`capture_one_breakable`)."""
+    from foundry.integration.sglang import breakable_ops
+
+    breakable_ops.begin_scope(model)
+    if mode == CUDAGraphExtensionMode.LOAD:
+        _preallocate_once()
+        record = breakable_ops.start_restore()
+        if record.get("prefill_graph_has_dp_gather"):
+            dp_flags.prefill_graph_has_dp_gather = True
+        rt.log_alloc_offset("before_prefill_restore")
+        t_loop = time.perf_counter()
+        yield
+        breakable_ops.finish_restore(time.perf_counter() - t_loop)
+        rt.log_alloc_offset("after_prefill_restore")
+        return
+    rt.log_alloc_offset("save_before_prefill_capture")
+    yield
+    if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
+        return  # fell back inside the scope (capture_one_breakable); the archive is invalid
+    rt.log_alloc_offset("save_after_prefill_capture")
+    breakable_ops.save_state(
         req_slots=req_slots,
         has_dp_gather=bool(dp_flags.prefill_graph_has_dp_gather),
     )
@@ -625,7 +726,11 @@ def _decode_capture_scope(model, kind: str, flashinfer_tactics: str | None = Non
         )
 
         state = rt.get_state()
-        if has_prefill_graphs() and not state.prefill_graphs_restored:
+        from foundry.integration.sglang import breakable_ops
+
+        if (
+            has_prefill_graphs() or breakable_ops.has_graphs()
+        ) and not state.prefill_graphs_restored:
             # SAVE's layout includes the prefill runner and its graphs;
             # without them every later address would be off.
             raise RuntimeError(
@@ -738,7 +843,7 @@ def capture_scope(
 
 def _check_resolved_graph_config(server_args) -> None:
     """Launcher, before any scheduler is spawned: the record must have been
-    resolved with Foundry's graph pins (decode ``full``, prefill ``full`` or
+    resolved with Foundry's graph pins (decode ``full``, prefill ``full``, ``breakable`` or
     ``disabled``). They are declared by :func:`api.pin_server_args`; a record
     resolved without them would start without them and SAVE / LOAD would
     disagree with the archive."""
@@ -754,10 +859,12 @@ def _check_resolved_graph_config(server_args) -> None:
         return
     decode = cfg.decode.backend
     prefill = cfg.prefill.backend
-    if decode != Backend.FULL or prefill not in (Backend.FULL, Backend.DISABLED):
+    from foundry.integration.sglang.pins import supported_prefill_backends
+
+    if decode != Backend.FULL or prefill not in supported_prefill_backends():
         raise RuntimeError(
             "[Foundry] the resolved CUDA-graph config is "
             f"decode={decode!r} prefill={prefill!r}; Foundry needs decode 'full' and "
-            "prefill 'full' or 'disabled'. The server args were resolved without "
+            f"prefill one of {supported_prefill_backends()}. The server args were resolved without "
             "Foundry's pins (--cuda-graph-persistence)."
         )

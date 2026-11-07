@@ -79,6 +79,36 @@ def _backend():
     return Backend
 
 
+def sglang_calls_breakable_capture() -> bool:
+    """Whether this SGLang's breakable backend hands its capture to Foundry
+    (``FoundryAdapter.capture_one_breakable``, integration API 2.5). An older
+    SGLang captures breakable graphs itself, which Foundry cannot archive."""
+    try:
+        from sglang.srt.utils.foundry_adapter import FoundryAdapter
+    except ImportError:
+        return False
+    return hasattr(FoundryAdapter, "capture_one_breakable")
+
+
+def supported_prefill_backends() -> tuple[str, ...]:
+    Backend = _backend()
+    if sglang_calls_breakable_capture():
+        return (Backend.FULL, Backend.BREAKABLE, Backend.DISABLED)
+    return (Backend.FULL, Backend.DISABLED)
+
+
+def _prefill_backend_hint() -> str:
+    if sglang_calls_breakable_capture():
+        return (
+            "Foundry persists full and breakable prefill graphs; "
+            "use 'full', 'breakable' or 'disabled'"
+        )
+    return (
+        "Foundry persists full prefill graphs only with this SGLang (its breakable backend "
+        "does not call Foundry); use 'full' or 'disabled'"
+    )
+
+
 def _raise_unsupported(errors: list[str], step: str = "server args") -> None:
     if errors:
         raise Unsupported(step, "; ".join(errors))
@@ -105,11 +135,8 @@ def _graph_field_conflicts(server_args: Any) -> list[str]:
             f"--cuda-graph-backend-decode={decode!r}: Foundry persists full decode graphs only"
         )
     prefill = getattr(cfg, "cuda_graph_backend_prefill", None)
-    if prefill not in (None, Backend.FULL, Backend.DISABLED):
-        errors.append(
-            f"--cuda-graph-backend-prefill={prefill!r}: Foundry persists full prefill graphs "
-            "only ('full' or 'disabled')"
-        )
+    if prefill is not None and prefill not in supported_prefill_backends():
+        errors.append(f"--cuda-graph-backend-prefill={prefill!r}: {_prefill_backend_hint()}")
     if getattr(cfg, "enable_profile_cuda_graph", False):
         errors.append(
             "--enable-profile-cuda-graph: profiling adds allocations to the capture that LOAD "
@@ -126,10 +153,12 @@ def check_pinnable(server_args: Any) -> None:
 
 
 def pin_graph_fields(server_args: Any) -> None:
-    """Decode ``full``; prefill ``full`` or ``disabled`` (default ``disabled``, not
-    the platform default, which on CUDA is ``breakable``; leaving it unset
-    would also let a model default such as Inkling's pick it); profiling and
-    FlashInfer autotune off (tuned tactics come from the cache file / archive)."""
+    """Decode ``full``; prefill ``full``, ``breakable`` (when SGLang's
+    breakable backend calls Foundry, see :func:`sglang_calls_breakable_capture`)
+    or ``disabled`` (default ``disabled``, not the platform default, which on
+    CUDA is ``breakable``; leaving it unset would also let a model default such
+    as Inkling's pick it); profiling and FlashInfer autotune off (tuned tactics
+    come from the cache file / archive)."""
     from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
     _raise_unsupported(_graph_field_conflicts(server_args))
@@ -147,7 +176,7 @@ def pin_graph_fields(server_args: Any) -> None:
 def validate_resolved_graph_config(server_args: Any) -> None:
     """The resolved ``cuda_graph_config`` (JSON > per-phase flags > legacy
     flags > defaults, then the compatibility cascades) must still be decode
-    ``full`` and prefill ``full`` / ``disabled``."""
+    ``full`` and prefill one of :func:`supported_prefill_backends`."""
     from sglang.srt.arg_groups.overrides import resolving_view
 
     Backend = _backend()
@@ -163,11 +192,8 @@ def validate_resolved_graph_config(server_args: Any) -> None:
             "only (check --cuda-graph-config, and disaggregation roles that turn decode graphs "
             "off)"
         )
-    if prefill not in (Backend.FULL, Backend.DISABLED):
-        errors.append(
-            f"cuda_graph_config[prefill].backend={prefill!r}: Foundry persists full prefill "
-            "graphs only ('full' or 'disabled')"
-        )
+    if prefill not in supported_prefill_backends():
+        errors.append(f"cuda_graph_config[prefill].backend={prefill!r}: {_prefill_backend_hint()}")
     _raise_unsupported(errors)
 
 

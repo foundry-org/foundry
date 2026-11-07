@@ -135,6 +135,11 @@ def graph_partition(filename: str) -> str:
     target decode graphs keep the plain "decode" partition name."""
     if _PREFILL_GRAPH_FILENAME_RE.match(filename):
         return "prefill"
+    from foundry.integration.sglang.breakable_ops import BCG_FILENAME_RE
+
+    match = BCG_FILENAME_RE.match(filename)
+    if match:
+        return f"breakable:{match.group('scope')}"
     match = _KIND_GRAPH_FILENAME_RE.match(filename)
     if match:
         return f"decode:{match.group('kind')}"
