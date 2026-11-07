@@ -211,6 +211,61 @@ def test_capture_that_creates_nothing_is_saved(scheduler, monkeypatch):
     assert not os.path.exists(os.path.join(cfg.workspace_root, rt._INVALID_FILE))
 
 
+def _breakable_scope(monkeypatch):
+    """The prefill scope with the breakable backend, without SGLang's runtime
+    context or a device."""
+    import sglang.srt.runtime_context as runtime_context
+
+    dp = SimpleNamespace(prefill_graph_has_dp_gather=False)
+    monkeypatch.setattr(runtime_context, "get_flags", lambda: SimpleNamespace(dp=dp))
+    monkeypatch.setattr(hooks, "_prefill_backend_is_breakable", lambda: True)
+    monkeypatch.setattr(rt, "_default_pool_small_free", lambda: {})
+    monkeypatch.setattr(rt, "log_alloc_offset", lambda label: None)
+
+
+def test_breakable_capture_that_creates_state_falls_back(scheduler, monkeypatch):
+    """As for full graphs: the breakable shape whose capture created
+    dispatcher state is not archived, its graph is kept aside, the attributes
+    are reset, the scope writes no record and the backend captures natively."""
+    from foundry.integration.sglang import breakable_ops
+
+    adapter, cfg, _ = scheduler("save")
+    _breakable_scope(monkeypatch)
+    recorded = []
+    monkeypatch.setattr(breakable_ops, "save_state", lambda **kw: recorded.append(kw))
+    graph = _Graph()
+    dispatcher = _PrebuiltDispatcher()
+
+    def capture(**kwargs):
+        dispatcher.cache = torch.zeros(1)
+        return graph, torch.zeros(1)
+
+    key = SimpleNamespace(size=8, variant_label=None, attention_variant=None)
+    with adapter.capture_scope(phase="prefill", model=_model(dispatcher), req_slots=1):
+        captured = adapter.capture_one_breakable(shape_key=key, capture=capture)
+    assert captured is None
+    assert graph.resets == 0 and graph in hooks._discarded_graphs
+    assert dispatcher.cache is None
+    assert recorded == []
+    marker = _marker(cfg)
+    assert marker["step"] == "capture"
+    assert "_PrebuiltDispatcher.cache" in marker["reason"]
+
+
+def test_breakable_attention_variant_falls_back_before_capture(scheduler, monkeypatch):
+    adapter, cfg, _ = scheduler("save")
+    _breakable_scope(monkeypatch)
+
+    def capture(**kwargs):
+        raise AssertionError("an attention graph variant was captured")
+
+    key = SimpleNamespace(size=8, variant_label=None, attention_variant="dual")
+    with adapter.capture_scope(phase="prefill", model=_model(_PrebuiltDispatcher()), req_slots=1):
+        captured = adapter.capture_one_breakable(shape_key=key, capture=capture)
+    assert captured is None
+    assert "attention graph variant" in _marker(cfg)["reason"]
+
+
 # ---------------------------------------------------------------------------
 # LOAD of an invalid archive
 # ---------------------------------------------------------------------------
