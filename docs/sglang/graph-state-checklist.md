@@ -113,7 +113,7 @@ Rec = recorded at SAVE, App = applied at LOAD, Det = detected when missing, Test
 
 ### 2.7 SGLang flags Foundry pins or rejects (`pins.py`)
 
-Decode backend full; prefill full or disabled; no breakable; no `--cuda-graph-config` contradiction;
+Decode backend full; prefill full, breakable (SGLang with `capture_one_breakable`, integration API 2.4) or disabled; no `--cuda-graph-config` contradiction;
 no `--disable-cuda-graph`; profiling and autotune off; speculative decoding other than EAGLE / EAGLE3, LoRA, pdmux, elastic-EP recapture and
 attention graph variants rejected; missing bs at LOAD is an error; graph-pool borrow forced off.
 
