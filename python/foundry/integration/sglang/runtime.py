@@ -334,6 +334,101 @@ def mark_layout_start() -> None:
     logger.info("[Foundry] SGLang layout start offset=%d", _layout_start_offset)
 
 
+# Every foundry graph capture creates its RNG capture state: two one-element
+# tensors (one 512-byte block each) in the default pool, on the default stream,
+# kept for the graph's life (CUDAGraph::capture_begin / register_generator_state,
+# torch >= 2.13). SAVE allocates them inside the capture's hook record, LOAD in
+# finish_one_graph_load with the region suspended. When they take free space of
+# an existing small segment both modes agree; when they grow a new one, SAVE
+# maps it in the region and LOAD does not, and every later small allocation a
+# graph bakes in (an attention backend's decode graph metadata, ...) lands at a
+# different address on LOAD. So right after the layout start both modes grow the
+# small pool by the same number of blocks (SAVE: FOUNDRY_RNG_RESERVE_BLOCKS,
+# recorded in the region layout; LOAD: the recorded number, 0 for archives
+# saved before), and SAVE refuses a capture that still grew it
+# (no_small_pool_growth). Segments the reserve grew may be released by a later
+# empty_cache once free; the RNG states fill the same blocks on both modes, so
+# that release is the same on both and harmless.
+DEFAULT_RNG_RESERVE_BLOCKS = 16384
+_rng_reserve_blocks = 0
+
+
+def _default_pool_small_free() -> dict[int, int]:
+    """Default-pool small segments on the default stream -> their free bytes."""
+    stream = torch.cuda.default_stream().cuda_stream
+    out = {}
+    for seg in torch.cuda.memory_snapshot():
+        if seg.get("segment_type") != "small":
+            continue
+        if (
+            tuple(seg.get("segment_pool_id", (0, 0))) != (0, 0)
+            or seg.get("stream", stream) != stream
+        ):
+            continue
+        out[seg["address"]] = sum(b["size"] for b in seg["blocks"] if b["state"] == "inactive")
+    return out
+
+
+def _rng_reserve_count(cfg) -> int:
+    """SAVE: FOUNDRY_RNG_RESERVE_BLOCKS; LOAD: the number SAVE recorded, 0 when
+    the archive predates the reserve."""
+    if cfg.mode != CUDAGraphExtensionMode.LOAD:
+        return int(os.environ.get("FOUNDRY_RNG_RESERVE_BLOCKS", DEFAULT_RNG_RESERVE_BLOCKS))
+    if cfg.workspace_dir is None:
+        return 0
+    path = os.path.join(cfg.workspace_dir, _LAYOUT_FILE)
+    if not os.path.exists(path):
+        return 0
+    with open(path) as f:
+        return int(json.load(f).get("rng_reserve_blocks", 0))
+
+
+def _grow_small_pool(blocks: int) -> None:
+    """Allocate and free `blocks` one-element tensors on the default stream; the
+    freed blocks stay cached in the segments they grew."""
+    with torch.cuda.stream(torch.cuda.default_stream()):
+        held = [torch.empty(1, dtype=torch.long, device="cuda") for _ in range(blocks)]
+        del held
+    torch.cuda.default_stream().synchronize()
+
+
+def reserve_rng_blocks() -> None:
+    """Both modes, once, right after the layout start (LOAD: after the
+    preallocation): grow the default pool's small segments (see above)."""
+    global _rng_reserve_blocks
+    cfg = get_config()
+    if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
+        return
+    blocks = _rng_reserve_count(cfg)
+    if blocks:
+        _grow_small_pool(blocks)
+    _rng_reserve_blocks = blocks
+    log_alloc_offset("after_rng_reserve")
+
+
+@contextlib.contextmanager
+def no_small_pool_growth(what: str):
+    """SAVE, around one capture: the capture must not grow a default-stream
+    small segment of the default pool. Its RNG capture state is allocated
+    there inside the hook record; LOAD allocates it with the region suspended,
+    so a segment grown here would not exist on LOAD and later small
+    allocations a graph bakes in would move."""
+    cfg = get_config()
+    if cfg is None or cfg.mode != CUDAGraphExtensionMode.SAVE:
+        yield
+        return
+    before = set(_default_pool_small_free())
+    yield
+    grown = set(_default_pool_small_free()) - before
+    if grown:
+        raise RuntimeError(
+            f"[Foundry] capturing {what} grew {len(grown)} small segment(s) of the default pool "
+            f"(RNG block reserve: {_rng_reserve_blocks}); LOAD would place later small "
+            "allocations elsewhere. Raise FOUNDRY_RNG_RESERVE_BLOCKS "
+            f"(e.g. {max(2 * _rng_reserve_blocks, 4096)}) and save again."
+        )
+
+
 @nvtx_traced("foundry.save.record_layout")
 def record_region_layout() -> int:
     """SAVE: persist the rank's allocation layout for LOAD.
@@ -354,6 +449,7 @@ def record_region_layout() -> int:
             "final_alloc_offset": _final_alloc_offset,
             "live_ranges": ranges,
             "capture_loop_version": CAPTURE_LOOP_VERSION,
+            "rng_reserve_blocks": _rng_reserve_blocks,
         }
         with open(os.path.join(cfg.workspace_dir, _LAYOUT_FILE), "w") as f:
             json.dump(layout, f)

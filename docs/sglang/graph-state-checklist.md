@@ -60,7 +60,7 @@ Rec = recorded at SAVE, App = applied at LOAD, Det = detected when missing, Test
 | newer attributes (e.g. NVLink-utilisation scheduling) | not queried | rebuilt without them, silently | **gap G1** |
 | instantiate flags | no | template: auto-free-on-launch; member: 0 | matches torch; device-launch / node-priority unsupported |
 | topology key = node types + cluster dims only | — | — | **gap G2**: excludes edges, ports, function identity, PSS, APW, device-updatable; member dependencies are deleted without comparison |
-| RNG generator state, output tensors, node order | yes | yes | handled |
+| RNG generator state, output tensors, node order | yes | yes | handled; the RNG states' small default-pool blocks are reserved at the layout start (`reserve_rng_blocks`) so they cannot move later small allocations |
 
 ### 2.3 Node types
 

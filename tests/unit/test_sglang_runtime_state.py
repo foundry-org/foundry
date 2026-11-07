@@ -129,3 +129,62 @@ def test_capture_loop_version_is_checked_on_load_only(as_rank):
     cfg = as_rank(0, SAVE)
     _layout(cfg, capture_loop_version=1)
     runtime.check_capture_loop_version()
+
+
+@pytest.fixture
+def small_pool(monkeypatch):
+    """Stand-in for the default pool's small segments: grow(n) adds n segments."""
+    segments: dict[int, int] = {}
+    grown: list[int] = []
+    monkeypatch.setattr(runtime, "_default_pool_small_free", lambda: dict(segments))
+    monkeypatch.setattr(runtime, "_grow_small_pool", grown.append)
+    monkeypatch.setattr(runtime, "log_alloc_offset", lambda tag: None)
+    monkeypatch.setattr(runtime, "_rng_reserve_blocks", 0)
+
+    def grow(n):
+        for _ in range(n):
+            segments[len(segments) * 2**21] = 0
+
+    return SimpleNamespace(grow=grow, grown=grown)
+
+
+def test_save_reserves_the_env_count(as_rank, small_pool, monkeypatch):
+    as_rank(0, SAVE)
+    monkeypatch.delenv("FOUNDRY_RNG_RESERVE_BLOCKS", raising=False)
+    runtime.reserve_rng_blocks()
+    monkeypatch.setenv("FOUNDRY_RNG_RESERVE_BLOCKS", "64")
+    runtime.reserve_rng_blocks()
+    assert small_pool.grown == [runtime.DEFAULT_RNG_RESERVE_BLOCKS, 64]
+    assert runtime._rng_reserve_blocks == 64
+
+
+@pytest.mark.parametrize(
+    "fields, blocks",
+    [({"rng_reserve_blocks": 64}, 64), ({}, 0), (None, 0)],
+    ids=["recorded", "older-archive", "no-layout"],
+)
+def test_load_reserves_the_recorded_count(as_rank, small_pool, monkeypatch, fields, blocks):
+    cfg = as_rank(0, LOAD)
+    monkeypatch.setenv("FOUNDRY_RNG_RESERVE_BLOCKS", "999")  # ignored on LOAD
+    if fields is not None:
+        _layout(cfg, **fields)
+    runtime.reserve_rng_blocks()
+    assert small_pool.grown == ([blocks] if blocks else [])
+
+
+def test_capture_that_grows_the_small_pool_is_refused_on_save(as_rank, small_pool):
+    as_rank(0, SAVE)
+    small_pool.grow(1)
+    with runtime.no_small_pool_growth("graph a"):
+        pass  # took free space of an existing segment
+    with (
+        pytest.raises(RuntimeError, match="graph b grew 1 small segment"),
+        runtime.no_small_pool_growth("graph b"),
+    ):
+        small_pool.grow(1)
+
+
+def test_small_pool_growth_is_not_checked_on_load(as_rank, small_pool):
+    as_rank(0, LOAD)
+    with runtime.no_small_pool_growth("graph"):
+        small_pool.grow(1)

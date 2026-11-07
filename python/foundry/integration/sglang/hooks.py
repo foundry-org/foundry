@@ -399,6 +399,9 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
     # preallocate_for_load_mode maps and replays from this point.
     rt.mark_layout_start()
     state.layout_started = True
+    if mode == CUDAGraphExtensionMode.LOAD:
+        _preallocate_once()
+    rt.reserve_rng_blocks()
 
 
 def _preallocate_once() -> None:
@@ -509,7 +512,7 @@ def _save_capture(shape_key, variant, forward_fn, *, pool, stream):
         reason = f"shape {shape_key} is an attention graph variant ({variant!r})"
     else:
         before = attribute_snapshot(_snapshot_objects)
-        with graph_pool_capture_scope():
+        with graph_pool_capture_scope(), rt.no_small_pool_growth(f"graph {shape_key}"):
             graph, out = capture_graph(pool, stream, forward_fn)
         created = created_attributes(_snapshot_objects, before)
         reason = None
