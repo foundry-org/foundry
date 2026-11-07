@@ -2014,7 +2014,8 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
             event_nodes_without_flags);
   }
 
-  // Compute topology key = node types + cluster dim values per kernel node.
+  // Compute topology key = node types + cluster dim values and cluster counts
+  // per kernel node.
   // cuGraphExecUpdate does NOT propagate kernel node attribute changes
   // (set via cuGraphKernelNodeSetAttribute) to the CUgraphExec — only
   // CUDA_KERNEL_NODE_PARAMS fields are updated. This means cluster dim
@@ -2022,6 +2023,14 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
   // at launch when grid dims no longer match the stale cluster dims.
   // To avoid this, we include full cluster dim values in the topology key
   // so all graphs in a group share identical cluster dims.
+  // The cluster COUNT (grid / cluster dims, what %nclusterid reports) is in
+  // the key as well: a grid-only exec update of a cluster node leaves the
+  // device copy of that constant stale (driver 595.71.05; constant bank 0 is
+  // refreshed only when the cluster attribute itself changes), and kernels
+  // that read it (FlashInfer's Lamport all-reduce fusion uses it as the token
+  // stride) then run with the template's value. Members of one template thus
+  // launch every cluster kernel with the same number of clusters; a node
+  // without clusters may still change its grid between members.
   // This is computed BEFORE common attr extraction (which removes per-node attrs).
   {
     std::string topology_key;
@@ -2065,7 +2074,22 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
           if (cluster_values_in_key) {
             topology_key +=
                 ":C" + std::to_string(cdx) + "_" + std::to_string(cdy) + "_" + std::to_string(cdz);
+            // Cluster count per axis (0 stays 0: no grid recorded).
+            const unsigned int gx =
+                p.contains("gridDimX") ? p.at("gridDimX").to_number<unsigned int>() : 0;
+            const unsigned int gy =
+                p.contains("gridDimY") ? p.at("gridDimY").to_number<unsigned int>() : 0;
+            const unsigned int gz =
+                p.contains("gridDimZ") ? p.at("gridDimZ").to_number<unsigned int>() : 0;
+            const unsigned int nx = gx / (cdx > 0 ? cdx : 1);
+            const unsigned int ny = gy / (cdy > 0 ? cdy : 1);
+            const unsigned int nz = gz / (cdz > 0 ? cdz : 1);
+            topology_key +=
+                "N" + std::to_string(nx) + "_" + std::to_string(ny) + "_" + std::to_string(nz);
           } else {
+            // FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0 also leaves the cluster count out: both
+            // the dims and the count then rely on a driver-side refresh of the node's
+            // cluster constants after the update (cudagraph-patch cluster step).
             topology_key += ":C";
           }
         } else {

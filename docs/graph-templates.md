@@ -22,7 +22,8 @@ Graphs captured for different batch sizes of the same model almost always have
 the same structure: the same kernels in the same order with the same
 dependency DAG and the same cluster dimensions, differing only in kernel
 parameters (grid sizes, pointers, scalars). SAVE groups graphs by a topology
-key (node types + cluster dims, `save_graph_manifest`; prefill and decode
+key (node types, and for cluster launches the cluster dims and the cluster
+count = grid / cluster dims, `save_graph_manifest`; prefill and decode
 graphs are kept in separate groups) and records one **template** per group
 plus the per-node parameter sets of every other **member**. A 256-graph
 capture typically yields 12-37 groups.
@@ -151,6 +152,15 @@ it, so archives saved before this need no migration. If the recorded dims miss
 a compiled cluster, the add retries once after reading the compiled dims from
 the driver. Test: `tests/core/test_cluster_optin.py` (driver-level, no archive).
 
+A cluster launch also keeps its cluster count (grid / cluster dims) within a
+template. `cuGraphExecUpdate` with a new grid rewrites the node's launch
+parameters but not the device copy of its cluster constants (`%nclusterid`;
+driver 595.71.05), so a kernel that reads them, such as FlashInfer's Lamport
+all-reduce fusion (token stride = number of clusters), would run a member with
+the template's count. With the count in the key such members are never
+switched; graphs whose cluster kernels change their grid with the batch size
+(TP with all-reduce fusion) get one template per batch size.
+
 ## Events of a loaded graph
 
 LOAD rebuilds each EventRecord/EventWait node with an event of its own,
@@ -175,6 +185,6 @@ applies, so the other graphs of the group keep recording their own events.
 | `FOUNDRY_EXEC_POOL_PREWARM=0` | LOAD env | ablation: skip the exec-pool prewarm (Phase 2 grows the driver's exec pool itself) |
 | `FOUNDRY_PHASE2_PIPELINE=0` | LOAD env | ablation: no build/instantiate overlap, every instantiate runs inline on the build thread (the prep pool stays) |
 | `TORCHDYNAMO_DISABLE=1` | SGLang SAVE / LOAD env | SAVE runs each shape's first forward inside the capture and torch >= 2.14's dynamo refuses to trace there; pinned by Foundry on SAVE / LOAD, exported by the recipes in every mode |
-| `FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0` | SAVE env | group graphs that differ only in per-node cluster dimensions (deep_gemm picks the cluster size by M): Qwen3-30B-A3B EP2 goes from 26 to 10 templates |
+| `FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0` | SAVE env | group graphs that differ only in per-node cluster dimensions or cluster counts (deep_gemm picks the cluster size by M): Qwen3-30B-A3B EP2 goes from 26 to 10 templates. Members then switch cluster constants through the exec update, which the driver does not refresh on its own (needs cudagraph-patch's cluster step) |
 | `FOUNDRY_MMAP_ARCHIVE` (default on; `0` disables) | LOAD env | mmap `fatbin_image_packed.img` instead of reading it into memory before `cuLibraryLoadData` |
 | `FOUNDRY_DEBUG` build | compile flag | logs per-graph edge verification and template/member decisions |
