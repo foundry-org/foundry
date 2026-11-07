@@ -9,9 +9,11 @@ integration, called through ``api.py`` from SGLang's resolution steps:
   and FlashInfer autotune off (the tuning pass allocates timing-dependently
   inside the recorded sequence; the tuned tactics are installed from SGLang's
   cache file / the archive instead, see
-  ``graph_ops.bootstrap_flashinfer_tactics``). Conflicting flags raise instead
-  of being overridden. The same step pins the flags that select state Foundry
-  cannot replay (:data:`FIELD_PINS`, see "Pins" below).
+  ``graph_ops.bootstrap_flashinfer_tactics``). Conflicting flags are not
+  overridden: they raise :class:`~foundry.integration.sglang.api.Unsupported`
+  before anything is declared, and SGLang continues natively. The same step
+  pins the flags that select state Foundry cannot replay (:data:`FIELD_PINS`,
+  see "Pins" below).
 - ``validate_cuda_graph_persistence`` (``api.validate_resolved_server_args``,
   after ``handle_other_validations``): features Foundry does not support
   (speculative decoding other than EAGLE / EAGLE3), once speculative
@@ -19,6 +21,10 @@ integration, called through ``api.py`` from SGLang's resolution steps:
   (which also covers ``--cuda-graph-config`` JSON) and the pinned flags are
   checked again after the later cascades, and ``NCCL_CUMEM_ENABLE`` is pinned
   once the MoE all-to-all backend is known.
+
+Every conflict and reject here raises ``Unsupported`` (``step="server args"``,
+``"environment"`` for the environment pins): a native run of the same record
+works, so SGLang falls back to it with the reason.
 
 Pins. State that cannot be made static across processes is not supported;
 Foundry uses the cuMem-backed alternatives instead. A graph restored on LOAD
@@ -29,9 +35,9 @@ or allocator) does not exist in the LOAD process, and the restored kernels
 read addresses nobody set up. Every such feature that a flag or an
 environment variable can switch off is pinned here rather than left to the
 recipe: each pin prints one ``[Foundry] pin:`` line, and a value the user
-set explicitly to the contrary raises with the reason (never a silent
-override). Features with no Foundry logic at all are rejected instead
-(:func:`reject_unsupported_features`).
+set explicitly to the contrary makes the engine fall back with the reason
+(never a silent override). Features with no Foundry logic at all fall back
+too (:func:`reject_unsupported_features`).
 
 Environment pins (:data:`ENV_PINS`) are applied in ``api.activate``, which
 runs in the launcher at the first resolution step (so the later resolution
@@ -51,6 +57,8 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
+from foundry.integration.sglang.api import Unsupported
+
 logger = logging.getLogger(__name__)
 
 # Declaration source recorded in the resolution stash.
@@ -58,10 +66,6 @@ RESOLUTION_SOURCE = "foundry_graph_extension"
 # Source of the unreplayable-state pins (FIELD_PINS), kept apart so that each
 # declaration can be read back on its own.
 PIN_RESOLUTION_SOURCE = "foundry_graph_extension_pins"
-# How the messages below name the activation.
-_FLAG = "Foundry graph persistence (--cuda-graph-persistence)"
-_DISABLE_HINT = "drop --cuda-graph-persistence to run without graphs"
-_EXTENSION = "the Foundry graph extension (--cuda-graph-persistence)"
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +79,52 @@ def _backend():
     return Backend
 
 
+def _raise_unsupported(errors: list[str], step: str = "server args") -> None:
+    if errors:
+        raise Unsupported(step, "; ".join(errors))
+
+
+def _graph_field_conflicts(server_args: Any) -> list[str]:
+    """Explicit graph flags that contradict the graph pins."""
+    from sglang.srt.arg_groups.overrides import resolving_view
+
+    Backend = _backend()
+    cfg = resolving_view(server_args)
+    errors = []
+    disabled = getattr(cfg, "disable_cuda_graph", False)
+    if disabled or getattr(cfg, "disable_decode_cuda_graph", False):
+        # No decode graphs: nothing to persist, and not a configuration error.
+        raise Unsupported(
+            "server args",
+            "--disable-cuda-graph / --disable-decode-cuda-graph: no decode CUDA graphs to persist",
+            quiet=True,
+        )
+    decode = getattr(cfg, "cuda_graph_backend_decode", None)
+    if decode not in (None, Backend.FULL):
+        errors.append(
+            f"--cuda-graph-backend-decode={decode!r}: Foundry persists full decode graphs only"
+        )
+    prefill = getattr(cfg, "cuda_graph_backend_prefill", None)
+    if prefill not in (None, Backend.FULL, Backend.DISABLED):
+        errors.append(
+            f"--cuda-graph-backend-prefill={prefill!r}: Foundry persists full prefill graphs "
+            "only ('full' or 'disabled')"
+        )
+    if getattr(cfg, "enable_profile_cuda_graph", False):
+        errors.append(
+            "--enable-profile-cuda-graph: profiling adds allocations to the capture that LOAD "
+            "does not reproduce"
+        )
+    return errors
+
+
+def check_pinnable(server_args: Any) -> None:
+    """Every conflict of :func:`pin_graph_fields` and
+    :func:`pin_unreplayable_fields`, raised before either declares anything,
+    so that a fallback resolves the record as without the flag."""
+    _raise_unsupported(_graph_field_conflicts(server_args) + _unreplayable_plan(server_args)[0])
+
+
 def pin_graph_fields(server_args: Any) -> None:
     """Decode ``full``; prefill ``full`` or ``disabled`` (default ``disabled``, not
     the platform default, which on CUDA is ``breakable``; leaving it unset
@@ -82,39 +132,14 @@ def pin_graph_fields(server_args: Any) -> None:
     FlashInfer autotune off (tuned tactics come from the cache file / archive)."""
     from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
+    _raise_unsupported(_graph_field_conflicts(server_args))
     Backend = _backend()
-    cfg = resolving_view(server_args)
-
-    disabled = getattr(cfg, "disable_cuda_graph", False)
-    if disabled or getattr(cfg, "disable_decode_cuda_graph", False):
-        raise ValueError(
-            "--disable-cuda-graph / --disable-decode-cuda-graph cannot be combined with "
-            f"{_FLAG}: "
-            f"Foundry saves and restores the decode CUDA graphs; {_DISABLE_HINT}"
-        )
-    decode = getattr(cfg, "cuda_graph_backend_decode", None)
-    if decode not in (None, Backend.FULL):
-        raise ValueError(
-            f"--cuda-graph-backend-decode={decode!r} is not supported with {_FLAG}: "
-            "Foundry persists full decode graphs only; use 'full' or leave it unset"
-        )
-    prefill = getattr(cfg, "cuda_graph_backend_prefill", None)
-    if prefill not in (None, Backend.FULL, Backend.DISABLED):
-        raise ValueError(
-            f"--cuda-graph-backend-prefill={prefill!r} is not supported with {_FLAG}: "
-            "Foundry persists full prefill graphs only; use 'full' or 'disabled'"
-        )
-    if getattr(cfg, "enable_profile_cuda_graph", False):
-        raise ValueError(
-            f"--enable-profile-cuda-graph is not supported with {_FLAG}: profiling "
-            "adds allocations to the capture that LOAD does not reproduce"
-        )
     fields = dict(
         cuda_graph_backend_decode=Backend.FULL,
         enable_profile_cuda_graph=False,
         disable_flashinfer_autotune=True,
     )
-    if prefill is None:
+    if getattr(resolving_view(server_args), "cuda_graph_backend_prefill", None) is None:
         fields["cuda_graph_backend_prefill"] = Backend.DISABLED
     declare_resolution(server_args, RESOLUTION_SOURCE, **fields)
 
@@ -131,17 +156,19 @@ def validate_resolved_graph_config(server_args: Any) -> None:
         return
     decode = graph_cfg.decode.backend
     prefill = graph_cfg.prefill.backend
+    errors = []
     if decode != Backend.FULL:
-        raise ValueError(
-            f"cuda_graph_config[decode].backend={decode!r} is not supported with {_FLAG}: "
-            "Foundry persists full decode graphs only (check --cuda-graph-config, "
-            "and disaggregation roles that turn decode graphs off)"
+        errors.append(
+            f"cuda_graph_config[decode].backend={decode!r}: Foundry persists full decode graphs "
+            "only (check --cuda-graph-config, and disaggregation roles that turn decode graphs "
+            "off)"
         )
     if prefill not in (Backend.FULL, Backend.DISABLED):
-        raise ValueError(
-            f"cuda_graph_config[prefill].backend={prefill!r} is not supported with {_FLAG}: "
-            "Foundry persists full prefill graphs only; use 'full' or 'disabled'"
+        errors.append(
+            f"cuda_graph_config[prefill].backend={prefill!r}: Foundry persists full prefill "
+            "graphs only ('full' or 'disabled')"
         )
+    _raise_unsupported(errors)
 
 
 def _elastic_recapture_path_exists() -> bool:
@@ -207,8 +234,7 @@ def reject_unsupported_features(server_args: Any) -> None:
             "SGLANG_ENABLE_POST_CAPTURE_KV_SIZING: the KV pool is re-sized from post-capture "
             "free memory, which LOAD cannot reproduce"
         )
-    if unsupported:
-        raise ValueError(f"not supported with {_EXTENSION}: " + "; ".join(unsupported))
+    _raise_unsupported(unsupported)
 
 
 # ---------------------------------------------------------------------------
@@ -405,13 +431,11 @@ def _contrary(pin: FieldPin, raw: Any) -> bool:
     return raw != pin.value and raw != pin.default
 
 
-def pin_unreplayable_fields(server_args: Any) -> None:
-    """Declare :data:`FIELD_PINS` and the DeepSeek-V4 attention backend. Raw
-    (user) values are read from ``server_args`` itself: declarations never
-    change the raw inputs. Fields the installed sglang does not have are
-    skipped."""
-    from sglang.srt.arg_groups.overrides import declare_resolution
-
+def _unreplayable_plan(server_args: Any) -> tuple[list[str], dict[str, Any], list[str]]:
+    """(conflicts, fields to declare, pin log lines) of :data:`FIELD_PINS` and
+    the DeepSeek-V4 attention backend. Raw (user) values are read from
+    ``server_args`` itself: declarations never change the raw inputs. Fields
+    the installed sglang does not have are skipped."""
     errors = []
     fields: dict[str, Any] = {}
     lines = []
@@ -438,8 +462,16 @@ def pin_unreplayable_fields(server_args: Any) -> None:
             value = raw or "auto"
             fields[DSV4_ATTN_FIELD] = value
             lines.append(f"{DSV4_ATTN_FIELD}={value!r} (not trtllm): {DSV4_ATTN_REASON}")
-    if errors:
-        raise ValueError(f"not supported with {_FLAG}: " + "; ".join(errors))
+    return errors, fields, lines
+
+
+def pin_unreplayable_fields(server_args: Any) -> None:
+    """Declare :data:`FIELD_PINS` and the DeepSeek-V4 attention backend; a
+    contrary user value raises ``Unsupported`` before anything is declared."""
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    errors, fields, lines = _unreplayable_plan(server_args)
+    _raise_unsupported(errors)
     for line in lines:
         _pin_log(line)
     if fields:
@@ -478,8 +510,7 @@ def validate_pinned_fields(server_args: Any) -> None:
             f"{DSV4_ATTN_FIELD}='trtllm' (set by {_last_source(server_args, DSV4_ATTN_FIELD)}): "
             f"{DSV4_ATTN_REASON}"
         )
-    if errors:
-        raise ValueError(f"not supported with {_FLAG}: " + "; ".join(errors))
+    _raise_unsupported(errors)
 
 
 def _normalize_env(value: str) -> str:
@@ -505,8 +536,8 @@ def apply_env_pins(server_args: Any = None) -> None:
     """Set :data:`ENV_PINS` in ``os.environ`` (and :data:`NCCL_CUMEM_PIN` when
     ``server_args`` is given, i.e. once the all-to-all backend is known). An
     unset variable is set; one set to the pinned value is kept; one set to
-    anything else raises. Idempotent: activation, resolution and every spawn
-    site call it."""
+    anything else raises ``Unsupported`` before any variable is set.
+    Idempotent: activation, resolution and every spawn site call it."""
     global _CUMEM_EXEMPT_LOGGED
     pins = list(ENV_PINS)
     if server_args is not None:
@@ -520,21 +551,18 @@ def apply_env_pins(server_args: Any = None) -> None:
                 "cuMem windows"
             )
     first = os.environ.get(_ENV_PINNED_MARK) is None
-    errors = []
+    errors = [
+        f"{pin.name}={os.environ[pin.name]!r} (Foundry needs {pin.value}): {pin.reason}"
+        for pin in pins
+        if pin.name in os.environ and _normalize_env(os.environ[pin.name]) != pin.value
+    ]
+    _raise_unsupported(errors, step="environment")
     for pin in pins:
         current = os.environ.get(pin.name)
         if current is None:
             os.environ[pin.name] = pin.value
             _pin_log(f"{pin.name}={pin.value} (was unset): {pin.reason}")
-        elif _normalize_env(current) != pin.value:
-            errors.append(f"{pin.name}={current!r} (Foundry needs {pin.value}): {pin.reason}")
         elif (first or pin is NCCL_CUMEM_PIN) and pin.name not in _KEPT_LOGGED:
             _KEPT_LOGGED.add(pin.name)
             _pin_log(f"{pin.name}={pin.value} (already set): {pin.reason}")
-    if errors:
-        raise ValueError(
-            f"environment not supported with {_FLAG}: "
-            + "; ".join(errors)
-            + " -- unset these variables, Foundry sets them"
-        )
     os.environ[_ENV_PINNED_MARK] = "1"

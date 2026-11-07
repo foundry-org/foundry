@@ -84,6 +84,9 @@ _LAYOUT_FILE = "region_layout.json"
 CAPTURE_LOOP_VERSION = 2
 _layout_start_offset: int | None = None
 _final_alloc_offset: int = 0
+# Written by a SAVE that fell back (api.deactivate) into its rank's workspace
+# and the workspace root; LOAD falls back when it finds either.
+_INVALID_FILE = "invalid.json"
 
 
 def get_state() -> CUDAGraphExtensionState | None:
@@ -195,6 +198,9 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
         if workspace_dir.exists():
             shutil.rmtree(workspace_dir)
         workspace_dir.mkdir(parents=True, exist_ok=True)
+        # A marker of an earlier SAVE; this SAVE writes its own only after the
+        # ranks agreed at a capture scope, which every rank reaches after this.
+        (Path(cfg.workspace_root) / _INVALID_FILE).unlink(missing_ok=True)
     t_bin = 0.0
     if cfg.mode == CUDAGraphExtensionMode.LOAD:
         cge.set_skip_fatbin_processing(True)
@@ -258,11 +264,49 @@ def hold_cyclic_gc() -> None:
         _gc_held = True
 
 
-def _release_cyclic_gc() -> None:
+def release_cyclic_gc() -> None:
     global _gc_held
     if _gc_held:
         gc.enable()
         _gc_held = False
+
+
+def mark_archive_invalid(step: str, reason: str) -> None:
+    """SAVE fell back: mark the rank's workspace and the workspace root so that
+    a LOAD of this archive falls back too (:func:`archive_invalid_marker`)."""
+    cfg = get_config()
+    payload = {"step": step, "reason": reason, "timestamp": datetime.now().isoformat()}
+    for directory in (cfg.workspace_dir, cfg.workspace_root):
+        if directory is None:
+            continue
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, _INVALID_FILE), "w") as f:
+            json.dump(payload, f, indent=2)
+    logger.warning(
+        "[Foundry] SAVE archive %s marked invalid (%s)", cfg.workspace_root, _INVALID_FILE
+    )
+
+
+def archive_invalid_marker(rank: int) -> tuple[str, str, str] | None:
+    """LOAD: (path, step, reason) of the invalid marker of the workspace root or
+    of ``rank``'s workspace, or None."""
+    cfg = get_config()
+    for directory in (cfg.workspace_root, os.path.join(cfg.workspace_root, f"rank_{rank}")):
+        path = os.path.join(directory, _INVALID_FILE)
+        if os.path.exists(path):
+            with open(path) as f:
+                marker = json.load(f)
+            return path, marker["step"], marker["reason"]
+    return None
+
+
+def leave_graph_extension() -> None:
+    """After a fallback in a scheduler past setup: later allocations of this
+    thread go to the driver (the region's live allocations stay valid and are
+    freed through the hook as before) and the hook stops dumping kernel
+    binaries."""
+    cge.stop_allocation_region()
+    cge.set_skip_fatbin_processing(True)
 
 
 def mark_layout_start() -> None:
@@ -283,7 +327,7 @@ def mark_layout_start() -> None:
         return
     gc.collect()
     torch.cuda.empty_cache()
-    _release_cyclic_gc()
+    release_cyclic_gc()
     if cfg.mode != CUDAGraphExtensionMode.SAVE:
         return
     _layout_start_offset = cge.get_current_alloc_offset()
@@ -477,6 +521,22 @@ def _start_resource_tracker() -> None:
     from multiprocessing import resource_tracker
 
     resource_tracker.ensure_running()
+
+
+@contextlib.contextmanager
+def scoped_environ(values: dict[str, str]):
+    """``values`` in ``os.environ`` for the block (a child spawned inside
+    copies them), the previous values restored afterwards."""
+    saved = {key: os.environ.get(key) for key in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 @contextlib.contextmanager

@@ -58,9 +58,10 @@ config Foundry sets, not a recipe requirement:
 - each pin prints one `[Foundry] pin: <name>=<value> (<sglang default | as given | overrides sglang default X |
   was unset | already set>): <reason>` line;
 - a value set explicitly to the contrary (a flag on the command line, a variable in the launcher's environment)
-  stops the launch with that pin's reason, so a pin never overrides a user's choice silently;
-- a later sglang resolution step (model override, platform fallback) that turns a strict pin back is rejected,
-  naming the step, instead of being re-pinned after other fields were derived from it.
+  is not supported (see **Unsupported configurations**), with that pin's reason, so a pin never overrides a
+  user's choice silently;
+- a later sglang resolution step (model override, platform fallback) that turns a strict pin back is not
+  supported either, naming the step, instead of being re-pinned after other fields were derived from it.
 
 Flags are declared in SGLang's `handle_cuda_graph_persistence` step (before the CUDA-graph, platform and memory
 steps read them) and re-checked in `validate_cuda_graph_persistence` (after `handle_other_validations`).
@@ -92,7 +93,7 @@ re-asserted in `validate_cuda_graph_persistence`, at the top of every scheduler 
 | `SGLANG_ENABLE_GRAPH_POOL_BORROW` | `0` | eager allocations would borrow free graph-pool extents whose addresses the restored graphs reference | set to true |
 | `TORCHDYNAMO_DISABLE` | `1` | SAVE runs each shape's first forward inside the capture and torch >= 2.14's dynamo refuses to trace there; pinned by Foundry on SAVE / LOAD, exported by the recipes in every mode | set to anything but 1 |
 
-Rejected instead, because Foundry has no logic for them: speculative decoding other than EAGLE / EAGLE3 (also adaptive
+Not supported, because Foundry has no logic for them: speculative decoding other than EAGLE / EAGLE3 (also adaptive
 speculative decoding and multi-layer EAGLE), LoRA, PD multiplexing, elastic-EP
 recapture, attention graph variants, non-full graph backends, `--disable-cuda-graph`, CUDA-graph profiling,
 `SGLANG_ENABLE_POST_CAPTURE_KV_SIZING`. Profiling and FlashInfer autotune are pinned off with the graph backends;
@@ -104,6 +105,19 @@ FlashInfer's tuned tactics travel with the archive instead: SAVE installs SGLang
 Still documented requirements (a flag cannot express them): dense no-padding decode capture with an explicit
 batch-size list, DeepEP low-latency on EP rows, JIT caches warm before SAVE, pinned hybrid state pools, and identical
 flags and environment on SAVE and LOAD (see `recipe/sglang/README.md`).
+
+## Unsupported configurations
+
+Outside what Foundry supports, the engine still runs: Foundry raises `api.Unsupported(step, reason)`, SGLang's
+adapter logs `[Foundry] unsupported at <step>: <reason>; cuda-graph persistence disabled, continuing natively` and
+initialises natively (normal graph capture). The steps that can fall back, all before LOAD restores a graph:
+`server args` / `environment` (the resolution steps above; pins already declared by then stay), `archive` (LOAD of
+an archive whose SAVE fell back, before any setup), `capture state` (first capture scope: a dispatcher without
+`prebuild`, or state still pending) and `capture` (each SAVE capture: an attribute of a dispatcher or logits
+processor created inside the capture, or an attention graph variant; the graph is discarded and the attributes
+reset, so that shape and the rest are captured natively). The scope and capture decisions are voted over the world
+group's CPU group, so all ranks fall back together. A SAVE that falls back writes `invalid.json` into its rank
+workspace and the workspace root. After LOAD starts restoring graphs, every Foundry failure is an error.
 
 ## How to use
 

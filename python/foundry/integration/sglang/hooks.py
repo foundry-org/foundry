@@ -14,8 +14,11 @@ import time
 from dataclasses import asdict
 
 from foundry.integration.sglang import runtime as rt
+from foundry.integration.sglang.api import Unsupported
 from foundry.integration.sglang.config import (
     CUDAGraphExtensionMode,
+    compute_workspace_rank,
+    get_config,
     get_graph_extension_mode,
 )
 
@@ -161,17 +164,65 @@ def _disable_dynamo() -> None:
         logger.info("[Foundry] torch._dynamo.config.disable = True (TORCHDYNAMO_DISABLE=1 pin)")
 
 
+def deactivate(step: str, reason: str) -> None:
+    """``api.deactivate``: SAVE in a scheduler past setup marks the archive
+    invalid; the allocation region and the kernel-binary dump stop, the cyclic
+    GC hold ends, and the mode becomes none, so every later call is a no-op."""
+    cfg = get_config()
+    if cfg is None:
+        return
+    if rt.get_state() is not None:
+        if cfg.mode == CUDAGraphExtensionMode.SAVE:
+            rt.mark_archive_invalid(step, reason)
+        rt.leave_graph_extension()
+    rt.release_cyclic_gc()
+    cfg.mode = CUDAGraphExtensionMode.NONE
+
+
+def log_init_summary() -> None:
+    mode = get_graph_extension_mode()
+    state = rt.get_state()
+    if mode == CUDAGraphExtensionMode.NONE or state is None:
+        return
+    if mode == CUDAGraphExtensionMode.SAVE:
+        done = f"{state.capture_index} graphs saved"
+    else:
+        done = f"{len(state.loaded_graphs)} graphs restored"
+    logger.info(
+        "[Foundry] init summary: cuda-graph persistence %s, %s (%s)",
+        mode.value,
+        done,
+        get_config().workspace_dir,
+    )
+
+
+def _check_archive_valid(parallel) -> None:
+    """LOAD, before anything is set up: an archive SAVE marked invalid (it fell
+    back) is not restored. Every SAVE rank writes the root marker after the
+    ranks agreed, so every LOAD rank sees one and they fall back together."""
+    rank = compute_workspace_rank(parallel, *_workspace_ranks(parallel))
+    marker = rt.archive_invalid_marker(rank)
+    if marker is not None:
+        path, step, reason = marker
+        raise Unsupported(
+            "archive", f"SAVE marked {path} invalid (unsupported at {step}: {reason})"
+        )
+
+
 def before_parallel_init(device: str) -> None:
     """Head of ``bootstrap.init_parallel_runtime``: bind this
     rank's VMM region before any communicator exists."""
-    if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
+    mode = get_graph_extension_mode()
+    if mode == CUDAGraphExtensionMode.NONE:
         return
-    _disable_dynamo()
-    _wait_on_barrier_works()
-    rt.hold_cyclic_gc()
     from sglang.srt.runtime_context import get_device, get_parallel
 
     parallel = get_parallel()
+    if mode == CUDAGraphExtensionMode.LOAD:
+        _check_archive_valid(parallel)
+    _disable_dynamo()
+    _wait_on_barrier_works()
+    rt.hold_cyclic_gc()
     # get_parallel() answers from the published placement (resolved
     # widths and spawn ranks), unlike the raw record fields.
     _before_distributed_init(
@@ -301,12 +352,16 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
     # EagerRunner warmup (BaseRunner._prepare_capture_state) builds them before
     # this first scope, on both modes.
     from foundry.integration.sglang.graph_ops import (
+        agree_unsupported,
         bootstrap_collective_connections,
         bootstrap_flashinfer_tactics,
         bootstrap_lazy_runtimes,
-        check_capture_state_prebuilt,
+        capture_state_unsupported,
     )
 
+    # The fallback point of the capture state: before any bootstrap, so a
+    # fallback leaves no Foundry-specific state behind (host-only check).
+    agree_unsupported("capture state", capture_state_unsupported(model))
     # 0. FlashInfer's tuned tactics (both modes, host-only): installed from
     #    SAVE's cache file / the archive, since the tuning pass itself is
     #    pinned off (its allocations are timing-dependent).
@@ -316,17 +371,14 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
     rt.log_alloc_offset("before_collective_bootstrap")
     bootstrap_collective_connections()
     rt.log_alloc_offset("after_collective_bootstrap")
-    # 2. sglang's prebuilt state (both modes): DeepEP / Mooncake /
-    #    symmetric-memory state is built by sglang's warmup; check it.
-    check_capture_state_prebuilt(model)
-    # 3. SAVE only: DeepGEMM's one-time runtime init, which capture rejects
+    # 2. SAVE only: DeepGEMM's one-time runtime init, which capture rejects
     #    (allocation-free; the region stays suspended around it). The model's
     #    JIT kernel loads then happen inside the captured forward.
     if mode == CUDAGraphExtensionMode.SAVE:
         with rt.allocation_region_suspended():
             bootstrap_lazy_runtimes()
         rt.log_alloc_offset("after_lazy_runtimes")
-    # 4. Both modes, before the first eager extend: the FlashInfer SM90 GDN
+    # 3. Both modes, before the first eager extend: the FlashInfer SM90 GDN
     #    prefill kernels load from FlashInfer's .o cache instead of compiling
     #    8-10 s in every scheduler (host-side patch, see flashinfer_cute_cache).
     from foundry.integration.sglang import flashinfer_cute_cache
@@ -379,16 +431,16 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
         raise RuntimeError("[Foundry] capture_one called outside capture_scope")
     req_slots = _scope[1]
     kind = _scope[2]
-    if getattr(shape_key, "attention_variant", None) is not None:
-        # ShapeKey.attention_variant (e.g. DSV4.1 candidate-indexer graphs on
-        # SM100, the HIP DSA dual graph): several graphs per shape, which the
-        # archive cannot represent.
-        raise RuntimeError(
-            f"[Foundry] shape {shape_key} captures an attention graph variant "
-            f"({shape_key.attention_variant!r}); Foundry save/load does not support "
-            "graph variants"
-        )
+    # ShapeKey.attention_variant (e.g. DSV4.1 candidate-indexer graphs on
+    # SM100, the HIP DSA dual graph): several graphs per shape, which the
+    # archive cannot represent.
+    variant = getattr(shape_key, "attention_variant", None)
     if mode == CUDAGraphExtensionMode.LOAD:
+        if variant is not None:
+            raise RuntimeError(
+                f"[Foundry] shape {shape_key} restores an attention graph variant "
+                f"({variant!r}); Foundry save/load does not support graph variants"
+            )
         # LOAD, both runners: the upstream capture loop runs (see
         # capture_scope) and only the capture is replaced, by the archived
         # graph for this shape; its allocator events replay here, at the point
@@ -412,16 +464,71 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
     # SAVE: capture directly, no warm-up forwards (their freed activations
     # would leave cached segments LOAD cannot reproduce). Dynamo is pinned off
     # (pins.ENV_PINS), as it refuses to trace inside a capture.
-    from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
+    from foundry.integration.sglang.graph_ops import save_graph
 
-    from foundry.integration.sglang.graph_ops import capture_graph, save_graph
-
-    with graph_pool_capture_scope():
-        graph, out = capture_graph(pool, stream, forward_fn)
+    graph, out = _save_capture(shape_key, variant, forward_fn, pool=pool, stream=stream)
     if req_slots is not None:
         save_graph(graph, out, shape_key, prefill_req_slots=req_slots)
     else:
         save_graph(graph, out, shape_key, kind=kind)
+    return graph, out
+
+
+# SAVE: the dispatchers and logits processors of the current scope's model,
+# whose attributes every capture must leave as it found them (_save_capture).
+_snapshot_objects: list = []
+# SAVE: graphs discarded at the fallback. They stay alive: a reset graph that
+# was the pool's only user drops the pool's use count to 0 while its blocks
+# are live, and torch's next capture_begin into that pool then asserts
+# (CUDACachingAllocator "use_count > 0"). One graph at most: after the
+# fallback no Foundry capture follows.
+_discarded_graphs: list = []
+
+
+def _save_capture(shape_key, variant, forward_fn, *, pool, stream):
+    """SAVE: capture one shape, unless it is unsupported on any rank: an
+    attention graph variant, or the capture created an attribute of a
+    dispatcher or logits processor. Such an attribute lives in graph-pool
+    memory that later graphs and eager forwards would share, where a native
+    capture builds it in its eager warmup; so the graph is discarded, the
+    attributes are reset and :class:`Unsupported` lets SGLang capture this
+    shape and the rest natively (the graphs captured before stay valid)."""
+    from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
+
+    from foundry.integration.sglang.graph_ops import (
+        agree_unsupported,
+        attribute_snapshot,
+        capture_graph,
+        created_attributes,
+        reset_created_attributes,
+    )
+
+    graph = out = None
+    created = []
+    if variant is not None:
+        reason = f"shape {shape_key} is an attention graph variant ({variant!r})"
+    else:
+        before = attribute_snapshot(_snapshot_objects)
+        with graph_pool_capture_scope():
+            graph, out = capture_graph(pool, stream, forward_fn)
+        created = created_attributes(_snapshot_objects, before)
+        reason = None
+        if created:
+            counts: dict[str, int] = {}
+            for obj, name, _ in created:
+                key = f"{type(obj).__name__}.{name}"
+                counts[key] = counts.get(key, 0) + 1
+            names = ", ".join(
+                key if n == 1 else f"{key} ({n} objects)" for key, n in counts.items()
+            )
+            reason = f"{names} created during graph capture"
+    try:
+        agree_unsupported("capture", reason)
+    except Unsupported:
+        reset_created_attributes(created)
+        if graph is not None:
+            _discarded_graphs.append(graph)
+        raise
     return graph, out
 
 
@@ -469,6 +576,8 @@ def _prefill_capture_scope(model, req_slots: int, flashinfer_tactics: str | None
 
     rt.log_alloc_offset("save_before_prefill_capture")
     yield
+    if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
+        return  # fell back inside the scope (capture_one); the archive is invalid
     rt.log_alloc_offset("save_after_prefill_capture")
     save_prefill_graph_state(
         req_slots=req_slots,
@@ -552,6 +661,8 @@ def _decode_capture_scope(model, kind: str, flashinfer_tactics: str | None = Non
 
     # SAVE: the same upstream loop; capture_one captures and saves each graph.
     yield
+    if get_graph_extension_mode() == CUDAGraphExtensionMode.NONE:
+        return  # fell back inside the scope (capture_one); the archive is invalid
     rt.log_alloc_offset(f"save_after_{kind}_capture")
 
     from foundry.integration.sglang.graph_ops import (
@@ -603,12 +714,17 @@ def capture_scope(
         raise ValueError(f"[Foundry] capture_scope: unknown phase {phase!r}")
     if _scope is not None:
         raise RuntimeError(f"[Foundry] capture_scope({phase!r}) inside capture_scope{_scope}")
+    if get_graph_extension_mode() == CUDAGraphExtensionMode.SAVE:
+        from foundry.integration.sglang.graph_ops import capture_state_objects
+
+        _snapshot_objects[:] = capture_state_objects(model)
     _scope = (phase, req_slots, kind)
     try:
         with inner:
             yield
     finally:
         _scope = None
+        _snapshot_objects.clear()
 
 
 def _check_resolved_graph_config(server_args) -> None:

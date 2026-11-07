@@ -755,26 +755,119 @@ def bootstrap_lazy_runtimes() -> None:
     logger.info("[Foundry] SGLang lazy runtimes bootstrapped in %.3fs", time.perf_counter() - t0)
 
 
-def check_capture_state_prebuilt(model) -> None:
-    """Both modes, at the first capture scope: verify that sglang's warmup
-    (``BaseRunner._prepare_capture_state``) built the communication state the
-    first forward otherwise creates lazily: every MoE dispatcher's buffer or
-    expert mapping and the logits all-gather state. Built inside a capture, they
-    record garbage (the expert mapping) or abort (DeepEP buffers). Raises naming
-    what is still unbuilt."""
+def capture_state_unsupported(model) -> str | None:
+    """Both modes, at the first capture scope: why sglang's warmup
+    (``BaseRunner._prepare_capture_state``) could not have built the
+    communication state the first forward otherwise creates lazily, or None.
+    Built inside a capture, it records garbage (the expert mapping) or aborts
+    (DeepEP buffers). A dispatcher class without the prebuild protocol
+    (``BaseDispatcher.implements_prebuild``) builds it lazily by design; one
+    that has it but is still ``prebuild_pending`` was skipped."""
     from sglang.srt.layers.logits_processor import LogitsProcessor
     from sglang.srt.layers.moe.token_dispatcher.base import iter_dispatchers
 
-    unbuilt = sorted({type(d).__name__ for d in iter_dispatchers(model) if d.prebuild_pending})
+    dispatchers = _all_dispatchers(iter_dispatchers(model))
+    missing = sorted({type(d).__name__ for d in dispatchers if not d.implements_prebuild})
+    if missing:
+        return f"{', '.join(missing)} {'has' if len(missing) == 1 else 'have'} no prebuild"
+    pending = sorted({type(d).__name__ for d in dispatchers if d.prebuild_pending})
     if any(isinstance(m, LogitsProcessor) and m.logits_gatherer_pending for m in model.modules()):
-        unbuilt.append("LogitsProcessor logits all-gather")
-    if unbuilt:
-        raise RuntimeError(
-            f"[Foundry] lazily built sglang state is still unbuilt at the first capture: "
-            f"{', '.join(unbuilt)}. sglang builds it before capture in "
-            "BaseRunner._prepare_capture_state (prepare_capture_state, run by the "
-            "EagerRunner warmup); this sglang lacks that step or skipped it"
-        )
+        pending.append("LogitsProcessor logits all-gather")
+    if pending:
+        return f"{', '.join(pending)} prebuild left state pending"
+    return None
+
+
+def _all_dispatchers(dispatchers) -> list:
+    """``dispatchers`` and the dispatchers they wrap (attributes or list items,
+    e.g. MaybeTboDeepEPDispatcher's inner ones), each once."""
+    from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+
+    found: dict[int, Any] = {}
+    stack = list(dispatchers)
+    while stack:
+        dispatcher = stack.pop()
+        if id(dispatcher) in found:
+            continue
+        found[id(dispatcher)] = dispatcher
+        for value in vars(dispatcher).values():
+            items = value if isinstance(value, (list, tuple)) else (value,)
+            stack.extend(item for item in items if isinstance(item, BaseDispatcher))
+    return list(found.values())
+
+
+def agree_unsupported(step: str, reason: str | None) -> None:
+    """Raise :class:`Unsupported` on every rank when any rank has a ``reason``.
+
+    A rank that fell back alone would capture natively, with two eager warmup
+    forwards per shape whose collectives the other ranks never issue, and the
+    job would hang; the configuration is the same everywhere, so the ranks
+    normally agree already and this only makes it certain. The vote runs on
+    the world group's CPU (gloo) group: no device memory, so the allocation
+    layout is the same as without it. A non-None vote gathers the reasons."""
+    import torch
+    import torch.distributed as dist
+
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        from sglang.srt.distributed import parallel_state as ps
+
+        world = ps.get_world_group()
+        vote = torch.tensor([0 if reason is None else 1], dtype=torch.int32)
+        dist.all_reduce(vote, op=dist.ReduceOp.MAX, group=world.cpu_group)
+        if not vote.item():
+            return
+        reasons: list = [None] * world.world_size
+        dist.all_gather_object(reasons, reason, group=world.cpu_group)
+        if reason is None:
+            rank, first = next((r, text) for r, text in enumerate(reasons) if text is not None)
+            reason = f"{first} (found on rank {rank})"
+    if reason is not None:
+        from foundry.integration.sglang.api import Unsupported
+
+        raise Unsupported(step, reason)
+
+
+def capture_state_objects(model) -> list:
+    """SAVE: the objects whose attributes a capture must not create: every
+    dispatcher of ``model`` (the wrapped ones too) and its logits processors.
+    Off with ``FOUNDRY_SGLANG_CAPTURE_SNAPSHOT=0`` (diagnosis only)."""
+    if os.environ.get("FOUNDRY_SGLANG_CAPTURE_SNAPSHOT") == "0":
+        return []
+    from sglang.srt.layers.logits_processor import LogitsProcessor
+    from sglang.srt.layers.moe.token_dispatcher.base import iter_dispatchers
+
+    objects = _all_dispatchers(iter_dispatchers(model))
+    return objects + [m for m in model.modules() if isinstance(m, LogitsProcessor)]
+
+
+def attribute_snapshot(objects: list) -> list[tuple[frozenset, frozenset]]:
+    """Per object: (names of all its attributes, names whose value is not
+    None). Names only, no value is read beyond the None check."""
+    return [
+        (frozenset(vars(obj)), frozenset(k for k, v in vars(obj).items() if v is not None))
+        for obj in objects
+    ]
+
+
+def created_attributes(objects: list, before: list) -> list[tuple[Any, str, bool]]:
+    """(object, name, existed as None) of every attribute that went from absent
+    or None to a value since ``before``."""
+    created = []
+    for obj, (names, set_names) in zip(objects, before):
+        for name, value in vars(obj).items():
+            if value is not None and name not in set_names:
+                created.append((obj, name, name in names))
+    return created
+
+
+def reset_created_attributes(created: list) -> None:
+    """Put the attributes back to absent / None, so the next eager forward
+    builds them outside any capture, as natively."""
+    for obj, name, existed in created:
+        if existed:
+            setattr(obj, name, None)
+        else:
+            delattr(obj, name)
 
 
 @dataclass
