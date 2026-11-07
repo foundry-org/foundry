@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,11 +25,20 @@ from foundry.integration.sglang.config import (
     get_config,
 )
 from foundry.integration.sglang.nvtx import nvtx_range, nvtx_traced
-from foundry.integration.sglang.runtime import get_state
+from foundry.integration.sglang.runtime import get_state, load_warmup_state, save_warmup_state
 
 logger = logging.getLogger(__name__)
 
 _GRAPH_FILENAME_RE = re.compile(r"^graph_(?P<index>\d+)_FULL_t(?P<bs>\d+)_r\d+_UX_pcN\.json$")
+# Decode-type graphs of every other capture scope kind (speculative decoding:
+# target_verify, draft_decode, draft_extend, ...) and of target_decode graphs
+# with a variant label: the kind and the ShapeKey's size (and variant label)
+# are in the name. The plain target decode graphs keep the name above, so
+# archives without speculative decoding are unchanged.
+_KIND_GRAPH_FILENAME_RE = re.compile(
+    r"^graph_(?P<index>\d+)_DECODE-(?P<kind>[a-z][a-z0-9_]*)_t(?P<size>\d+)_UX_pcN"
+    r"(?:_v(?P<variant>[A-Za-z0-9]+))?\.json$"
+)
 # Full-backend prefill graphs: one per token bucket t and cached-prefix variant
 # pc (prefix chunks, 0 = suffix-only), captured with r request slots. Their own
 # phase tag keeps them out of the decode scan above, so decode-only archives
@@ -38,32 +49,66 @@ _PREFILL_GRAPH_FILENAME_RE = re.compile(
 # Per-rank SAVE record of what LOAD needs besides the graphs: the DP-gather
 # flag the captured forwards latch and the prefill output structures.
 _PREFILL_STATE_FILE = "prefill_graphs.json"
+# Per-rank SAVE record of the decode-type capture scopes: their kinds in
+# process order and the output structure of each decode-type graph. Absent in
+# archives saved before 2.1 (one target_decode scope, logits-only outputs).
+_DECODE_STATE_FILE = "decode_graphs.json"
 # PrefillCudaGraphRunner's only ShapeKey variants (_chunked_prefix_variant).
 _CHUNKED_PREFIX_LABEL = "chunked_prefix:"
 # SAVE: output structure of each prefill graph whose output is not one tensor.
 _prefill_output_specs: dict[str, Any] = {}
+# SAVE: output structure of each decode-type graph, and the kinds of the
+# decode-type scopes finished so far (both written to _DECODE_STATE_FILE).
+_decode_output_specs: dict[str, Any] = {}
+_saved_decode_kinds: list[str] = []
+
+# The decode runner of a process without speculative decoding (and the kind
+# an integration API 2.0 caller implies).
+DEFAULT_DECODE_KIND = "target_decode"
+_KIND_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_VARIANT_RE = re.compile(r"^[A-Za-z0-9]+$")
+# Output of a pre-2.1 decode graph: LogitsProcessorOutput(next_token_logits).
+_LEGACY_DECODE_OUTPUT_SPEC: Any = {"lpo": ["next_token_logits"]}
 
 
-def _batch_size_from_key(key: Any) -> int:
-    """Decode ShapeKey(size, stream_idx, variant_label, attention_variant):
-    only plain single-stream graphs are persisted, where size == bs."""
-    if (
-        key.stream_idx is not None
-        or key.variant_label is not None
-        or key.attention_variant is not None
-    ):
+def check_decode_kind(kind: str | None) -> str:
+    """The scope kind (None: :data:`DEFAULT_DECODE_KIND`); it goes into graph
+    filenames and manifest partitions, so it must be a lowercase identifier."""
+    if kind is None:
+        return DEFAULT_DECODE_KIND
+    if not isinstance(kind, str) or not _KIND_RE.match(kind):
+        raise ValueError(f"[Foundry] invalid decode capture scope kind {kind!r}")
+    return kind
+
+
+def _decode_shape(key: Any) -> tuple[int, str | None]:
+    """(size, variant label) of a decode-type ShapeKey(size, variant_label,
+    attention_variant; older sglang also stream_idx). Multi-stream (PD multiplexing) and
+    attention graph variants are not persisted; a variant label (the EAGLE
+    draft runner's greedy / sampling graph pair) is, by name."""
+    # stream_idx left ShapeKey with PD multiplexing (upstream #43898)
+    if getattr(key, "stream_idx", None) is not None or key.attention_variant is not None:
         raise ValueError(f"Foundry SGLang save/load does not support graph variants: {key!r}")
-    return key.size
+    label = key.variant_label
+    if label is not None and (not isinstance(label, str) or not _VARIANT_RE.match(label)):
+        raise ValueError(
+            f"Foundry SGLang save/load does not support decode variant label {label!r}: {key!r}"
+        )
+    return key.size, label
 
 
-def _graph_filename(index: int, key: Any) -> str:
-    batch_size = _batch_size_from_key(key)
-    return f"graph_{index}_FULL_t{batch_size}_r{batch_size}_UX_pcN.json"
+def _graph_filename(index: int, key: Any, kind: str = DEFAULT_DECODE_KIND) -> str:
+    size, variant = _decode_shape(key)
+    if kind == DEFAULT_DECODE_KIND and variant is None:
+        return f"graph_{index}_FULL_t{size}_r{size}_UX_pcN.json"
+    suffix = f"_v{variant}" if variant is not None else ""
+    return f"graph_{index}_DECODE-{kind}_t{size}_UX_pcN{suffix}.json"
 
 
 def _prefill_shape(key: Any) -> tuple[int, int]:
     """(num_tokens, prefix chunks) of a prefill ShapeKey."""
-    if key.stream_idx is not None or key.attention_variant is not None:
+    # stream_idx left ShapeKey with PD multiplexing (upstream #43898)
+    if getattr(key, "stream_idx", None) is not None or key.attention_variant is not None:
         raise ValueError(f"Foundry SGLang save/load does not support graph variants: {key!r}")
     label = key.variant_label
     if label is None:
@@ -79,17 +124,28 @@ def _prefill_graph_filename(index: int, key: Any, req_slots: int) -> str:
 
 
 def graph_partition(filename: str) -> str:
-    """Manifest partition: prefill and decode graphs are restored by separate
-    start_graph_builds calls (at their own runner's capture point), so they
-    must not share a template."""
-    return "prefill" if _PREFILL_GRAPH_FILENAME_RE.match(filename) else "decode"
+    """Manifest partition: prefill graphs and each decode-type scope kind's
+    graphs are restored by separate start_graph_builds calls (at their own
+    runner's capture point), so they must not share a template. The plain
+    target decode graphs keep the pre-2.1 partition name."""
+    if _PREFILL_GRAPH_FILENAME_RE.match(filename):
+        return "prefill"
+    match = _KIND_GRAPH_FILENAME_RE.match(filename)
+    if match:
+        return f"decode:{match.group('kind')}"
+    return "decode"
 
 
 def _flatten_prefill_output(output: Any) -> tuple[Any, list[torch.Tensor]]:
     """Prefill graphs capture the transformer body, whose output is the hidden
     states: one tensor for most models, a nested tuple / list (auxiliary hidden
     states) or PPProxyTensors (non-last PP rank) otherwise. Returns a JSON spec
-    of the structure and its tensors in depth-first order."""
+    of the structure and its tensors in depth-first order. Decode-type graphs
+    use the same spec, plus ``{"lpo": [fields]}`` for a LogitsProcessorOutput
+    (its tensor fields; the target-verify and draft-extend outputs carry the
+    hidden states next to the logits) and tuples with None members (the EAGLE
+    draft runner's (parent_list, top_scores_index, draft_tokens, draft_probs))."""
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
     tensors: list[torch.Tensor] = []
@@ -100,6 +156,20 @@ def _flatten_prefill_output(output: Any) -> tuple[Any, list[torch.Tensor]]:
         if isinstance(x, torch.Tensor):
             tensors.append(x)
             return "T"
+        if isinstance(x, LogitsProcessorOutput):
+            names = []
+            for f in dataclasses.fields(x):
+                value = getattr(x, f.name)
+                if value is None:
+                    continue
+                if not isinstance(value, torch.Tensor):
+                    raise TypeError(
+                        f"SGLang CUDA graph output field LogitsProcessorOutput.{f.name} is a "
+                        f"{type(value).__name__}; only tensor fields can be persisted"
+                    )
+                names.append(f.name)
+                tensors.append(value)
+            return {"lpo": names}
         if isinstance(x, PPProxyTensors):
             names = list(x.tensors)
             tensors.extend(x.tensors[n] for n in names)
@@ -114,6 +184,7 @@ def _flatten_prefill_output(output: Any) -> tuple[Any, list[torch.Tensor]]:
 
 
 def _unflatten_prefill_output(spec: Any, tensors: Any) -> Any:
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 
     if tensors is None:
@@ -127,6 +198,11 @@ def _unflatten_prefill_output(spec: Any, tensors: Any) -> Any:
             return None
         if s == "T":
             return next(it)
+        if "lpo" in s:
+            fields = {name: next(it) for name in s["lpo"]}
+            if "next_token_logits" not in fields:
+                fields["next_token_logits"] = None
+            return LogitsProcessorOutput(**fields)
         if "pp" in s:
             return PPProxyTensors({n: next(it) for n in s["pp"]})
         if "tuple" in s:
@@ -139,40 +215,43 @@ def _unflatten_prefill_output(spec: Any, tensors: Any) -> Any:
     return out
 
 
-def _pack_output(output: Any) -> torch.Tensor:
-    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-
-    if isinstance(output, LogitsProcessorOutput):
-        if output.next_token_logits is None:
-            raise TypeError("SGLang decode CUDA graph output has no next_token_logits")
-        return output.next_token_logits
-
-    if isinstance(output, torch.Tensor):
-        return output
-
-    raise TypeError(f"Unsupported SGLang CUDA graph output type: {type(output)!r}")
+def _pack_output(output: Any) -> tuple[Any, Any]:
+    """Decode-type graph output -> (structure spec, tensor(s) for graph.save):
+    one tensor when the output holds one (the pre-2.1 layout of a
+    logits-only output), else the list in depth-first order."""
+    spec, tensors = _flatten_prefill_output(output)
+    if not tensors:
+        raise TypeError(f"SGLang decode CUDA graph output holds no tensor: {type(output)!r}")
+    return spec, tensors[0] if len(tensors) == 1 else tensors
 
 
-def _unpack_output(tensors: Any) -> Any:
-    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-
-    if isinstance(tensors, (tuple, list)):
-        if len(tensors) != 1:
-            raise RuntimeError(f"Expected one SGLang CUDA graph output tensor, got {len(tensors)}")
-        tensors = tensors[0]
-    return LogitsProcessorOutput(next_token_logits=tensors)
-
-
-def _scan_graph_files(workspace_dir: str) -> list[tuple[int, str, dict[str, Any]]]:
+def _scan_graph_files(
+    workspace_dir: str, kind: str | None = None
+) -> list[tuple[int, str, dict[str, Any]]]:
+    """Decode-type graph files in capture order, of every kind or of
+    ``kind`` only; meta: index, kind, size, variant."""
     graph_files = []
     for filename in os.listdir(workspace_dir):
         match = _GRAPH_FILENAME_RE.match(filename)
-        if not match:
+        if match:
+            meta = {
+                "index": int(match.group("index")),
+                "kind": DEFAULT_DECODE_KIND,
+                "size": int(match.group("bs")),
+                "variant": None,
+            }
+        else:
+            match = _KIND_GRAPH_FILENAME_RE.match(filename)
+            if not match:
+                continue
+            meta = {
+                "index": int(match.group("index")),
+                "kind": match.group("kind"),
+                "size": int(match.group("size")),
+                "variant": match.group("variant"),
+            }
+        if kind is not None and meta["kind"] != kind:
             continue
-        meta = {
-            "index": int(match.group("index")),
-            "key": int(match.group("bs")),
-        }
         graph_files.append((int(meta["index"]), filename, meta))
     graph_files.sort(key=lambda x: x[0])
     return graph_files
@@ -188,18 +267,26 @@ def capture_graph(pool, stream, forward_fn) -> tuple[Any, Any]:
     return graph, out
 
 
-def save_graph(graph, output: Any, key: Any, prefill_req_slots: int | None = None) -> None:
+def save_graph(
+    graph,
+    output: Any,
+    key: Any,
+    prefill_req_slots: int | None = None,
+    kind: str = DEFAULT_DECODE_KIND,
+) -> None:
     """Persist one captured graph. ``prefill_req_slots`` is set for the
     prefill runner's graphs (its fixed request-slot count) and selects the
-    prefill filename and output packing; decode graphs are unchanged."""
+    prefill filename and output packing; decode-type graphs are named after
+    their scope ``kind`` and record their output structure."""
     cfg = get_config()
     state = get_state()
     if cfg is None or state is None or cfg.workspace_dir is None:
         raise RuntimeError("Foundry SGLang graph extension is not initialized")
 
     if prefill_req_slots is None:
-        packed_output = _pack_output(output)
-        filename = _graph_filename(state.capture_index, key)
+        filename = _graph_filename(state.capture_index, key, kind)
+        spec, packed_output = _pack_output(output)
+        _decode_output_specs[filename] = spec
     else:
         filename = _prefill_graph_filename(state.capture_index, key, prefill_req_slots)
         spec, tensors = _flatten_prefill_output(output)
@@ -238,6 +325,42 @@ def save_prefill_graph_state(*, req_slots: int, has_dp_gather: bool) -> None:
     }
     with open(os.path.join(cfg.workspace_dir, _PREFILL_STATE_FILE), "w") as f:
         json.dump(record, f, indent=2)
+
+
+def save_decode_graph_state(kind: str) -> None:
+    """SAVE, at the end of each decode-type capture scope: append its kind
+    and (re)write the rank's decode record (see _DECODE_STATE_FILE). The
+    process does not know which scope is its last, so the record is complete
+    after every scope."""
+    cfg = get_config()
+    if cfg is None or cfg.workspace_dir is None:
+        return
+    _saved_decode_kinds.append(kind)
+    record = {"scopes": _saved_decode_kinds, "output_specs": _decode_output_specs}
+    with open(os.path.join(cfg.workspace_dir, _DECODE_STATE_FILE), "w") as f:
+        json.dump(record, f, indent=2)
+
+
+_decode_record: dict[str, Any] | None = None
+
+
+def load_decode_graph_state() -> dict[str, Any]:
+    """LOAD: the rank's decode record; an archive saved before 2.1 has none
+    and holds one target_decode scope with logits-only outputs."""
+    global _decode_record
+    if _decode_record is not None:
+        return _decode_record
+    cfg = get_config()
+    if cfg is None or cfg.workspace_dir is None:
+        raise RuntimeError("Foundry SGLang graph extension is not initialized")
+    path = os.path.join(cfg.workspace_dir, _DECODE_STATE_FILE)
+    if os.path.exists(path):
+        with open(path) as f:
+            record = json.load(f)
+    else:
+        record = {"scopes": [DEFAULT_DECODE_KIND], "output_specs": {}}
+    _decode_record = record
+    return record
 
 
 def _scan_prefill_graph_files(workspace_dir: str) -> list[tuple[int, str, dict[str, Any]]]:
@@ -279,7 +402,11 @@ def _log_restore(what: str, n: int, pending: Any, timing: _RestoreTiming, loop_s
     builds = max(0.0, build_end - timing.t0)
     handover = sum(max(0.0, end - max(start, build_end)) for start, end in timing.calls)
     in_calls = sum(end - start for start, end in timing.calls)
-    graphs = "SGLang prefill graphs" if what == "prefill" else "SGLang graphs"
+    # "prefill", "decode" (the target_decode scope, pre-2.1 wording) or the
+    # decode-type scope kind.
+    graphs = {"prefill": "SGLang prefill graphs", "decode": "SGLang graphs"}.get(
+        what, f"SGLang {what} graphs"
+    )
     logger.info(
         "[Foundry] Loaded %d %s in %.3fs (builds %.3fs, handover %.3fs)",
         n,
@@ -338,7 +465,7 @@ def start_prefill_graph_restore() -> dict[str, Any]:
     with open(record_path) as f:
         record = json.load(f)
 
-    # Graphs may reference NVSHMEM symbols; the DeepEP bootstrap ran before.
+    # Graphs may reference NVSHMEM symbols; sglang's warmup built the DeepEP buffer before.
     cge.init_nvshmem_for_loaded_modules()
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
     t0 = time.perf_counter()
@@ -512,166 +639,113 @@ def bootstrap_collective_connections() -> None:
     )
 
 
-def bootstrap_logits_gatherer(model) -> bool:
-    """Create the logits all-gather's symmetric-memory state BEFORE capture, on
-    SAVE and LOAD alike.
+def _load_flashinfer_tactics(path: str) -> tuple[bool, int]:
+    """Install the tactics of ``path`` into FlashInfer's AutoTuner (its config
+    lookup; a kernel's first call then picks the tuned tactic without tuning).
+    Returns (accepted, entries loaded); ``accepted`` is False when the file's
+    metadata (FlashInfer / CUDA / cuBLAS / cuDNN versions, GPU) differs from
+    this process, in which case FlashInfer ignores the whole file."""
+    from flashinfer.autotuner import AutoTuner
 
-    sglang's ``LogitsProcessor`` gathers the TP-sharded logits through
-    ``MultimemAllGatherer``: a torch symmetric-memory buffer plus a multicast
-    mapping and signal pads, built lazily on the first *eager* call
-    (``create_state``, a collective) and skipped under capture, where the
-    gatherer falls back to an NCCL all-gather. Whether the multicast path is
-    available is a host property (IMEX / fabric), so on a host with multicast
-    any eager forward before capture activates the gatherer and every graph
-    then bakes in its pointers; those allocations bypass cudaMalloc, so the
-    hook never records them and LOAD cannot recreate them (illegal address at
-    the first decode). Creating the state here, at the same sequence point in
-    both modes, gives it the same addresses on both sides (its VA reservations
-    are carved from the region) and lets the graphs capture the multicast
-    gather exactly as native sglang does.
+    tuner = AutoTuner.get()
+    # _file_configs: the AutoTuner's table of file-loaded tactics (search_cache source 2).
+    before = len(getattr(tuner, "_file_configs", {}))
+    accepted = bool(tuner.load_configs(path))
+    return accepted, len(getattr(tuner, "_file_configs", {})) - before
 
-    Returns True when a state was (or already is) built, False when the
-    gatherer is disabled, absent, or multicast is unavailable (NCCL fallback,
-    identical on both modes).
+
+def bootstrap_flashinfer_tactics(cache_path: str | None) -> None:
+    """Both modes, at the first capture scope (after the EagerRunner warmup,
+    before any capture): give the captured kernels FlashInfer's tuned tactics
+    without a tuning pass.
+
+    Foundry pins ``--disable-flashinfer-autotune`` because the tuning pass
+    benchmarks every tactic of every shape inside the recorded allocation
+    sequence, with timing-dependent allocations SAVE and LOAD cannot repeat.
+    The tactics themselves are static: a plain SGLang start of the same model
+    tunes them once and writes its per-rank cache file (``cache_path``,
+    SGLang's ``flashinfer_autotune_cache_path``; None when the model's kernels
+    take no FlashInfer tactics). SAVE installs that file and keeps its content
+    in the rank's ``warmup_state.json`` (section ``flashinfer_tactics``); LOAD
+    installs that section. The tactics decide the kernels and their
+    workspaces, so archived tactics LOAD cannot apply are an error, not a
+    fallback. Without a cache file SAVE archives no section, and LOAD then
+    runs FlashInfer's default tactics as SAVE did.
     """
-    import torch
-
-    try:
-        from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
-            MultimemAllGatherer,
-        )
-    except Exception:
-        return False
-    built = False
-    for module in model.modules():
-        gatherer = getattr(module, "_logits_gatherer", None)
-        if not isinstance(gatherer, MultimemAllGatherer):
-            continue
-        if gatherer._state is None:
-            continue  # disabled by configuration
-        if gatherer._state is not MultimemAllGatherer._UNINIT:
-            # Built before this point by an eager forward: its addresses depend
-            # on that forward's allocations, which LOAD does not repeat.
-            logger.warning(
-                "[Foundry] logits all-gather state was already built before the bootstrap; "
-                "SAVE and LOAD may place it differently"
-            )
-            built = True
-            continue
-        lm_head = getattr(model, "lm_head", None)
-        weight = getattr(lm_head, "weight", None)
-        if weight is None or weight.dim() != 2:
-            logger.warning("[Foundry] logits gatherer found but no lm_head weight; leaving it lazy")
-            return False
-        # The gather input is the per-rank logits shard: (tokens, vocab / tp).
-        probe = torch.empty((1, weight.shape[0]), dtype=torch.bfloat16, device=weight.device)
-        t0 = time.perf_counter()
-        state = gatherer._build(probe)
-        if state is not MultimemAllGatherer._UNINIT:
-            gatherer._state = state
-        built = state is not None and state is not MultimemAllGatherer._UNINIT
-        logger.info(
-            "[Foundry] logits all-gather state %s pre-capture in %.3fs (shard width %d)",
-            "built" if built else "not built (NCCL fallback)",
-            time.perf_counter() - t0,
-            weight.shape[0],
-        )
-    return built
-
-
-def install_capture_autotune_guard() -> None:
-    """SAVE-only: turn inductor's Triton autotuning inside the capture window
-    into a clear error.
-
-    A freshly compiled inductor kernel with several candidate configs is
-    benchmarked on its first run (``CachingAutotuner.benchmark_all_configs``),
-    and the benchmark synchronizes the device, which the capturing stream
-    rejects ("operation not permitted when stream is capturing") and the whole
-    capture then fails with an unrelated-looking error. With a warm inductor
-    cache (``autotune_local_cache``) the best config is loaded and nothing is
-    benchmarked, so SAVE succeeds; this is why SAVE passes after a plain sglang
-    run of the same model on the same machine and fails cold. The guard does
-    not change behaviour, it names the cause and the remedy.
-    """
-    try:
-        import torch
-        from torch._inductor.runtime import triton_heuristics
-    except Exception as exc:  # pragma: no cover - inductor layout changed
-        logger.warning("[Foundry] capture-time autotune guard not installed: %s", exc)
+    cfg = get_config()
+    if cfg is None or cfg.workspace_dir is None:
         return
-    cls = triton_heuristics.CachingAutotuner
-    orig = cls.benchmark_all_configs
-    if getattr(orig, "_foundry_capture_guard", False):
-        return
-
-    def benchmark_all_configs(self, *args, **kwargs):
-        if torch.cuda.is_current_stream_capturing():
+    if cfg.mode == CUDAGraphExtensionMode.LOAD:
+        tactics = load_warmup_state().flashinfer_tactics
+        if not tactics:
+            if cache_path is not None:
+                logger.info(
+                    "[Foundry] FlashInfer tactics: the archive carries none; the kernels use "
+                    "FlashInfer's default tactics, as SAVE did"
+                )
+            return
+        # load_configs reads a file: hand it the archived section as one.
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(tactics, f)
+            path = f.name
+        try:
+            accepted, n = _load_flashinfer_tactics(path)
+        finally:
+            os.unlink(path)
+        if not accepted or n == 0:
             raise RuntimeError(
-                "[Foundry] inductor wants to autotune a freshly compiled Triton kernel inside "
-                "the capture window; its benchmark synchronizes the device, which capture "
-                "forbids. Warm the JIT caches first: run plain sglang with the same decode-graph "
-                "set once for this model on this machine (same SGLANG_CACHE_DIR / "
-                "TORCHINDUCTOR_CACHE_DIR), then SAVE."
+                "[Foundry] this FlashInfer rejected the archive's tuned tactics "
+                "(warmup_state.json flashinfer_tactics): its metadata (FlashInfer / CUDA / "
+                "cuBLAS / cuDNN versions, GPU) differs from SAVE's. The tactics select the "
+                "captured kernels and their workspaces, so LOAD needs SAVE's stack"
             )
-        return orig(self, *args, **kwargs)
-
-    benchmark_all_configs._foundry_capture_guard = True  # type: ignore[attr-defined]
-    cls.benchmark_all_configs = benchmark_all_configs
+        logger.info("[Foundry] FlashInfer tactics: %d loaded from the archive", n)
+        return
+    if cache_path is None:
+        return  # the model's kernels take no FlashInfer tactics
+    if not os.path.isfile(cache_path):
+        logger.warning(
+            "[Foundry] FlashInfer autotune is pinned off and no tuned-tactics cache exists at %s: "
+            "the captured kernels use FlashInfer's default tactics (slower on FlashInfer MoE / "
+            "GEMM paths). Tune once with a plain SGLang start of the same model and flags "
+            "(autotune on writes that file), then SAVE",
+            cache_path,
+        )
+        return
+    accepted, n = _load_flashinfer_tactics(cache_path)
+    if not accepted or n == 0:
+        logger.warning(
+            "[Foundry] FlashInfer tactics cache %s was rejected (metadata of another FlashInfer / "
+            "CUDA / cuDNN / GPU) or is empty: the captured kernels use FlashInfer's default "
+            "tactics. Re-tune with a plain SGLang start on this stack, then SAVE",
+            cache_path,
+        )
+        return
+    with open(cache_path) as f:
+        tactics = json.load(f)
+    state = load_warmup_state()
+    state.flashinfer_tactics = tactics
+    save_warmup_state(state)
+    logger.info(
+        "[Foundry] FlashInfer tactics: %d loaded from %s and archived in warmup_state.json",
+        n,
+        cache_path,
+    )
 
 
 def bootstrap_lazy_runtimes() -> None:
-    """SAVE-only: perform, outside any stream capture, the one-time runtime
-    initializations that capture rejects, so that the model's own compiles and
-    JIT kernel loads can happen inside the captured forward and be recorded
-    like every other capture-time event (no eager warmup forward).
+    """SAVE-only: DeepGEMM's one-time runtime init, outside any stream capture.
 
-    * torch.compile / inductor: its pattern-matcher lazy init traces example
-      graphs and copies unpinned host tensors to the device, which fails inside
-      capture ("Cannot copy between CPU and CUDA tensors during CUDA graph
-      capture"). The three lazy_init entry points run it once; the tensors are
-      transient. Dynamo tracing, inductor codegen and Triton compiles are host
-      work and module loads, legal during capture.
-    * DeepGEMM: the first JIT call builds its runtime, which calls
-      cudaFree(nullptr) and probes nvcc; get_num_sms() goes through the same
-      device object. Allocation-free.
+    The first DeepGEMM JIT call builds its runtime, which calls
+    cudaFree(nullptr) and probes nvcc, both rejected inside a capture;
+    get_num_sms() goes through the same device object. Allocation-free. LOAD
+    does not need it: restore compiles nothing, and its first eager request
+    performs the init outside capture, as native sglang does.
 
-    LOAD needs neither: restore compiles nothing, and LOAD's first eager
-    request performs these inits outside capture, as native sglang does. The
-    caller runs this with the allocation region suspended, so the transient
-    tensors are plain driver allocations and the deterministic cursor is the
-    same on SAVE and LOAD afterwards.
+    torch.compile needs nothing here: TORCHDYNAMO_DISABLE=1 is pinned
+    (pins.ENV_PINS), so no inductor compile runs in an engine.
     """
-    import torch
-
     t0 = time.perf_counter()
-    device = torch.device("cuda", torch.cuda.current_device())
-    # inductor guards its pattern-matcher initializers with a functools.cache
-    # keyed on the "input device" it derives from the compiled function's first
-    # tensor input (None when there is none). Warm every key a compile can
-    # produce: a trivial compile of a CUDA function runs the whole pipeline
-    # (dynamo, joint-graph and post-grad passes, one Triton kernel) for the
-    # CUDA key; the initializers are then run directly for the None and CPU
-    # keys.
-    torch.compile(lambda x: x * 2 + 1, dynamic=True)(torch.ones(8, device=device))
-    # Only the joint-graph initializers are device-keyed (pad_mm / sfdp / misc
-    # patterns trace example tensors on `input_device`, which is where the
-    # unpinned host-to-device copy happens). pre_grad and post_grad register
-    # global patterns once, and a second call raises "Duplicate pattern";
-    # the trivial compile above already ran them. Guard every call on its
-    # own: one failure must not skip the remaining keys (that skip let
-    # GLM-5.3-Flash's DSA indexer compile run _sfdp_init inside capture).
-    try:
-        from torch._inductor.fx_passes import joint_graph
-
-        keys = (None, torch.device("cpu"), torch.device("cuda"), device)
-        for key in keys:
-            try:
-                joint_graph.lazy_init(key)
-            except Exception as exc:
-                logger.warning("[Foundry] inductor joint_graph.lazy_init(%s) failed: %s", key, exc)
-    except Exception as exc:
-        logger.warning("[Foundry] inductor lazy_init warm-up unavailable: %s", exc)
-    install_capture_autotune_guard()
     try:
         import deep_gemm
 
@@ -681,158 +755,34 @@ def bootstrap_lazy_runtimes() -> None:
     logger.info("[Foundry] SGLang lazy runtimes bootstrapped in %.3fs", time.perf_counter() - t0)
 
 
-def _find_dispatcher(model, cls) -> Any:
-    """The first ``cls`` dispatcher on the model: ``module.dispatcher`` itself
-    or one of its ``_inners`` (the two-batch-overlap wrapper holds the real
-    dispatchers there)."""
-    for module in model.modules():
-        dispatcher = getattr(module, "dispatcher", None)
-        if dispatcher is None:
-            continue
-        for candidate in (dispatcher, *getattr(dispatcher, "_inners", [])):
-            if isinstance(candidate, cls):
-                return candidate
-    return None
+def check_capture_state_prebuilt(model) -> None:
+    """Both modes, at the first capture scope: verify that sglang's warmup
+    (``BaseRunner._prepare_capture_state``) built the communication state the
+    first forward otherwise creates lazily: every MoE dispatcher's buffer or
+    expert mapping and the logits all-gather state. Built inside a capture, they
+    record garbage (the expert mapping) or abort (DeepEP buffers). Raises naming
+    what is still unbuilt."""
+    from sglang.srt.layers.logits_processor import LogitsProcessor
+    from sglang.srt.layers.moe.token_dispatcher.base import iter_dispatchers
 
-
-def bootstrap_deepep_buffer(model) -> bool:
-    """Force the singleton DeepEP ``Buffer`` (NVSHMEM runtime + symmetric heap)
-    to be created BEFORE the cuda-graph capture loop.
-
-    sglang creates the DeepEP buffer lazily on the first MoE dispatch — normally
-    during the two pre-capture warmup forwards. Foundry suppresses those warmups
-    (for allocation determinism), which would push buffer creation into the
-    captured forward, where ``deep_ep_cpp.Buffer(...)`` aborts with
-    ``operation not permitted when stream is capturing``.
-
-    Triggering it here (outside any stream capture) creates only the NVSHMEM
-    runtime + symmetric heap — no model activations — so it stays symmetric
-    across SAVE and LOAD and lands at the same VMM offset on both. The buffer is
-    a process-wide singleton (``DeepEPBuffer._buffer``), so one creation per rank
-    is enough. It is a collective over the EP group, so every rank must reach
-    this point together — which they do, since ``capture`` runs on all ranks.
-
-    Returns True if a buffer was (or already is) created, False if DeepEP is off.
-    """
-    try:
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
-        backend = get_moe_a2a_backend()
-    except Exception:
-        return False
-    # Outside the guard: a failure to build the buffer must surface here, not
-    # resurface as a native abort when the capture forward retries lazily.
-    if backend.is_deepep_v2():
-        return _bootstrap_deepep_v2_buffer(model)
-    if backend.is_mooncake():
-        return _bootstrap_mooncake_buffer(model)
-    if not backend.is_deepep():
-        return False
-
-    from sglang.srt.layers.moe.token_dispatcher.deepep import (
-        DeepEPBuffer,
-        DeepEPDispatcher,
-    )
-
-    # The singleton now lives on the runtime context's resources
-    # (DeepEPBuffer._state().buffer), not a class attribute.
-    if DeepEPBuffer._state().buffer is not None:
-        return True
-
-    deepep = _find_dispatcher(model, DeepEPDispatcher)
-    # Prefer the low-latency impl (the mode foundry captures); the buffer is
-    # sized for whichever impls exist, so either bootstraps the shared
-    # singleton.
-    impl = deepep and (
-        getattr(deepep, "_low_latency_dispatcher", None)
-        or getattr(deepep, "_normal_dispatcher", None)
-    )
-    if impl is not None:
-        t0 = time.perf_counter()
-        impl._get_buffer()
-        logger.info(
-            "[Foundry] Bootstrapped DeepEP buffer pre-capture in %.3fs",
-            time.perf_counter() - t0,
+    unbuilt = sorted({type(d).__name__ for d in iter_dispatchers(model) if d.prebuild_pending})
+    if any(isinstance(m, LogitsProcessor) and m.logits_gatherer_pending for m in model.modules()):
+        unbuilt.append("LogitsProcessor logits all-gather")
+    if unbuilt:
+        raise RuntimeError(
+            f"[Foundry] lazily built sglang state is still unbuilt at the first capture: "
+            f"{', '.join(unbuilt)}. sglang builds it before capture in "
+            "BaseRunner._prepare_capture_state (prepare_capture_state, run by the "
+            "EagerRunner warmup); this sglang lacks that step or skipped it"
         )
-        return True
-
-    logger.warning(
-        "[Foundry] DeepEP backend active but no DeepEPDispatcher found on the "
-        "model; buffer not bootstrapped (capture may fail inside stream capture)."
-    )
-    return False
-
-
-def _bootstrap_mooncake_buffer(model) -> bool:
-    """Mooncake EP counterpart (elastic EP): create the process-wide mooncake
-    ``Buffer`` (RDMA-registered EP buffer) before capture / graph load, for the
-    same SAVE/LOAD allocation-sequence parity reasons as DeepEP. Without it the
-    first MoE dispatch -- and the torch.compile / DeepGEMM lazy init around it
-    -- runs inside the captured forward on SAVE."""
-    from sglang.srt.layers.moe.token_dispatcher.mooncake import (
-        EPBuffer,
-        MooncakeEPDispatcher,
-    )
-
-    if EPBuffer.get_existing_buffer() is not None:
-        return True
-
-    mk = _find_dispatcher(model, MooncakeEPDispatcher)
-    impl = getattr(mk, "_low_latency_dispatcher", None)
-    if impl is not None:
-        t0 = time.perf_counter()
-        impl._get_buffer()
-        logger.info(
-            "[Foundry] Bootstrapped Mooncake EP buffer pre-capture in %.3fs",
-            time.perf_counter() - t0,
-        )
-        return True
-
-    logger.warning(
-        "[Foundry] Mooncake a2a backend active but no MooncakeEPDispatcher found; "
-        "buffer not bootstrapped (capture may fail inside stream capture)."
-    )
-    return False
-
-
-def _bootstrap_deepep_v2_buffer(model) -> bool:
-    """DeepEP v2 counterpart: create the process-wide ``ElasticBuffer`` (its own
-    NCCL communicator + symmetric-memory windows) before capture / graph load.
-
-    sglang creates it lazily on the first dispatch, which on SAVE is inside the
-    first captured forward and on LOAD would be the first request — so the
-    window VA and NCCL state would sit at different allocation-sequence points
-    on the two paths. Collective over the EP group, like the v1 bootstrap.
-    """
-    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import (
-        DeepEPv2Buffer,
-        DeepEPv2Dispatcher,
-    )
-
-    if DeepEPv2Buffer._state().buffer is not None:
-        return True
-
-    v2 = _find_dispatcher(model, DeepEPv2Dispatcher)
-    if v2 is not None:
-        t0 = time.perf_counter()
-        v2._impl._get_buffer()
-        logger.info(
-            "[Foundry] Bootstrapped DeepEP v2 ElasticBuffer pre-capture in %.3fs",
-            time.perf_counter() - t0,
-        )
-        return True
-
-    logger.warning(
-        "[Foundry] DeepEP v2 backend active but no DeepEPv2Dispatcher found on the "
-        "model; ElasticBuffer not bootstrapped."
-    )
-    return False
 
 
 @dataclass
 class _DecodeRestore:
+    kind: str
     pending: Any
     graph_files: list[tuple[int, str, dict[str, Any]]]
+    output_specs: dict[str, Any]
     timing: _RestoreTiming
     next: int = 0
 
@@ -840,24 +790,33 @@ class _DecodeRestore:
 _decode_restore: _DecodeRestore | None = None
 
 
+def _shape_label(size: int, variant: str | None) -> str:
+    return f"size={size}" + (f" variant={variant}" if variant is not None else "")
+
+
 @nvtx_traced("foundry.graph_restore.decode_start")
-def start_decode_graph_restore() -> None:
-    """LOAD, at the decode runner's capture: start building every decode graph
-    in one ``start_graph_builds`` call (the manifest's template / on-demand
-    linking needs them in one call; the builds run on foundry's background
-    thread). The graphs are then
-    finished one at a time by restore_next_decode_graph, from inside the
-    upstream capture loop, so their allocator events replay at the points SAVE
-    captured them, between the same per-shape eager work."""
+def start_decode_graph_restore(kind: str = DEFAULT_DECODE_KIND) -> None:
+    """LOAD, at a decode-type runner's capture: start building every graph of
+    this scope ``kind`` in one ``start_graph_builds`` call (the manifest's
+    template / on-demand linking needs a partition in one call; the builds
+    run on foundry's background thread). The graphs are then finished one at
+    a time by restore_next_decode_graph, from inside the upstream capture
+    loop, so their allocator events replay at the points SAVE captured them,
+    between the same per-shape eager work."""
     global _decode_restore
     cfg = get_config()
     if cfg is None or cfg.workspace_dir is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
         raise RuntimeError("Foundry SGLang graph extension is not initialized for LOAD")
-    graph_files = _scan_graph_files(cfg.workspace_dir)
+    if _decode_restore is not None:
+        raise RuntimeError(
+            f"Foundry decode graph restore of {_decode_restore.kind} is still open "
+            f"at the start of {kind}"
+        )
+    graph_files = _scan_graph_files(cfg.workspace_dir, kind)
     if not graph_files:
-        raise RuntimeError(f"No Foundry SGLang graph files found in {cfg.workspace_dir}")
+        raise RuntimeError(f"No Foundry SGLang {kind} graph files found in {cfg.workspace_dir}")
 
-    # Graphs may reference NVSHMEM symbols; the DeepEP bootstrap ran before.
+    # Graphs may reference NVSHMEM symbols; sglang's warmup built the DeepEP buffer before.
     # Single-GPU dense models have no NVSHMEM modules (no-op there).
     cge.init_nvshmem_for_loaded_modules()
 
@@ -865,45 +824,54 @@ def start_decode_graph_restore() -> None:
     paths = [os.path.join(cfg.workspace_dir, filename) for _, filename, _ in graph_files]
     pending = FoundryCUDAGraph.start_graph_builds(paths, num_threads=4)
     _decode_restore = _DecodeRestore(
-        pending=pending, graph_files=graph_files, timing=_RestoreTiming(t0=t0)
+        kind=kind,
+        pending=pending,
+        graph_files=graph_files,
+        output_specs=load_decode_graph_state().get("output_specs", {}),
+        timing=_RestoreTiming(t0=t0),
     )
 
 
 def restore_next_decode_graph(key: Any) -> tuple[Any, Any]:
-    """LOAD: stands in for capturing decode graph ``key``. The archive holds
-    the graphs in capture order (``reversed(capture_bs)``); the upstream loop
-    asks for them in the same order, which is checked here."""
+    """LOAD: stands in for capturing decode-type graph ``key``. The archive
+    holds the scope's graphs in capture order (``reversed(capture_bs)``, and
+    per size the runner's variants in its order); the upstream loop asks for
+    them in the same order, which is checked here."""
     r = _decode_restore
     state = get_state()
     if r is None or state is None:
         raise RuntimeError("Foundry decode graph restore was not started")
-    bs = _batch_size_from_key(key)
+    size, variant = _decode_shape(key)
     if r.next >= len(r.graph_files):
         raise RuntimeError(
-            f"Foundry archive holds {len(r.graph_files)} decode graphs, but the capture loop "
-            f"asks for more (bs={bs}): the decode capture sizes (--cuda-graph-bs) differ from SAVE"
+            f"Foundry archive holds {len(r.graph_files)} {r.kind} graphs, but the capture loop "
+            f"asks for more ({_shape_label(size, variant)}): the capture sizes "
+            "(--cuda-graph-bs) or speculative settings differ from SAVE"
         )
     _index, filename, meta = r.graph_files[r.next]
-    if meta["key"] != bs:
+    if (meta["size"], meta["variant"]) != (size, variant):
         raise RuntimeError(
-            f"Foundry decode graph order mismatch: the capture loop asks for bs={bs}, the next "
-            f"archived graph is {filename}. The decode capture sizes (--cuda-graph-bs) differ "
-            "between SAVE and LOAD."
+            f"Foundry {r.kind} graph order mismatch: the capture loop asks for "
+            f"{_shape_label(size, variant)}, the next archived graph is {filename}. The capture "
+            "sizes (--cuda-graph-bs) or speculative settings differ between SAVE and LOAD."
         )
     t = time.perf_counter()
     with nvtx_range("foundry.graph_restore.finish_one"):
         graph, tensors = FoundryCUDAGraph.finish_one_graph_load(r.pending, r.next)
     r.timing.calls.append((t, time.perf_counter()))
     r.next += 1
-    output = _unpack_output(tensors)
+    output = _unflatten_prefill_output(
+        r.output_specs.get(filename, _LEGACY_DECODE_OUTPUT_SPEC), tensors
+    )
     # Strong reference next to the backend's own.
-    state.loaded_graphs[bs] = (graph, output)
+    state.loaded_graphs[(r.kind, size, variant)] = (graph, output)
     return graph, output
 
 
 def finish_decode_graph_restore(loop_s: float) -> None:
-    """LOAD, after the upstream decode capture loop (``loop_s`` is its
-    wall): check that it restored every archived decode graph."""
+    """LOAD, after the upstream capture loop of a decode-type scope
+    (``loop_s`` is its wall): check that it restored every archived graph of
+    the scope's kind."""
     global _decode_restore
     r = _decode_restore
     _decode_restore = None
@@ -911,7 +879,10 @@ def finish_decode_graph_restore(loop_s: float) -> None:
         raise RuntimeError("Foundry decode graph restore was not started")
     if r.next != len(r.graph_files):
         raise RuntimeError(
-            f"Foundry archive holds {len(r.graph_files)} decode graphs, the capture loop "
-            f"restored {r.next}: the decode capture sizes (--cuda-graph-bs) differ from SAVE"
+            f"Foundry archive holds {len(r.graph_files)} {r.kind} graphs, the capture loop "
+            f"restored {r.next}: the capture sizes (--cuda-graph-bs) or speculative settings "
+            "differ from SAVE"
         )
-    _log_restore("decode", r.next, r.pending, r.timing, loop_s)
+    _log_restore(
+        "decode" if r.kind == DEFAULT_DECODE_KIND else r.kind, r.next, r.pending, r.timing, loop_s
+    )

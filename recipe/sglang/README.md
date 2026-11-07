@@ -9,14 +9,12 @@ These recipes use the **dependency route**: SGLang declares Foundry as an option
 dependency (`sglang[foundry]`) and switches it on with its own server arguments
 `--cuda-graph-persistence {save,load}` (plus optional `--cuda-graph-persistence-config`).
 That is the route in the foundry-org SGLang branch `foundry-dep` and in upstream SGLang
-once the Foundry adapter lands there. The older plugin route
-(`FOUNDRY_GRAPH_EXTENSION_CONFIG=<TOML>`, entry point `foundry_sglang_plugin:load`) still
-exists for an SGLang without the adapter; these scripts no longer use it.
+once the Foundry adapter lands there.
 
 | Component | Version | Notes |
 |---|---|---|
-| SGLang | branch `foundry-dep` (adapter `sglang.srt.utils.foundry_adapter`) | Requires Foundry integration API **2.x**; without `--cuda-graph-persistence` every Foundry call site is a no-op. |
-| Foundry | `foundry-core 0.1.0rc2` (this branch, `INTEGRATION_API_VERSION = (2, 0)`) | `pip install "sglang[foundry]"`, or `pip install -e .` from this repo. The wheel must match the torch/CUDA pair SGLang pins (torch 2.14.1 / cu130 for 0.1.0rc2; use the per-pair index in the top-level README for other pairs). |
+| SGLang | branch `foundry-dep` (adapter `sglang.srt.utils.foundry_adapter`) | Requires Foundry integration API **2.x** with minor >= 3 (`FOUNDRY_INTEGRATION_API_MIN_MINOR`); without `--cuda-graph-persistence` every Foundry call site is a no-op. |
+| Foundry | `foundry-core 0.1.0rc2` (this branch, `INTEGRATION_API_VERSION = (2, 3)`) | `pip install "sglang[foundry]"`, or `pip install -e .` from this repo. The wheel must match the torch/CUDA pair SGLang pins (torch 2.14.1 / cu130 for 0.1.0rc2; use the per-pair index in the top-level README for other pairs). |
 
 All scripts share one `foundry.toml` (`workspace_root = "foundry_archive"`); its `mode`
 key, if present, is ignored — the flag's mode wins. Pick a script for your model +
@@ -136,9 +134,9 @@ graph cannot replay (custom all-reduce off, torch symm-mem all-reduce on, NCCL b
 registration / cuMem / NVLS off, DeepGEMM precompile sweep off, two-batch overlap off,
 memory-saver / graph-pool variants off, `--dsv4-attn-backend` not `trtllm`), print one
 `[Foundry] pin:` line per value, and stop with the reason on a contrary explicit value;
-unsupported features (speculative decoding, LoRA, PD multiplexing, elastic-EP recapture,
+unsupported features (speculative decoding other than EAGLE / EAGLE3, LoRA, PD multiplexing, elastic-EP recapture,
 non-full graph backends) are rejected. Full table:
-[`docs/sglang/overview.md`](../../docs/sglang/overview.md#what-the-plugin-pins-and-why).
+[`docs/sglang/overview.md`](../../docs/sglang/overview.md#what-foundry-pins-and-why).
 The scripts pass the collective flags (`--disable-custom-all-reduce --enable-torch-symm-mem`)
 and source `set_env.sh` in every mode, so baseline, SAVE and LOAD capture the same
 graph set; everything else they set is model/topology, not Foundry policy:
@@ -226,8 +224,8 @@ nothing to build. Two things still matter:
 
 - **NVSHMEM** — already in the env. cu13 `torch` pulls the `nvidia-nvshmem-cuXX`
   wheel as a dependency (`libnvshmem_host.so.3` under `site-packages/nvidia/nvshmem/lib/`).
-  Foundry auto-detects it from the wheel (just like `libcuda_hook.so`) and the
-  spawn-site patches preload it into each worker — no manual path, no TOML field.
+  Foundry auto-detects it from the wheel (just like `libcuda_hook.so`) and
+  `api.configure_subprocess` preloads it into each worker at spawn — no manual path, no TOML field.
 - **NVSHMEM host/device versions must match.** The `sgl-deep-ep` wheel statically
   embeds its NVSHMEM *device* library; the preloaded *host* library must be the same
   version. The auto-detected `nvidia-nvshmem` wheel satisfies this. Overriding
@@ -261,9 +259,9 @@ The EP script sets `--attn-dp-size <ep_size> --moe-a2a-backend deepep --deepep-m
 --disable-custom-all-reduce` in every mode. `--enable-torch-symm-mem` routes the DP-attention gather
 all-reduce through torch symmetric memory, the same path the TP recipes use; without it sglang uses pynccl for
 that all-reduce (NCCL LL kernels do replay from restored graphs; the flag keeps the collective path uniform).
-Communication state that sglang builds lazily on the first eager forward (the DeepEP buffer, the logits
-all-gather's symmetric-memory state) is created by foundry before capture at the same point on SAVE and LOAD, so
-it exists at the same addresses in both modes; see `docs/sglang/hooks.md`.
+Communication state that sglang used to build lazily on the first eager forward (the DeepEP buffer, the logits
+all-gather's symmetric-memory state) is built by sglang's own warmup before capture, at the same point on SAVE and
+LOAD; Foundry only checks that it exists (`check_capture_state_prebuilt`); see `docs/sglang/hooks.md`.
 
 ## Qwen3.5 and DeepSeek
 
@@ -344,8 +342,8 @@ Model notes:
 - **8-rank memory headroom.** LOAD keeps the recorded kernel images resident and maps the graph range in one step,
   so it needs a few GB more than SAVE; a LOAD that cannot map the range now fails at startup with the missing and
   free MB instead of hanging at the first request. Lower the fraction for SAVE and LOAD alike.
-- **No eager warmup on SAVE.** SAVE runs only the two one-time initializations that stream capture rejects
-  (inductor's lazy init, DeepGEMM's runtime init), with the allocation region suspended; the model's compiles and
+- **No eager warmup on SAVE.** SAVE runs only the one-time initialization that stream capture rejects
+  (DeepGEMM's runtime init), with the allocation region suspended; the model's compiles and
   JIT loads happen inside the captured forward and are recorded. SAVE and LOAD therefore reach the graph range at
   the same cursor. Validated on 8xH200 (Qwen3-30B-A3B EP2: identical output).
 
@@ -490,7 +488,7 @@ start (see the top-level README's Performance table).
 By default Foundry persists decode graphs only, and SAVE/LOAD run with prefill graphs disabled. To persist them, pass
 `--cuda-graph-backend-prefill full` (plus the same `--cuda-graph-bs-prefill` list) on **both SAVE and LOAD**. The
 results below were measured on the fork branch **`foundry-prefill`** (`4f018fd052`) with foundry `coldstart`
-`608193b` (in-tree route); prefill graphs have not been run on upstream main with the plugin yet.
+`608193b` (in-tree route).
 
 - SAVE records the prefill graphs through the same capture hook as decode.
 - LOAD runs sglang's own prefill capture loop and swaps each capture for the archived graph, with an order/shape
@@ -522,7 +520,7 @@ Not usable in plain sglang on Hopper, because the native engine already fails to
 all-to-all over DeepEP v2 (`--moe-a2a-backend deepep_v2`), i.e. NCCL
 symmetric-memory windows and NCCL GIN (GDAKI/DOCA) rather than NVSHMEM.
 Prototype status: validated on H100 EP=2/EP=4 with all 256 decode graphs.
-Not yet validated on the plugin route (upstream main). v2 needs NCCL GIN, i.e.
+v2 needs NCCL GIN, i.e.
 an RDMA-capable NIC visible to the process: on a host whose verbs devices are
 blocked, `ElasticBuffer.__init__` asserts `NCCL GIN is unavailable` at the
 first MoE dispatch in plain SGLang, before any Foundry code runs (4xH200 bare
@@ -542,11 +540,11 @@ Any later `pip install -e` of foundry re-resolves torch's NCCL pin; use
 `--no-deps` or re-pin 2.30.7 afterwards.
 
 What foundry does for v2 (all automatic): creates the `ElasticBuffer` at the
-same pre-capture point on SAVE and LOAD (`_bootstrap_deepep_v2_buffer`),
+same pre-capture point on SAVE and LOAD (sglang's warmup prebuild),
 reports success for `cuPointerSetAttribute(SYNC_MEMOPS)` on region memory
 (DOCA requires it), and pins `NCCL_GRAPH_REGISTER=0`/`NCCL_LOCAL_REGISTER=0`
 so no collective in a captured graph depends on registration state that a
-restored graph cannot replay. `NCCL_CUMEM_ENABLE`, which the plugin pins to 0
+restored graph cannot replay. `NCCL_CUMEM_ENABLE`, which Foundry pins to 0
 for every other all-to-all backend, is left to sglang (1) with v2: do not
 force it to 0.
 
@@ -554,9 +552,10 @@ force it to 0.
 
 ```
 foundry_archive/
-├── warmup_state.json              # KV-block sizing + MemoryPoolConfig (rank 0)
+├── warmup_state.json              # KV-block sizing + MemoryPoolConfig (rank 0's copy)
 └── rank_<N>/
     ├── graph_*.json + .cugraph    # one pair per captured graph
+    ├── warmup_state.json          # per-rank copy (wins on LOAD); also FlashInfer tactics
     ├── graph_manifest.json        # topology groups + template assignments
     ├── fatbin_image_packed.img    # packed CUDA modules
     └── region_layout.json         # per-rank layout: start offset, watermark, live ranges

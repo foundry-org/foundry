@@ -130,7 +130,7 @@ jobs:
           tar tzf dist/foundry_core-*.tar.gz > sdist.txt
           for f in CMakeLists.txt csrc/hook.cpp csrc/boost_json_src.cpp include/hook.h \
                    third_party/boost/boost/version.hpp third_party/boost/LICENSE_1_0.txt \
-                   python/foundry/_build_info.py.in python/foundry_sglang_plugin.py; do
+                   python/foundry/_build_info.py.in; do
             grep -q "/$f\$" sdist.txt || { echo "::error::sdist is missing $f"; exit 1; }
           done
           if grep -E '\.so$|/_build_info\.py$' sdist.txt; then

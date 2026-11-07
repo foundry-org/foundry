@@ -11,7 +11,7 @@ evidence; this document is the reviewed union, deduplicated and ranked. Trigger:
 Every item below is one of these.
 
 - **M1, separate module copies.** LOAD loads its own copy of every archived binary and the graph nodes resolve
-  to that copy (hook.cpp:4544, :4371). Everything the process or a library sets on its *own* handles never
+  to that copy (`load_cuda_modules_and_libraries`, `query_function_handle` in hook.cpp). Everything the process or a library sets on its *own* handles never
   reaches the kernels the restored graph launches, even when LOAD runs exactly the same init code:
   `cudaFuncSetAttribute`, `cudaMemcpyToSymbol` / `__device__`/`__constant__` initialisers, cache config, library
   device state. Foundry re-applies exactly four things: max dynamic smem (recorded), carveout (recorded, CUkernel
@@ -26,7 +26,7 @@ Every item below is one of these.
   attention metadata, chunked-prefix buffers, TBO children, LoRA prepare, the DeepEP adapter mode) runs in SAVE's
   order and allocates at the recorded addresses. What is still not run on LOAD: `forward_fn` (the two warm-up
   forwards and the captured forward itself) and anything done on `graph_capture()` *exit* (custom all-reduce IPC
-  registration, pinned off by the plugin).
+  registration, pinned off in `pins.py`).
 - **M4, host-side latches set by capture, read by replay.** Handled: `prefill_graph_has_dp_gather`, the shared-read
   event fence, the DeepEP adapter mode. Anything else of this kind is a candidate gap.
 
@@ -97,9 +97,9 @@ Rec = recorded at SAVE, App = applied at LOAD, Det = detected when missing, Test
 | feature | one-time work native does in warm-up / capture | Foundry |
 |---|---|---|
 | NCCL communicators | first collective connects and allocates | handled: `bootstrap_collective_connections`; `NCCL_GRAPH_REGISTER=0`, `NCCL_LOCAL_REGISTER=0` |
-| torch symm-mem all-reduce, logits `MultimemAllGatherer` | rendezvous / buffer on first eager forward | handled (bootstrap + re-rendezvous) |
-| DeepEP / DeepEP v2 / Mooncake buffer | created on first dispatch | handled (`bootstrap_deepep_buffer` and v2 variant) |
-| inductor lazy init, DeepGEMM runtime init, Triton autotune | first call | handled: per-key lazy_init warm-up, autotune guard, **caches must be warm before SAVE** |
+| torch symm-mem all-reduce, logits `MultimemAllGatherer` | rendezvous / buffer on first eager forward | handled (sglang warmup prebuild + re-rendezvous) |
+| DeepEP / DeepEP v2 / Mooncake / NIXL buffer, standard-dispatcher expert mapping | created on first dispatch | handled: sglang warmup prebuild (`BaseDispatcher.prebuild`), checked by `check_capture_state_prebuilt` |
+| inductor lazy init, DeepGEMM runtime init, Triton autotune | first call | handled: SAVE runs DeepGEMM's runtime init (`bootstrap_lazy_runtimes`); `TORCHDYNAMO_DISABLE=1` is pinned (no inductor compile in an engine) and FlashInfer autotune is pinned off (tuned tactics archived in `warmup_state.json`); **caches must be warm before SAVE** |
 | FlashInfer per-bs wrappers and workspaces | created by the capture loop between shapes | handled since c5e43c4: the loop runs on LOAD too, no pre-pass |
 | **backend detection by attribute** (`hasattr(attn_backend, "indices_updater_decode")`): wrapper backends such as `HybridLinearAttnBackend` hide their FlashInfer child, so hybrid + flashinfer took the non-FlashInfer branch and LOAD re-created the per-bs `_int_workspace_buffer`s after load_all_graphs at new addresses; graphs read plans never updated (Qwen3.5-2B: same wrong tokens every run) | per-bs wrapper creation between captures | **closed 2026-09-30 by c5e43c4: decode LOAD re-runs SGLang's capture loop and substitutes only capture_one (as prefill did), so every per-shape host object is re-created by SGLang in SAVE's order; pre-pass, reuse shim, backend detection and post-load metadata init deleted; archives need `capture_loop_version: 2` (re-SAVE)** |
 | **custom all-reduce v1/v2 (v2 default ON in sglang)** | IPC handle exchange + device table fill on `graph_capture()` **exit** | **not handled, not rejected** (our recipes disable it) — **gap G0** |
@@ -107,21 +107,21 @@ Rec = recorded at SAVE, App = applied at LOAD, Det = detected when missing, Test
 | `flashinfer_megamoe` layers, DeepGEMM `megamoe` symmetric buffer, K3 AR-fusion named buffers, `flashinfer_cutedsl` MoE wrapper, nixl buffer | built on the layer's first forward with a collective | **not handled** — gap G0c |
 | cutedsl GDN `_cu_seqlens_cache` + state-pool dummy tensors, qsa 128 MB workspace | allocated inside the first capture; later graphs only read them | replay order dependence; not checked — gap G4 |
 | `--dsv4-attn-backend trtllm` semaphore getter | asserts not-capturing on first call | SAVE fails loudly; needs a bootstrap — gap G0d |
-| two-batch overlap children metadata | per-shape `capture_one_batch_size` | built on LOAD since c5e43c4 (the loop runs); still pinned off by the plugin until a TBO row is validated |
-| `SGLANG_JIT_DEEPGEMM_PRECOMPILE` (default on: first-call sweep with a sync), `NCCL_CUMEM_ENABLE=0`, `NCCL_NVLS_ENABLE=0` | — | pinned by the plugin on branch sglang-registry-pins (2440370, pending host validation); was recipe-only — G9 |
-| `--enable-memory-saver` graph context, `SGLANG_ENABLE_METADATA_GLUE_GRAPH`, `SGLANG_ENABLE_GRAPH_POOL_PRECARVE` | tms-owned graph memory / a second sglang-owned graph / pool layout | pinned off by the plugin on sglang-registry-pins (pending host validation) — G9 |
+| two-batch overlap children metadata | per-shape `capture_one_batch_size` | built on LOAD since c5e43c4 (the loop runs); pinned off (`FIELD_PINS`) until a TBO row is validated |
+| `SGLANG_JIT_DEEPGEMM_PRECOMPILE` (default on: first-call sweep with a sync), `NCCL_CUMEM_ENABLE=0`, `NCCL_NVLS_ENABLE=0` | — | pinned in `pins.py` (`ENV_PINS`, `NCCL_CUMEM_PIN`; `NCCL_CUMEM_ENABLE` is left alone for `deepep_v2`) — G9 |
+| `--enable-memory-saver` graph context, `SGLANG_ENABLE_METADATA_GLUE_GRAPH`, `SGLANG_ENABLE_GRAPH_POOL_PRECARVE` | tms-owned graph memory / a second sglang-owned graph / pool layout | pinned off in `pins.py` (`FIELD_PINS`, `ENV_PINS`) — G9 |
 
-### 2.7 SGLang flags the plugin already pins or rejects
+### 2.7 SGLang flags Foundry pins or rejects (`pins.py`)
 
 Decode backend full; prefill full or disabled; no breakable; no `--cuda-graph-config` contradiction;
-no `--disable-cuda-graph`; profiling and autotune off; speculative decoding, LoRA, pdmux, elastic-EP recapture and
+no `--disable-cuda-graph`; profiling and autotune off; speculative decoding other than EAGLE / EAGLE3, LoRA, pdmux, elastic-EP recapture and
 attention graph variants rejected; missing bs at LOAD is an error; graph-pool borrow forced off.
 
 ## 3. Ranked gaps (deduplicated)
 
 | # | gap | mechanism | blast radius | evidence |
 |---|---|---|---|---|
-| G0 | custom all-reduce (sglang default) registration on `graph_capture()` exit never replayed; symm-mem NCCL windows, NVLS, mscclpp, TBO, dsv4-trtllm: pinned off on sglang-registry-pins (pending validation); megamoe/cutedsl/K3/nixl lazy collective buffers still not bootstrapped (G0c open) | M2/M3 | any user who does not pass our recipe flags gets a silent wrong or hanging LOAD | sglang B1, B2, B5, B6, B7 |
+| G0 | custom all-reduce (sglang default) registration on `graph_capture()` exit never replayed; symm-mem NCCL windows, NVLS, mscclpp, TBO, dsv4-trtllm: pinned off in `pins.py`; megamoe/cutedsl/K3/nixl lazy collective buffers still not bootstrapped (G0c open) | M2/M3 | any user who does not pass our recipe flags gets a silent wrong or hanging LOAD | sglang B1, B2, B5, B6, B7 |
 | G1 | function attributes: three re-applied, none recorded or compared; the next attribute kind fails like 912 or silently | M1 | every kernel library that sets attributes on its own handles | driver A1, sglang B4 |
 | G2 | member grouping ignores edges/ports/attributes; member dependencies deleted without comparison; `__device__`/`__constant__` globals written before capture are lost | M1 | silent wrong results | driver A2, A3 |
 | G3 | the three load paths disagree on graph-wide attributes, PDL and access-policy window; members never get PSS/APW/device-updatable | — | silent perf or correctness loss on PDL-heavy graphs | driver A7 |
@@ -130,7 +130,7 @@ attention graph variants rejected; missing bs at LOAD is an error; graph-pool bo
 | G6 | external event nodes rebuilt as private events | — | silent races | driver A6 |
 | G7 | GPU/driver identity (arch, SM count, compat driver, kernel-selecting envs, baked occupancy macros) never checked at LOAD | — | wrong grids on a different GPU | driver A8, sglang B8 |
 | G8 | unsupported node types rejected with an uninformative message | — | debuggability | driver A9 |
-| G9 | (pinned on sglang-registry-pins, pending validation) env pins and modes formerly set only by the recipe | — | users of the plugin without the recipe | sglang B10 |
+| G9 | (pinned in `pins.py`) env pins and modes formerly set only by the recipe | — | users without the recipe | sglang B10 |
 | G10 | rare per-process state: green contexts, device limits, texture objects, PTX re-JIT | — | rare | driver A10 |
 | G11 | (closed) backend dispatch by `hasattr` on the top-level attention backend missed composite backends; per-bs resources created between captures moved on LOAD | M3, removed by c5e43c4 (decode LOAD runs the upstream loop) | was: silent wrong tokens on Qwen3.5 + flashinfer | qwen35_flashinfer_load_divergence.md, decode_load_loop.md |
 
@@ -146,13 +146,13 @@ attention graph variants rejected; missing bs at LOAD is an error; graph-pool bo
    or NVSHMEM allocations inside capture a hard error; add a debug checksum of live region ranges before the first
    replay, compared between SAVE and LOAD.
 3. **Replay `graph_capture()`-exit work or refuse it** (G0): until custom all-reduce registration can be replayed
-   (enter the same capture contexts on LOAD and restore the recorded pointer/size list), the plugin must reject
-   custom all-reduce unless `--disable-custom-all-reduce` is set, and reject `--enable-symm-mem`,
-   `--enable-nccl-nvls`, `--enable-mscclpp`, two-batch overlap, `--dsv4-attn-backend trtllm`, memory saver and
-   the metadata glue graph, with one-line reasons.
+   (enter the same capture contexts on LOAD and restore the recorded pointer/size list), Foundry pins
+   `--disable-custom-all-reduce` and pins `--enable-symm-mem`, `--enable-nccl-nvls`, `--enable-mscclpp`,
+   two-batch overlap, `--dsv4-attn-backend trtllm`, memory saver and the metadata glue graph off (`FIELD_PINS`),
+   with one-line reasons.
 4. **Environment identity in the archive** (G7, G9): store compute capability, SM count, driver and compat version,
-   `CUDA_MODULE_LOADING` and the kernel-selecting `SGLANG_*` envs at SAVE; compare at LOAD; move the recipe-only env
-   pins into the plugin.
+   `CUDA_MODULE_LOADING` and the kernel-selecting `SGLANG_*` envs at SAVE; compare at LOAD; the env pins are in
+   `pins.py` (`ENV_PINS`).
 5. **A registry of pre-capture bootstraps** run at the same sequence point on SAVE and LOAD (G0c, G0d), data-driven
    instead of the current hand-written list: add megamoe prebuild, dsv4-trtllm semaphore, nixl buffer, K3 buffers,
    the qsa workspace.
@@ -166,25 +166,25 @@ attention graph variants rejected; missing bs at LOAD is an error; graph-pool bo
 
 8. **Re-run SGLang's capture loop on LOAD, substitute only the capture** (G11, done in c5e43c4 for decode; prefill already did): no emulation of per-shape host work, hence no backend-specific dispatch; SAVE and LOAD take the same allocation path by construction, checked by `final_alloc_offset == after_load_all_graphs`.
 
-Recommended order: 3 (a plugin change, no C++), 8, 4, 1, 2, 5, 6, 7.
+Recommended order: 3 (a pin change, no C++), 8, 4, 1, 2, 5, 6, 7.
 
-## 5. What the plugin should pin before the PR ships (decided 2026-09-30)
+## 5. What Foundry pins (decided 2026-09-30, implemented in `pins.py`)
 
 Foundry's rule: state that cannot be made static across processes is not supported; use the cuMem-backed
-alternatives instead. Everything on that list that a flag or environment variable controls is a CONFIG the plugin
-PINS (resolution hook, same as the graph backends today), not a rejection:
+alternatives instead. Everything on that list that a flag or environment variable controls is a CONFIG Foundry
+PINS (sglang's resolution steps, `api.pin_server_args`, same as the graph backends), not a rejection:
 
-| pinned by the plugin | value | why |
+| pinned | value | why |
 |---|---|---|
 | custom all-reduce (sglang default on) | `--disable-custom-all-reduce`; torch symm-mem all-reduce on | IPC registration on `graph_capture()` exit is not replayable |
-| NCCL buffer registration | `NCCL_GRAPH_REGISTER=0`, `NCCL_LOCAL_REGISTER=0` (already), `NCCL_CUMEM_ENABLE=0`, `NCCL_NVLS_ENABLE=0` | registrations live outside the recorded region |
+| NCCL buffer registration | `NCCL_GRAPH_REGISTER=0`, `NCCL_LOCAL_REGISTER=0` (already), `NCCL_CUMEM_ENABLE=0` (not for `deepep_v2`), `NCCL_NVLS_ENABLE=0` | registrations live outside the recorded region |
 | `--enable-symm-mem` (NCCL windows), `--enable-nccl-nvls`, `--enable-mscclpp` | off | first-use registration inside the forward |
 | DeepGEMM first-call precompile sweep | `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0` | a sync inside capture |
 | two-batch overlap | off | per-shape children metadata built only by the capture loop (moot once decode LOAD re-runs the loop) |
 | memory saver graph context, metadata glue graph, graph-pool precarve, graph-pool borrow | off | graph memory owned outside Foundry's region |
 | `--dsv4-attn-backend` | `auto`/`flashmla` | the trtllm variant asserts at first call during capture; needs a bootstrap first |
 
-Rejected with an error (no Foundry logic for them): speculative decoding, LoRA, pdmux, elastic-EP recapture,
+Rejected with an error (no Foundry logic for them): speculative decoding other than EAGLE / EAGLE3, LoRA, pdmux, elastic-EP recapture,
 attention graph variants, non-full graph backends, `--disable-cuda-graph`, profiling/autotune on.
 
 Documented requirements stay: dense no-padding capture with an explicit bs list, DeepEP low-latency on EP rows,

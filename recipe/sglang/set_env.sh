@@ -10,8 +10,8 @@
 # NVSHMEM_DISABLE_NCCL=1     NVSHMEM otherwise builds one NCCL communicator per team (5 on a 4-rank node,
 #                            ~0.4 s each) while DeepEP creates its buffer; the low-latency kernels never use
 #                            them. Cuts the DeepEP bootstrap from ~3.5 s to ~0.7 s on native and LOAD and
-#                            frees the 1.5 GB of region memory their buffers took. It changes the allocation
-#                            sequence, so archives are captured with it (SAVE and LOAD share this file).
+#                            frees the 1.5 GB of region memory their buffers took. Foundry pins it on SAVE/LOAD
+#                            (no allocation change); exported here so the native engine matches.
 # EP_DISABLE_GIN=1           DeepEP v2 only (serve_qwen3-30ba3bfp8_ep_v2.sh): the GIN mode hangs in the first
 #                            warm-up forward (ElasticBuffer) on every H200 host tried, with or without usable
 #                            verbs; the NVLink-only direct mode is the validated path. DeepEP v2's JIT also needs

@@ -6,10 +6,13 @@ from __future__ import annotations
 
 import enum
 import importlib.util
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 import tomllib
+
+logger = logging.getLogger(__name__)
 
 
 class CUDAGraphExtensionMode(str, enum.Enum):
@@ -33,7 +36,6 @@ class CUDAGraphExtensionConfig:
     region_size: str = "64GB"
     workspace_root: str = "foundry_archive"
     workspace_dir: str | None = None
-    scratch_space_size: str = "64MB"
     # SAVE: group same-topology graphs under one template with on-demand
     # members. False makes every graph its own template so LOAD rebuilds each
     # from its full node list (slower load, no shared-graph re-parameterization).
@@ -68,6 +70,9 @@ class CUDAGraphExtensionConfig:
                 "build it with `make -C tools/host` (docs/bare-host-verbs-udev-wait.md)"
             )
 
+        if "scratch_space_size" in data:
+            logger.info("[Foundry] scratch_space_size in %s is ignored", source)
+
         return cls(
             mode=CUDAGraphExtensionMode(data.get("mode", cls.mode.value)),
             hook_library_path=hook_library_path,
@@ -76,7 +81,6 @@ class CUDAGraphExtensionConfig:
             base_addr=base_addr,
             region_size=data.get("region_size", cls.region_size),
             workspace_root=data.get("workspace_root", cls.workspace_root),
-            scratch_space_size=data.get("scratch_space_size", cls.scratch_space_size),
             graph_templates=bool(data.get("graph_templates", cls.graph_templates)),
         )
 

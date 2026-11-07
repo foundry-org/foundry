@@ -31,11 +31,9 @@ PUBLIC_MODULES = [
     "foundry.integration.sglang.graph_ops",
     "foundry.integration.sglang.hooks",
     "foundry.integration.sglang.nvtx",
-    "foundry.integration.sglang.plugin",
+    "foundry.integration.sglang.pins",
     "foundry.integration.sglang.preflight",
     "foundry.integration.sglang.runtime",
-    # sglang plugin entry point (pyproject [project.entry-points."sglang.srt.plugins"])
-    "foundry_sglang_plugin",
 ]
 
 # vLLM integration: imports vllm at module import, so tested only when vllm is installed.

@@ -1,38 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
-"""Foundry as an SGLang plugin.
+"""Server-args and environment pins and rejects of the Foundry SGLang
+integration, called through ``api.py`` from SGLang's resolution steps:
 
-Activation: ``FOUNDRY_GRAPH_EXTENSION_CONFIG=<foundry toml>`` in the launcher's
-environment (spawned processes inherit it). SGLang's ``load_plugins()`` runs
-the ``foundry`` entry point (``foundry_sglang_plugin:load``) in the launcher,
-before the server args are built, and at the top of every scheduler process.
-Each run of :func:`activate` registers the resolution hooks below and installs
-the runtime patches (``hooks.install``).
-
-The data-parallel controller process does not call ``load_plugins()``. It
-needs nothing from Foundry: the only patch it used to receive (LD_PRELOAD for
-the scheduler spawn) is covered by the environment it inherits from the
-launcher, whose ``Engine._launch_scheduler_processes`` sets it before the
-controller is spawned.
-
-Resolution hooks (``register_resolution_hook`` on whitelisted steps, so the
-pins land at the same pipeline positions as the former in-tree step):
-
-- ``apply_inkling_prefill_cuda_graph_default`` (wrapped, pins first): the
-  step the in-tree ``handle_graph_extension`` ran right before. Decode is
-  pinned to ``full``, prefill to ``disabled`` unless ``full`` / ``disabled`` was
-  given, profiling and FlashInfer autotune off (SAVE and LOAD must allocate
-  identically). Conflicting flags raise instead of being overridden. The
-  same step pins the flags that select state Foundry cannot replay
-  (:data:`FIELD_PINS`, see "Pins" below).
-- ``handle_cuda_graph_config`` (wrapped, validates after): the resolved
-  config, which also covers ``--cuda-graph-config`` JSON (it outranks the
-  per-phase flags).
-- ``handle_other_validations`` (wrapped, validates after): features Foundry
-  does not support, once speculative decoding, LoRA and elastic EP are
-  resolved; the graph config and the pinned flags are checked again after
-  the later cascades, and ``NCCL_CUMEM_ENABLE`` is pinned once the MoE
-  all-to-all backend is known.
+- ``handle_cuda_graph_persistence`` (``api.pin_server_args``, before
+  ``apply_inkling_prefill_cuda_graph_default``): decode is pinned to ``full``,
+  prefill to ``disabled`` unless ``full`` / ``disabled`` was given, profiling
+  and FlashInfer autotune off (the tuning pass allocates timing-dependently
+  inside the recorded sequence; the tuned tactics are installed from SGLang's
+  cache file / the archive instead, see
+  ``graph_ops.bootstrap_flashinfer_tactics``). Conflicting flags raise instead
+  of being overridden. The same step pins the flags that select state Foundry
+  cannot replay (:data:`FIELD_PINS`, see "Pins" below).
+- ``validate_cuda_graph_persistence`` (``api.validate_resolved_server_args``,
+  after ``handle_other_validations``): features Foundry does not support
+  (speculative decoding other than EAGLE / EAGLE3), once speculative
+  decoding, LoRA and elastic EP are resolved; the resolved graph config
+  (which also covers ``--cuda-graph-config`` JSON) and the pinned flags are
+  checked again after the later cascades, and ``NCCL_CUMEM_ENABLE`` is pinned
+  once the MoE all-to-all backend is known.
 
 Pins. State that cannot be made static across processes is not supported;
 Foundry uses the cuMem-backed alternatives instead. A graph restored on LOAD
@@ -45,16 +31,16 @@ environment variable can switch off is pinned here rather than left to the
 recipe: each pin prints one ``[Foundry] pin:`` line, and a value the user
 set explicitly to the contrary raises with the reason (never a silent
 override). Features with no Foundry logic at all are rejected instead
-(:func:`reject_unsupported_features`, ``hooks.reject_unsupported_decode_runner``).
+(:func:`reject_unsupported_features`).
 
-Environment pins (:data:`ENV_PINS`) are applied in :func:`activate`, which
-runs in the launcher before the server args are built (so the resolution
+Environment pins (:data:`ENV_PINS`) are applied in ``api.activate``, which
+runs in the launcher at the first resolution step (so the later resolution
 steps that read them see the pinned values) and before any engine process is
 spawned (spawned processes inherit ``os.environ``; values that sglang caches
 at import time, such as ``SGLANG_JIT_DEEPGEMM_PRECOMPILE``, are only correct
-this way). They are re-asserted at the top of every scheduler process
-(``activate`` runs there too) and at each spawn site
-(``runtime.setup_ld_preload_env``).
+this way). They are re-asserted by ``api.validate_resolved_server_args``, at
+the top of every scheduler process (``activate`` runs there too) and at
+each spawn site (``api.configure_subprocess``).
 """
 
 from __future__ import annotations
@@ -67,121 +53,15 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-CONFIG_ENV = "FOUNDRY_GRAPH_EXTENSION_CONFIG"
 # Declaration source recorded in the resolution stash.
 RESOLUTION_SOURCE = "foundry_graph_extension"
 # Source of the unreplayable-state pins (FIELD_PINS), kept apart so that each
 # declaration can be read back on its own.
 PIN_RESOLUTION_SOURCE = "foundry_graph_extension_pins"
-# How the messages below name the activation. The dependency route
-# (foundry.integration.sglang.api) switches them to SGLang's flag through
-# use_flag_labels(); the reasons stay the same on both routes.
-_FLAG = f"Foundry graph persistence ({CONFIG_ENV})"
-_DISABLE_HINT = f"unset {CONFIG_ENV} to run without graphs"
-_EXTENSION = f"the Foundry graph extension ({CONFIG_ENV})"
-# Whitelisted resolution steps the plugin wraps (register_resolution_hooks);
-# the preflight checks that the installed sglang still offers them.
-RESOLUTION_HOOK_STEPS = (
-    "apply_inkling_prefill_cuda_graph_default",
-    "handle_cuda_graph_config",
-    "handle_other_validations",
-)
-_ACTIVATED = False
-
-
-def activate(cfg_path: str) -> None:
-    """Plugin body; called by ``foundry_sglang_plugin.load`` when the env is set.
-
-    ``load_plugins()`` logs and swallows exceptions from a plugin, which would
-    leave SGLang running natively while the user asked for SAVE or LOAD, so a
-    failure here exits the process (SystemExit is not an ``Exception``)."""
-    global _ACTIVATED
-    if _ACTIVATED:
-        return
-    from foundry.integration.sglang import api
-
-    if api.is_active() or _sglang_has_dependency_route():
-        raise SystemExit(
-            f"[Foundry] {CONFIG_ENV} is set, but this sglang calls Foundry directly: "
-            "use --cuda-graph-persistence {save,load} [--cuda-graph-persistence-config "
-            f"{cfg_path}] and unset {CONFIG_ENV}"
-        )
-    try:
-        if not os.path.isfile(cfg_path):
-            raise FileNotFoundError(f"{cfg_path!r} does not exist")
-        apply_env_pins()
-        register_resolution_hooks()
-        from foundry.integration.sglang.hooks import install
-
-        install(cfg_path)
-    except Exception as exc:
-        raise SystemExit(
-            f"[Foundry] sglang plugin failed to activate ({CONFIG_ENV}={cfg_path}): {exc!r}"
-        ) from exc
-    _ACTIVATED = True
-    # Logging is not configured yet in every process that loads plugins.
-    print(
-        f"[Foundry] sglang plugin active: pid={os.getpid()} config={cfg_path}",
-        file=sys.stderr,
-        flush=True,
-    )
-
-
-def use_flag_labels(flag: str = "--cuda-graph-persistence") -> None:
-    """Dependency route: name SGLang's flag instead of the plugin's
-    environment variable in every pin and reject message."""
-    global _FLAG, _DISABLE_HINT, _EXTENSION
-    _FLAG = f"Foundry graph persistence ({flag})"
-    _DISABLE_HINT = f"drop {flag} to run without graphs"
-    _EXTENSION = f"the Foundry graph extension ({flag})"
-
-
-def _sglang_has_dependency_route() -> bool:
-    """True for an sglang that declares Foundry as a dependency and calls it
-    at its own call sites (sglang.srt.utils.foundry_adapter); the plugin's
-    patches would then run on top of those calls."""
-    import importlib.util
-
-    try:
-        return importlib.util.find_spec("sglang.srt.utils.foundry_adapter") is not None
-    except (ImportError, ValueError):
-        return False
-
-
-def register_resolution_hooks() -> None:
-    from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook
-
-    wrappers = (
-        _pin_then_previous,
-        _previous_then_validate_graph_config,
-        _previous_then_reject_unsupported,
-    )
-    for name, wrapper in zip(RESOLUTION_HOOK_STEPS, wrappers, strict=True):
-        register_resolution_hook(name)(wrapper)
-
-
-# ---------------------------------------------------------------------------
-# Resolution-hook wrappers: fn(server_args, previous)
-# ---------------------------------------------------------------------------
-
-
-def _pin_then_previous(server_args: Any, previous) -> None:
-    pin_graph_fields(server_args)
-    pin_unreplayable_fields(server_args)
-    previous(server_args)
-
-
-def _previous_then_validate_graph_config(server_args: Any, previous) -> None:
-    previous(server_args)
-    validate_resolved_graph_config(server_args)
-
-
-def _previous_then_reject_unsupported(server_args: Any, previous) -> None:
-    previous(server_args)
-    reject_unsupported_features(server_args)
-    validate_resolved_graph_config(server_args)
-    validate_pinned_fields(server_args)
-    apply_env_pins(server_args)
+# How the messages below name the activation.
+_FLAG = "Foundry graph persistence (--cuda-graph-persistence)"
+_DISABLE_HINT = "drop --cuda-graph-persistence to run without graphs"
+_EXTENSION = "the Foundry graph extension (--cuda-graph-persistence)"
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +79,7 @@ def pin_graph_fields(server_args: Any) -> None:
     """Decode ``full``; prefill ``full`` or ``disabled`` (default ``disabled``, not
     the platform default, which on CUDA is ``breakable``; leaving it unset
     would also let a model default such as Inkling's pick it); profiling and
-    FlashInfer autotune off."""
+    FlashInfer autotune off (tuned tactics come from the cache file / archive)."""
     from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
     Backend = _backend()
@@ -272,6 +152,15 @@ def _elastic_recapture_path_exists() -> bool:
     return hasattr(cuda_graph_setup, "recapture_elastic_cuda_graph")
 
 
+# Speculative decoding persisted by Foundry: the EAGLE worker's target-verify,
+# draft-decode and draft-extend graphs (one decode-type capture scope each,
+# hooks._decode_capture_scope). NEXTN resolves to EAGLE before this check.
+# The other algorithms (STANDALONE, NGRAM, DFLASH, DSPARK, UNO, FROZEN_KV_MTP
+# and plugin-registered ones) run other workers and runners and stay
+# rejected.
+SUPPORTED_SPECULATIVE_ALGORITHMS = ("EAGLE", "EAGLE3", "NEXTN")
+
+
 def reject_unsupported_features(server_args: Any) -> None:
     """Features whose graphs Foundry cannot save or restore, rejected once
     they are resolved. Pipeline parallelism is allowed: the workspace rank
@@ -282,11 +171,22 @@ def reject_unsupported_features(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     unsupported = []
     spec = getattr(cfg, "speculative_algorithm", None)
-    if spec and str(spec).upper() != "NONE":
+    spec = str(spec).upper() if spec else "NONE"
+    if spec != "NONE" and spec not in SUPPORTED_SPECULATIVE_ALGORITHMS:
         unsupported.append(
-            f"speculative decoding (--speculative-algorithm={spec}): target-verify and "
-            "draft graphs are not persisted"
+            f"speculative decoding (--speculative-algorithm={spec}): only "
+            f"{'/'.join(SUPPORTED_SPECULATIVE_ALGORITHMS)} graphs are persisted"
         )
+    if spec != "NONE":
+        if getattr(cfg, "speculative_adaptive", False):
+            unsupported.append(
+                "adaptive speculative decoding (--speculative-adaptive): it captures one "
+                "graph set per step count and switches between them"
+            )
+        if getattr(cfg, "enable_multi_layer_eagle", False):
+            unsupported.append(
+                "multi-layer EAGLE (--enable-multi-layer-eagle): its runners are not persisted"
+            )
     if getattr(cfg, "enable_lora", False) or getattr(cfg, "lora_paths", None):
         unsupported.append("LoRA (--enable-lora / --lora-paths): not persisted or tested")
     if getattr(cfg, "enable_pdmux", False):
@@ -318,7 +218,7 @@ def reject_unsupported_features(server_args: Any) -> None:
 
 @dataclass(frozen=True)
 class FieldPin:
-    """A ServerArgs field the plugin declares to ``value``. ``default`` is
+    """A ServerArgs field Foundry declares to ``value``. ``default`` is
     sglang's default (fa090f7755): a raw value other than the pin and the
     default can only come from the user, and raises. ``strict`` pins are
     re-checked after the later resolution steps; a non-strict one may be
@@ -430,8 +330,8 @@ ENV_PINS: tuple[EnvPin, ...] = (
         "carry and are registered outside the recorded region",
     ),
     # NVSHMEM builds one NCCL communicator per team (5 on a 4-rank node, ~0.4 s
-    # each) while DeepEP creates its buffer; the low-latency kernels never use
-    # them, and the pin changes no allocation, so existing archives stay valid.
+    # each, ~1.5 GB of region memory) while DeepEP creates its buffer; the
+    # low-latency kernels never use them.
     EnvPin(
         "NVSHMEM_DISABLE_NCCL",
         "1",
@@ -605,8 +505,8 @@ def apply_env_pins(server_args: Any = None) -> None:
     """Set :data:`ENV_PINS` in ``os.environ`` (and :data:`NCCL_CUMEM_PIN` when
     ``server_args`` is given, i.e. once the all-to-all backend is known). An
     unset variable is set; one set to the pinned value is kept; one set to
-    anything else raises. Idempotent: every process that loads the plugin and
-    every spawn site calls it."""
+    anything else raises. Idempotent: activation, resolution and every spawn
+    site call it."""
     global _CUMEM_EXEMPT_LOGGED
     pins = list(ENV_PINS)
     if server_args is not None:

@@ -56,7 +56,7 @@ pytestmark = pytest.mark.skipif(
 
 def _env():
     env = {
-        # As the sglang integration pins it (plugin.ENV_PINS) and the recipes run.
+        # As the sglang integration pins it (pins.ENV_PINS) and the recipes run.
         "NVSHMEM_DISABLE_NCCL": "1",
         # NCCL buffers through the plain allocator.
         "NCCL_CUMEM_ENABLE": "0",

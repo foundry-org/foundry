@@ -9,28 +9,16 @@ order, and LOAD cannot replay that layout. `region_layout.json` (per rank) recor
 or with another value: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the
 current code`. Rule: re-SAVE every archive saved by the old code.
 
-## DeepEP v2 (NCCL windows + GIN) not validated on the plugin route (TODO, 2026-09-30)
+## DeepEP v2: NCCL's window descriptor is placed by the driver (NOTE, 2026-11-06)
 
-`--moe-a2a-backend deepep_v2` was validated on the earlier fork route only (H100 EP2 / EP4, all 256 decode graphs,
-foundry e24186b). On the plugin route (upstream main) it has not run: the plugin leaves `NCCL_CUMEM_ENABLE` to
-sglang for v2 (its NCCL windows need cuMem), and that exception is the one pin without a measurement behind it.
-
-Two attempts on the bare 4xH200 radix hosts failed before any Foundry code ran:
-
-- `sgl-deep-ep` 0.1.2 is built against NCCL 2.30.7 while torch pins 2.29.7 (`NCCL library version is too old`);
-  fixed for the run with `uv pip install --no-deps nvidia-nccl-cu13==2.30.7` plus the CUDA 13.3 compat libcuda.
-- With NCCL 2.30.7, plain sglang asserts at the first MoE dispatch: `NCCL GIN is unavailable` (`ElasticBuffer.__init__`,
-  `csrc/kernels/backend/nccl.cu:87`). v2 requires NCCL GIN even for a single-node EP4, i.e. an RDMA NIC visible to
-  the process. These hosts are 4-GPU slices of 8xH200 nodes with IB disabled, so v2 cannot start there at all.
-
-What to check once an RDMA-capable host is available (Qwen3-30B-A3B-FP8 EP4, decode graphs; sglang forces prefill
-graphs off for v2): the `[Foundry] pin:` line saying `NCCL_CUMEM_ENABLE` was left to sglang; the ElasticBuffer
-bootstrap time on SAVE and LOAD; `Loaded 128 SGLang graphs in`; SAVE `final_alloc_offset` == LOAD
-`after_load_all_graphs`; no `[HOOK] WARNING: cuMemAddressReserve returned address ... != hint` (NCCL cuMem
-allocations made outside the hook's thread-local region would show up there); greedy parity and TPOT vs native.
-Why it is expected to work: v2's windows are library-owned physical memory at a hook-carved VA, registered at the
-pre-capture bootstrap on both SAVE and LOAD, the same model as DeepEP v1's NVSHMEM heap; the
-`NCCL_GRAPH_REGISTER=0` / `NCCL_LOCAL_REGISTER=0` / `NCCL_NVLS_ENABLE=0` pins stay in force.
+DeepEP v2 kernels take NCCL's window by address, and NCCL allocates the window descriptor from a CUDA memory pool
+(`ncclCommWindowRegister`), which the driver places itself: the pool API takes no address, so this is the one device
+address in the graphs that the region does not control. The driver's choice is deterministic: SAVE and LOAD get the
+same address when they run with the same environment and the same steps before the first capture scope (measured on
+drivers 580 and 595, in either position of LOAD's binary restore and exec prewarm). Foundry relies on that and does
+not interpose the pool API. Consequence: SAVE and LOAD must use identical environment variables (for example
+`CUDA_MODULE_LOADING`); a difference can move the pool by 512 MiB, and the restored dispatch then fails at the first
+replay with an illegal memory access while the region offsets still match.
 
 ## Event-record nodes (TODO, 2026-10-02)
 
@@ -55,7 +43,7 @@ start of the graph. The runner keeps it in `self.in_graph_metadata_prep_done` (o
 first capture) and `_publish_read_done(in_graph=True)` hands it to the scheduler, which can then overwrite the shared
 buffers while the rest of the forward still runs.
 
-**What LOAD loses.** LOAD never runs `run_once` (patch 3 in [`hooks.md`](hooks.md) swaps the capture for the
+**What LOAD loses.** LOAD never runs `run_once` (`hooks.capture_one` swaps the capture for the
 archived graph), so `runner.in_graph_metadata_prep_done` stays `None`. The archive does not help either. SAVE
 serializes event-record / event-wait nodes as `EventRecordNode` / `EventWaitNode` with an `event_id` numbered per
 graph in first-seen order (`event_to_id` in `CUDAGraph.cpp`); LOAD creates a fresh private `CUevent` per id
@@ -65,12 +53,7 @@ therefore records into an event that only Foundry holds: the link from the node 
 all of a runner's graphs. (Not checked against a SGLang archive for this particular node; the statement is
 from the SAVE / LOAD code, which handles every event node this way.)
 
-Upstream's fallback for "`IN_REPLAY` declared, no marker" is `PRE_REPLAY`, which fences too early: the scheduler may
-overwrite buffers the graph is still about to read (upstream's own TODO in `_resolve_shared_read_ends` says
-`POST_REPLAY` is the sound one). Foundry's `shared_read_ends_override` (`integration/sglang/hooks.py`, called from
-`_resolve_shared_read_ends`; patch 3d in [`hooks.md`](hooks.md)) therefore returns `POST_REPLAY` on LOAD in that case
-on the plugin route. On the dependency route upstream's own fallback is already `POST_REPLAY`, so no Foundry call is
-needed there.
+SGLang's fallback for "`IN_REPLAY` declared, no marker" is `POST_REPLAY` (`_resolve_shared_read_ends`).
 That is correct, but the scheduler's writes for batch N+1 now wait for the whole forward of batch N, so the overlap the
 marker buys is lost. The loss was not measurable in our bs 1-128 TPOT runs; it may matter for small-batch, CPU-bound
 serving, where the scheduler's next-batch preparation is a large share of the step (not measured).
@@ -78,8 +61,8 @@ serving, where the scheduler's next-batch preparation is a large share of the st
 **TODO (next phase).** Give events a stable identity across the archive instead of a per-graph index: SAVE records,
 per event node, an id for the host event (shared by every graph that records it) and, where the integration registers
 one, which host object it is. LOAD creates one event per id, adds the nodes with it, and hands the event back to the
-integration (SGLang: set `runner.in_graph_metadata_prep_done`). Then the plugin route's `shared_read_ends_override`
-patch can go, and upstream's own `IN_REPLAY` path runs unchanged. The generic mechanism
+integration (SGLang: set `runner.in_graph_metadata_prep_done`). Then upstream's own `IN_REPLAY` path runs on LOAD
+too. The generic mechanism
 is "graph nodes that reference host objects": events now, conditional handles and child-graph handles later.
 
 ## SAVE spends ~30 s in `Init torch distributed` (and ~20 s more elsewhere) copying over-read fatbins (FIXED, 2026-09-25)
@@ -127,10 +110,10 @@ all-gather instead).
 **Fix.** Two changes, both following the rule that state sglang builds lazily on the first
 forward must be created at the same sequence point on SAVE and LOAD: (1) SAVE no longer runs an
 eager warmup pass; the only pre-capture work is the two one-time initializations that stream
-capture rejects (inductor's lazy init, DeepGEMM's runtime init), run with the allocation region
+capture rejects (DeepGEMM's runtime init), run with the allocation region
 suspended, so the model's compiles and JIT loads happen inside the captured forward and are
-recorded; (2) `bootstrap_logits_gatherer` builds the gatherer's state before capture on both
-modes, so the graphs capture the multicast gather exactly as native sglang does and it lands at
+recorded; (2) the gatherer's state is built before capture on both modes (now by sglang's
+warmup, `LogitsProcessor.prebuild_logits_gatherer`), so the graphs capture the multicast gather exactly as native sglang does and it lands at
 the same addresses on LOAD. Validated: identical output, TPOT within 1.3% of native capture.
 `FOUNDRY_SGLANG_CHECK_ARCHIVE=1` (or `python -m foundry.integration.sglang.archive_check`)
 reports any graph pointer into the region that no recorded range covers, which names the next
@@ -216,7 +199,7 @@ localization chain, each step measured:
   dp_rank 1 requests are corrupted (prompt-dependent visibility).
 - NOT an execution-order race: persists under CUDA_LAUNCH_BLOCKING=1.
 - NOT torch-cache aliasing alone: `torch.cuda.empty_cache()` after graph
-  load does not fix it (kept in hooks as hygiene regardless).
+  load does not fix it (the call was kept as hygiene at the time; it no longer exists).
 - ADDRESS-DISPLACEMENT SENSITIVE (smoking gun): planting a 64 MB tensor at
   the exact region boundary (final_alloc_offset, 0x601cb2200000 on the dirty
   rank) makes ALL requests clean — and the canary itself records ZERO
@@ -247,12 +230,12 @@ NVSHMEM traffic and graph-referenced addresses used the SAVE-time address
 while the runtime used the LOAD-time one; whichever eager tensor later
 reused the stale VA got corrupted (logits-path tensors by default).
 
-**Fix** (hooks.py, no dummy forwards): run `bootstrap_deepep_buffer` BEFORE
-the SAVE-side warmup pass, so the buffer is created at the same
+**Fix** (no dummy forwards): create the buffer (now sglang's warmup
+prebuild, `DeepEPDispatcher.prebuild`) BEFORE the SAVE-side warmup pass, so the buffer is created at the same
 allocation-sequence point in both modes and its address matches by
 construction. Archives must be RE-SAVED (baked addresses change).
 `torch.cuda.empty_cache()` after graph load was also added as allocator
-hygiene. Validated: the repro sequence is fully clean, first token
+hygiene (since removed). Validated: the repro sequence is fully clean, first token
 `<think>` at logprob ~0.0, DP2 regression clean.
 
 **Follow-up.** Add a token-parity check (fixed prompt set, temp 0,
@@ -262,3 +245,21 @@ routinely.
 Repro: `experimental/expert-parallel/serve_sglang_qwen_30b_a3b.sh 2 --load`,
 then two chat requests, temp 0: `"What is 15 - 6? Answer briefly."` — the
 second (or the first, if the server warmup ran) starts with `" zeroes"`.
+
+## Garbage output on both SAVE and LOAD with `--moe-a2a-backend none` at EP > 1 (FIXED, 2026-10-19)
+
+**Symptom.** Qwen3-30B-A3B-FP8 EP2 (attention DP or TP) with the plain EP all-to-all (`--moe-a2a-backend none`,
+sglang's standard token dispatcher): the SAVE engine's own output is garbage from the first token of every request,
+LOAD's as well (decode-only: first token right, then wrong); native capture is correct; offsets match, no hook
+errors. DeepEP v1 / v2 rows are unaffected.
+
+**Cause.** `StandardDispatcher` built `local_expert_mapping` (global expert id -> local slot, or -1) lazily on its
+first dispatch. SAVE captures the first shape without warm-up forwards, so that first dispatch ran under stream
+capture: the tensor was allocated in the graph pool and its `full`/`arange` fill was only recorded, never
+executed. Every later eager forward (and every graph) routed through the uninitialized mapping, and LOAD's graphs
+referenced its capture-time address.
+
+**Fix.** sglang's `StandardDispatcher.prebuild()` builds the mapping with the same builder as its lazy path, in
+the EagerRunner warmup (`BaseRunner._prepare_capture_state`) before any capture, at the same sequence point on SAVE
+and LOAD; Foundry's first capture scope checks it exists (`check_capture_state_prebuilt`).
+The rule stands: state sglang creates lazily on the first forward must exist before the first capture.

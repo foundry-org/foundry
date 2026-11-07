@@ -8,7 +8,6 @@
 | `sgl/` | `sglang` | sglang installed, no GPU |
 | `sgl/e2e/` | `sglang`, `gpu`, `slow` (+ `multigpu`, `xlarge` per case) | GPUs, model weights or configs from the HF cache / network |
 
-`plugin_route` marks `sgl/test_plugin_route.py` and `sgl/test_plugin_hook_points.py`.
 `slow` and `xlarge` are deselected by default (`pyproject.toml` addopts); a `-m` on the command line replaces that default.
 Missing GPUs skip; missing sglang / deep_ep / triton / nvcc skip.
 
@@ -24,7 +23,6 @@ pytest tests/sgl/e2e/test_save_load_1gpu.py -m slow -v -s
 pytest tests/sgl/e2e -m "slow and multigpu and not xlarge" -v -s     # Qwen3.5-35B-A3B on 2 GPUs
 pytest tests/sgl/e2e -m slow -k q35_ep2 -v -s                       # one case
 pytest tests/sgl/e2e -m "slow and xlarge" -v -s                     # 4 GPUs
-pytest tests/ -m "not slow and not xlarge and not plugin_route"         # without the plugin-route files
 pytest tests/core/test_save_load.py -k compat -q -s                     # torch-compat check of a wheel
 ```
 

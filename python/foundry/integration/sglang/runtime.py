@@ -48,6 +48,9 @@ class WarmupState:
     # models); LOAD skips the resolver and replays them instead.
     context_overrides: list = field(default_factory=list)
     final_alloc_offset: int = 0
+    # FlashInfer's tuned tactics of this rank (the content of SGLang's autotune
+    # cache file), installed by LOAD before capture; None: default tactics.
+    flashinfer_tactics: dict | None = None
 
 
 @dataclass
@@ -62,6 +65,9 @@ class CUDAGraphExtensionState:
     preallocated: bool = False
     # Whether this process restored (LOAD) prefill graphs.
     prefill_graphs_restored: bool = False
+    # Decode-type capture scopes restored so far (LOAD; one per kind, e.g.
+    # target_verify, draft_decode, draft_extend under EAGLE).
+    decode_scopes_done: int = 0
 
 
 _state: CUDAGraphExtensionState | None = None
@@ -70,7 +76,8 @@ _state: CUDAGraphExtensionState | None = None
 # of SAVE and consumed by LOAD's preallocation (see record_region_layout).
 _LAYOUT_FILE = "region_layout.json"
 # Version of the allocation sequence between the layout start and the end of
-# the decode capture, recorded in _LAYOUT_FILE on SAVE and required on LOAD.
+# the last decode-type capture scope, recorded in _LAYOUT_FILE on SAVE and
+# required on LOAD.
 # 2: both modes run sglang's own decode capture loop and substitute only the
 # capture (1, unmarked: a FlashInfer metadata pre-pass before the loop, which
 # allocates the per-bs wrappers in another order; LOAD cannot replay it).
@@ -215,23 +222,6 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
     )
 
 
-def skip_to_scratch_boundary() -> None:
-    cfg = get_config()
-    if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
-        return
-    scratch = parse_size(cfg.scratch_space_size)
-    current = cge.get_current_alloc_offset()
-    if current > scratch:
-        logger.warning(
-            "[Foundry] Current allocation offset %d exceeds scratch size %d",
-            current,
-            scratch,
-        )
-        return
-    cge.set_current_alloc_offset(scratch)
-    logger.info("[Foundry] SGLang skipped allocator to scratch boundary %d", scratch)
-
-
 @contextlib.contextmanager
 def allocation_region_suspended():
     """Run a block whose device allocations must not touch the deterministic
@@ -246,6 +236,33 @@ def allocation_region_suspended():
         torch.cuda.empty_cache()
     finally:
         cge.resume_allocation_region()
+
+
+_gc_held = False
+
+
+def hold_cyclic_gc() -> None:
+    """Keep Python's cyclic collector off until the layout starts.
+
+    Model loading leaves tensors in reference cycles (EAGLE3: two draft linear
+    weights, 110 MB). The collector frees them when its allocation counters
+    trip, which the weight-loading threads move from run to run, so a later
+    allocation (the draft's RoPE cache) takes the freed block on some runs and
+    another one on others, and LOAD's buffers miss the addresses SAVE's graphs
+    hold. With the collector off, cycles are freed only by the explicit
+    collections both modes run at the same points (memory-pool resolution,
+    layout start)."""
+    global _gc_held
+    if gc.isenabled():
+        gc.disable()
+        _gc_held = True
+
+
+def _release_cyclic_gc() -> None:
+    global _gc_held
+    if _gc_held:
+        gc.enable()
+        _gc_held = False
 
 
 def mark_layout_start() -> None:
@@ -266,6 +283,7 @@ def mark_layout_start() -> None:
         return
     gc.collect()
     torch.cuda.empty_cache()
+    _release_cyclic_gc()
     if cfg.mode != CUDAGraphExtensionMode.SAVE:
         return
     _layout_start_offset = cge.get_current_alloc_offset()
@@ -350,9 +368,12 @@ def preallocate_for_load_mode() -> None:
     LOAD's current cursor and the watermark, then checks the cursor against
     SAVE's recorded layout start (equal by construction; a difference means
     the allocation sequences diverged and is logged, moving the cursor up when
-    LOAD is behind). Allocations inside the span are pointer bumps; a hole is
-    backed on demand by the hook and logged, since it too means the sequences
-    diverged."""
+    LOAD is behind). Allocations inside the span are pointer bumps. A range
+    SAVE allocated and freed again before the end is not in the layout: when
+    LOAD's replay of the same sequence allocates it, the hook backs it on
+    demand and logs it at INFO (the same ranges on every LOAD of an archive,
+    e.g. the segments sglang's ``empty_cache`` releases between the EAGLE
+    draft scopes)."""
     cfg = get_config()
     if cfg is None or cfg.mode != CUDAGraphExtensionMode.LOAD:
         return
@@ -445,20 +466,6 @@ def _set_subprocess_preload_env() -> None:
     os.environ["FOUNDRY_SPAWN_T0_NS"] = str(time.perf_counter_ns())
 
 
-def setup_ld_preload_env(server_args=None) -> None:
-    """Plugin route, spawn sites (launcher before the schedulers, DP
-    controller before its TP groups): the preload environment for the
-    children, set for the rest of the process, and the plugin's environment
-    pins re-asserted (``plugin.apply_env_pins``; with ``server_args`` also
-    the all-to-all-dependent ``NCCL_CUMEM_ENABLE``) so every child inherits
-    them whichever route loaded Foundry."""
-    _set_subprocess_preload_env()
-    if get_graph_extension_mode() != CUDAGraphExtensionMode.NONE:
-        from foundry.integration.sglang.plugin import apply_env_pins
-
-        apply_env_pins(server_args)
-
-
 _SUBPROCESS_ENV_KEYS = ("LD_PRELOAD", "FOUNDRY_MODE", "FOUNDRY_SPAWN_T0_NS")
 
 
@@ -474,10 +481,10 @@ def _start_resource_tracker() -> None:
 
 @contextlib.contextmanager
 def subprocess_preload_env():
-    """Dependency route (``foundry.integration.sglang.api``): the same
-    preload environment, set only around ``Process.start()`` (the child
-    copies ``os.environ`` at that point) and restored afterwards, so the
-    launcher's other processes do not load the hook."""
+    """``api.configure_subprocess``: the children's preload environment, set
+    only around ``Process.start()`` (the child copies ``os.environ`` at that
+    point) and restored afterwards, so the launcher's other processes do not
+    load the hook."""
     _start_resource_tracker()
     saved = {key: os.environ.get(key) for key in _SUBPROCESS_ENV_KEYS}
     try:

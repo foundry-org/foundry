@@ -83,7 +83,7 @@ For Foundry SAVE and LOAD engines, name it in the graph-extension TOML, next to 
 verbs_udev_wait_shim_path = "/abs/path/to/libno_cdev_wait.so"
 ```
 
-The integration layer (`integration/sglang/runtime.py`, `setup_ld_preload_env`) then adds it to
+The integration layer (`integration/sglang/runtime.py`, `subprocess_preload_env`) then adds it to
 `LD_PRELOAD` together with `libcuda_hook.so` and the NVSHMEM host library, before the engine processes
 are spawned; a missing file is rejected when the TOML is read. Native SGLang engines (no Foundry) do not
 read that TOML, so for a fair native-vs-Foundry comparison export it in the shell as well, appending to
@@ -94,7 +94,7 @@ export LD_PRELOAD=/path/to/libno_cdev_wait.so${LD_PRELOAD:+:$LD_PRELOAD}
 ```
 
 Foundry itself adds `libcuda_hook.so` from Python (`integration/sglang/runtime.py`,
-`setup_ld_preload_env`) by prepending to whatever `LD_PRELOAD` already holds, so an exported shim
+`subprocess_preload_env`) by prepending to whatever `LD_PRELOAD` already holds, so an exported shim
 survives into the SAVE and LOAD engines; the recipe scripts and the `experimental/matrix3` harness set
 nothing else. A launcher that overwrites the variable drops one of the two libraries, and the SAVE/LOAD
 engines then silently lose the shim while the native engines keep it, which makes their start times

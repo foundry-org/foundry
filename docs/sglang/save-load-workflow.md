@@ -34,11 +34,11 @@ installed (or its integration API major mismatches), SGLang stops at startup wit
 reason instead of running natively; see
 [`recipe/sglang/README.md`](../../recipe/sglang/README.md#activation---cuda-graph-persistence).
 
-On SAVE / LOAD, Foundry's resolution hooks pin the configs that select unreplayable state
+On SAVE / LOAD, Foundry's resolution steps pin the configs that select unreplayable state
 (NCCL registration / cuMem / NVLS, DeepGEMM precompile, and the rest) and stop the launch
-if one was set to the contrary ([`overview.md`](overview.md#what-the-plugin-pins-and-why));
-the scripts pass the collective flags (`--disable-custom-all-reduce --enable-torch-symm-mem`)
-in every mode so baseline, SAVE and LOAD capture the same graph set.
+if one was set to the contrary ([`overview.md`](overview.md#what-foundry-pins-and-why));
+the multi-GPU scripts pass the collective flags (`--disable-custom-all-reduce --enable-torch-symm-mem`)
+in every mode so baseline, SAVE and LOAD capture the same graph set, and all scripts source `set_env.sh`.
 
 `--cuda-graph-max-bs-decode 512` is the closest analogue to vLLM's `--max-num-seqs 512` — it drives `capture_bs` to span a similar range of decode batch sizes (52 batch sizes from 1 → 512).
 
@@ -51,7 +51,6 @@ One shared `recipe/sglang/foundry.toml` for SAVE and LOAD (the mode comes from
 base_addr = 0x600000000000
 region_size = "256GB"
 workspace_root = "foundry_archive"
-scratch_space_size = "1024MB"
 ```
 
 See [`memory-lifecycle.md`](memory-lifecycle.md) for the field semantics.
@@ -91,8 +90,11 @@ A single SAVE pass is sufficient. SGLang does not run a profile-forward at start
 
 ```
 foundry_archive/
-  warmup_state.json                       # shared; MemoryPoolConfig + final_alloc_offset
+  warmup_state.json                       # shared copy (first rank to write it); MemoryPoolConfig + final_alloc_offset
   rank_0/
+    warmup_state.json                     # per-rank (wins on LOAD): MemoryPoolConfig, context overrides, final_alloc_offset, FlashInfer tactics
+    decode_graphs.json                    # decode-type scope kinds in capture order + output structures
+    prefill_graphs.json                   # prefill graphs on: request slots, DP-gather flag, output structures
     graph_{0..N-1}_FULL_t{bs}_r{bs}_UX_pcN.json       # one per captured graph
     graph_{0..N-1}_FULL_t{bs}_r{bs}_UX_pcN.cugraph    # binary cuGraph blob
     graph_manifest.json                   # topology groups for template + on-demand linking
@@ -107,34 +109,30 @@ Filename scheme (defined in `graph_ops._graph_filename`):
 graph_{state.capture_index}_FULL_t{bs}_r{bs}_UX_pcN.json
 ```
 
-`state.capture_index` increments per `save_graph` call so files sort in SAVE-time order. `_GRAPH_FILENAME_RE` in `graph_ops.py` parses them on LOAD.
+`state.capture_index` increments per `save_graph` call so files sort in SAVE-time order. `_GRAPH_FILENAME_RE` in `graph_ops.py` parses them on LOAD. Other decode-type scopes (EAGLE / EAGLE3) and prefill graphs use `graph_{i}_DECODE-{kind}_t{size}_UX_pcN[_v{variant}].json` and `graph_{i}_PREFILL_t{tokens}_r{slots}_UX_pc{chunks}.json`.
 
 **Archive format note (LOAD template build).** A `.cugraph` written by the current SAVE carries the header flag
 `FLAG_COMPLETE_KERNEL_ATTRS` when it holds every kernel-node attribute the JSON records (per-node programmatic stream
 serialization and device-updatable live in spare node-table space; an access-policy window, or those attributes in the
-common set, leave the flag unset). LOAD then builds each template's graph from the binary node table only. Archives
-saved before this (or without the flag) still load unchanged, but their templates are built from the JSON copy, as
-before, so they do not get that speedup: re-SAVE to get it. The format stays v2, so older foundry builds read new
-archives too.
+common set, leave the flag unset). LOAD then builds each template's graph from the binary node table only; without the flag it builds from the JSON copy.
 
 ## Expected logs
 
 SAVE (success):
 
 ```
-[Foundry] SGLang hooks installing: mode=save workspace=foundry_archive_qwen_1.7b
-[Foundry] SGLang hooks installed
-Foundry SGLang integration activated from .../save_qwen_1.7b.toml
-[Foundry] SGLang rank=0 workspace_dir=foundry_archive_qwen_1.7b/rank_0
-[Foundry] SGLang graph extension setup completed in 0.x s
-[Foundry] SGLang skipped allocator to scratch boundary 1073741824
-[Foundry] SGLang reused saved memory pool config       ← only on LOAD
-[Foundry] SGLang kernel_warmup skipped in save mode
+[Foundry] SGLang graph persistence active: mode=save workspace=foundry_archive_qwen_1.7b
+[Foundry] SGLang rank=0 (tp_rank=0 pp_rank=0 dp_rank=… replica=0 attention_dp=False) workspace_dir=foundry_archive_qwen_1.7b/rank_0
+[Foundry] SGLang graph extension setup completed in 0.x s (binary restore 0.000 s, region reserve …, cuBLAS handle …)
+[Foundry] Saved SGLang warmup state to foundry_archive_qwen_1.7b/rank_0/warmup_state.json
+[Foundry] SGLang layout start offset=…
 …
 [Foundry] Saved SGLang CUDA graph graph_0_FULL_t512_r512_UX_pcN.json key=512
 …
 [Foundry] Saved SGLang CUDA graph graph_51_FULL_t1_r1_UX_pcN.json key=1
-[foundry] Saved graph_manifest.json: 9 topology groups (9 templates, 43 on-demand, 43 stripped)
+[foundry] Saved graph_manifest.json (templates=on): 9 topology groups (9 templates, 43 on-demand, 43 stripped)
+[Foundry] SAVE packed the recorded binaries in … ms
+[Foundry] SGLang region layout: … live ranges (… MB) in the region, …
 [Foundry] Saved SGLang warmup state to foundry_archive_qwen_1.7b/warmup_state.json
 [Foundry] SGLang final_alloc_offset=22785556480
 …
@@ -144,28 +142,28 @@ INFO:     Application startup complete.
 LOAD (success):
 
 ```
-[Foundry] SGLang hooks installing: mode=load workspace=foundry_archive_qwen_1.7b
-[Foundry] SGLang hooks installed
-[Foundry] SGLang graph extension setup completed in 0.x s
-[Foundry] SGLang reused saved memory pool config
-[Foundry] SGLang kernel_warmup skipped in load mode
+[Foundry] SGLang graph persistence active: mode=load workspace=foundry_archive_qwen_1.7b
+[Foundry] SGLang graph extension setup completed in 0.x s (binary restore …, region reserve …, cuBLAS handle …)
+[Foundry] SGLang reused saved memory pool config (0 context overrides replayed)
 [Foundry] SGLang alloc_offset[before_preallocate]=… (… MB)
+[Foundry] LOAD memory restore: … live ranges (… MB) mapped in … ms
 [Foundry] SGLang alloc_offset[after_preallocate]=… (… MB)
-[CGE] Using graph_manifest.json (9 topology groups)
-[CGE] Phase 1: 52 graphs parsed in 0.x ms, 9 topologies, 4 threads, 52 binary + 0 json
-[CGE BUILD] Template 0 (...): N nodes, done in X.X ms
+[foundry] Using graph_manifest.json (9 topology groups)
+[foundry] Phase 1: 52 graphs parsed in 0.x ms (…), 9 topologies, 4 threads, 52 binary + 0 json
+[foundry BUILD] Template 0 (...): N nodes, done in X.X ms
 …
-[CGE] Phase 2: 9 templates + 43 on-demand = 52 graphs built in xx.x ms
-[Foundry] SGLang alloc_offset[before_decode_restore]=… (… MB)
+[foundry] Phase 2: 9 templates + 43 on-demand = 52 graphs built in xx.x ms (…)
+[Foundry] SGLang alloc_offset[before_target_decode_restore]=… (… MB)
 [Foundry] Loaded 52 SGLang graphs in 0.0xs (builds 0.0xs, handover 0.00xs)
 [Foundry] SGLang decode capture loop on LOAD: 0.xs (52 shapes, restore 0.0xs, per-shape prep 0.xs)
+[Foundry] SGLang alloc_offset[after_load_target_decode_graphs]=22785556480 (… MB)
 [Foundry] SGLang alloc_offset[after_load_all_graphs]=22785556480 (… MB)
 …
 INFO:     Application startup complete.
 ```
 
 The `after_load_all_graphs` value **must** equal SAVE's `final_alloc_offset`. If it doesn't, see [`memory-consistency.md`](memory-consistency.md).
-The build lines (`[CGE] Phase 1/2`) come from the background build thread and may interleave with the offset lines.
+The build lines (`[foundry] Phase 1/2`) come from the background build thread and may interleave with the offset lines.
 The graphs are finished one per shape inside sglang's capture loop. The two timing lines, logged once per runner
 (decode above; the prefill runner logs `Loaded N SGLang prefill graphs in ...` and `SGLang prefill capture loop on
 LOAD: ...` the same way when prefill graphs are on), mean:
@@ -186,4 +184,4 @@ so the restore is tens of milliseconds per runner, while the loops take ~1.1 s (
 
 An archive saved by older code (no `capture_loop_version` in `region_layout.json`) is refused at setup, before the
 weights load: `Foundry archive ... has capture_loop_version=None, this code needs 2: re-SAVE with the current code`.
-Re-run both SAVE passes.
+Re-run SAVE.

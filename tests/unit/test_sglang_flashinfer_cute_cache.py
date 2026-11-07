@@ -127,3 +127,10 @@ def test_gdn_flashinfer_detection(monkeypatch):
     assert not fcc.gdn_flashinfer_in_use()
     monkeypatch.setitem(sys.modules, fcc.SGLANG_GDN_FLASHINFER, types.ModuleType("x"))
     assert fcc.gdn_flashinfer_in_use()
+
+
+def test_patch_is_on_by_default(monkeypatch):
+    monkeypatch.delenv(fcc.OPT_OUT_ENV, raising=False)
+    assert fcc.enabled()
+    monkeypatch.setenv(fcc.OPT_OUT_ENV, "0")
+    assert not fcc.enabled()

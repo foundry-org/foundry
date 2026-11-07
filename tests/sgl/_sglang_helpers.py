@@ -1,20 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
-"""Route-aware helpers for the SGLang integration tests (imported by the test
-modules; the fixtures are in conftest.py).
+"""Helpers for the SGLang integration tests (imported by the test modules;
+the fixtures are in conftest.py).
 
-Foundry reaches SGLang by one of two routes, decided by the installed sglang:
-
-- dependency route: sglang has ``sglang.srt.utils.foundry_adapter`` and calls
-  Foundry from its own call sites; enabled by ``--cuda-graph-persistence
-  {save,load}`` and ``--cuda-graph-persistence-config <toml>``; the plugin
-  refuses to activate there;
-- plugin route: the ``sglang.srt.plugins`` entry point, enabled by
-  ``FOUNDRY_GRAPH_EXTENSION_CONFIG=<toml>``.
-
-The end-to-end tests launch through :func:`foundry_launch` (via
-:func:`serve`) so one file validates whichever route the installed sglang has.
-Also shared: the mini model config for CPU-only resolution tests
+The installed sglang has ``sglang.srt.utils.foundry_adapter`` and calls
+Foundry from its own call sites; enabled by ``--cuda-graph-persistence
+{save,load}`` and ``--cuda-graph-persistence-config <toml>``. The end-to-end
+tests launch through :func:`foundry_launch` (via :func:`serve`). Also shared: the mini model config for CPU-only resolution tests
 (:data:`MINI_CONFIG`, the ``model_dir`` fixture) and :func:`run_python` for
 checks that need a fresh interpreter.
 """
@@ -30,15 +22,8 @@ import textwrap
 
 import pytest
 
-CONFIG_ENV = "FOUNDRY_GRAPH_EXTENSION_CONFIG"
-PLUGIN_ONLY_REASON = (
-    "plugin route only: this sglang calls Foundry directly (sglang.srt.utils.foundry_adapter) "
-    "and the plugin refuses to activate on it"
-)
-# Activation line of either route, one per process that activated Foundry.
-ACTIVE = re.compile(
-    r"\[Foundry\] (?:sglang plugin active|cuda graph persistence active): pid=(\d+)"
-)
+# Activation line, one per process that activated Foundry.
+ACTIVE = re.compile(r"\[Foundry\] cuda graph persistence active: pid=(\d+)")
 
 
 def sglang_has_adapter() -> bool:
@@ -50,27 +35,21 @@ def sglang_has_adapter() -> bool:
         return False
 
 
-plugin_route_only = pytest.mark.skipif(sglang_has_adapter(), reason=PLUGIN_ONLY_REASON)
-
-
 def foundry_launch(base_env, mode=None, toml=None):
     """(env, extra server args) for a native (``mode=None``) or a Foundry SAVE /
-    LOAD launch on the installed sglang's route. A Foundry launch first passes
-    preflight (route-aware, ``--save`` / ``--load``); a failure fails the test
-    rather than letting the engine run natively."""
-    env = {k: v for k, v in base_env.items() if k != CONFIG_ENV}
+    LOAD launch. A Foundry launch first passes preflight (``--save`` /
+    ``--load``); a failure fails the test rather than letting the engine run
+    natively."""
+    env = dict(base_env)
     if mode is None:
         return env, []
     from foundry.integration.sglang import preflight
 
     try:
-        preflight.run(toml, expect_mode=mode, env=env)
+        preflight.run(toml, expect_mode=mode)
     except preflight.PreflightError as exc:
         pytest.fail(f"Foundry preflight: {exc}")
-    if sglang_has_adapter():
-        return env, ["--cuda-graph-persistence", mode, "--cuda-graph-persistence-config", toml]
-    env[CONFIG_ENV] = toml
-    return env, []
+    return env, ["--cuda-graph-persistence", mode, "--cuda-graph-persistence-config", toml]
 
 
 # A config.json sglang's server-args resolution accepts without weights.
@@ -87,7 +66,7 @@ MINI_CONFIG = {
 }
 
 
-def run_python(code, cwd=None, *, env_drop=(CONFIG_ENV,), env_extra=None):
+def run_python(code, cwd=None, *, env_drop=(), env_extra=None):
     """Run ``code`` (dedented) in a fresh interpreter with this environment
     minus ``env_drop`` plus ``env_extra``."""
     env = {k: v for k, v in os.environ.items() if k not in env_drop}
@@ -102,12 +81,12 @@ def run_python(code, cwd=None, *, env_drop=(CONFIG_ENV,), env_extra=None):
     )
 
 
-def foundry_toml(path, mode, workspace, scratch_space_size="1024MB"):
+def foundry_toml(path, mode, workspace):
     """Write a Foundry TOML for an end-to-end engine. The region must hold
     everything sglang allocates after setup, the KV pool included."""
     path.write_text(
         f'mode = "{mode}"\nbase_addr = 0x600000000000\nregion_size = "256GB"\n'
-        f'workspace_root = "{workspace}"\nscratch_space_size = "{scratch_space_size}"\n'
+        f'workspace_root = "{workspace}"\n'
     )
     return str(path)
 

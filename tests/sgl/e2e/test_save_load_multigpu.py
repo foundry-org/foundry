@@ -27,9 +27,6 @@ backend's out-of-graph metadata is decode-only; the DSV4 backend rejects EXTEND)
 
 Overrides: FOUNDRY_E2E_MAXBS (decode max batch size per rank, default 64; the recipes use 256),
 FOUNDRY_E2E_WEIGHTS=dummy|real (default per case).
-
-Runs on whichever route the installed sglang has (_sglang_helpers.foundry_launch): the --cuda-graph-persistence
-flags when sglang has the Foundry adapter, the plugin's environment variable otherwise.
 """
 
 import os
@@ -171,8 +168,7 @@ def _engine_env(case):
 
 
 def _toml(path, mode, workspace):
-    # 4 GB scratch: TP/EP dist init takes 1.8-2.9 GB before the region opens (1 GB default is too small).
-    return foundry_toml(path, mode, workspace, scratch_space_size="4096MB")
+    return foundry_toml(path, mode, workspace)
 
 
 def _server_args(case):
