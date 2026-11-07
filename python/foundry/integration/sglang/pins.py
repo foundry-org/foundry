@@ -330,8 +330,8 @@ ENV_PINS: tuple[EnvPin, ...] = (
         "carry and are registered outside the recorded region",
     ),
     # NVSHMEM builds one NCCL communicator per team (5 on a 4-rank node, ~0.4 s
-    # each) while DeepEP creates its buffer; the low-latency kernels never use
-    # them, and the pin changes no allocation, so existing archives stay valid.
+    # each, ~1.5 GB of region memory) while DeepEP creates its buffer; the
+    # low-latency kernels never use them.
     EnvPin(
         "NVSHMEM_DISABLE_NCCL",
         "1",
