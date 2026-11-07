@@ -61,7 +61,7 @@ Anything that runs on one path but not the other. The fixes we landed identify a
 
 1. The two pre-capture warmup forwards in `capture_one_batch_size` — skipped on SAVE so they don't pollute the caching allocator with freed activations LOAD can't reproduce. (See doc 06.)
 2. The per-bs attention metadata init (`init_forward_metadata_out_graph(in_capture=True)`: FlashInfer wrappers, `_int_workspace_buffer`) outside the captured graph. Originally aligned with a pre-pass on both sides plus a SAVE-only reuse shim; now both modes run the upstream capture loop and substitute only `capture_one`, so the init runs at the same point and in the same order on SAVE and LOAD, with each graph's allocator events replayed where SAVE captured it. (See [`memory-consistency.md`](memory-consistency.md) Bug 3.)
-3. `_resolve_memory_pool_config` calls `get_available_gpu_memory(empty_cache=True)` on SAVE; LOAD's `_patch_init_memory_pool` mirrors it with an explicit `torch.cuda.empty_cache()` before `_apply_memory_pool_config`. (See below.)
+3. `_resolve_memory_pool_config` calls `get_available_gpu_memory(empty_cache=True)` on SAVE; LOAD's `replay_saved_memory_pool_config` mirrors it with an explicit `torch.cuda.empty_cache()` before `_apply_memory_pool_config`. (See below.)
 
 ## The `_resolve_memory_pool_config` mirror
 

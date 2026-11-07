@@ -70,8 +70,8 @@ Columns:
 
 - **Graph content**: kernels, node types and launch attributes the feature puts in the captured graph.
 - **One-time side effect LOAD misses**: yes or no, plus what.
-- **Foundry status**: handled (where), not handled, or rejected. Rejected means the plugin refuses the
-  configuration (plugin.py:130-254, hooks.py:867-900).
+- **Foundry status**: handled (where), not handled, or rejected. Rejected means Foundry refuses the
+  configuration (`pins.py`).
 - **Detect at SAVE**: how Foundry could see the problem at SAVE time.
 - **Coverage**: which of our rows exercised it.
 
@@ -96,10 +96,10 @@ Every row ran on H200 (sm90). **Nothing ran on sm100/sm120**, and every multi-GP
 | flag / feature | graph content | one-time side effect LOAD misses | Foundry status | detect at SAVE | coverage |
 |---|---|---|---|---|---|
 | two warmup forwards + `post_warmup_hook` (`full_cuda_graph_backend.py:137-151`) | none (eager) | Native sglang uses them for every lazy init (M2) | intentionally skipped on SAVE. Replaced by the bootstraps: NCCL connect, logits gatherer, DeepEP/v2/mooncake buffer, inductor lazy_init, DeepGEMM runtime (hooks.py:405-446) | alloc events that happen inside the capture of graph i and stay live after the loop (section 3.2) | all rows |
-| `--cuda-graph-backend-decode/prefill`, `--cuda-graph-config`, disaggregation roles | full vs breakable (dedup mixin: breakable only, `cuda_graph_dedup_mixin.py:303`) | n/a | pinned: decode `full`, prefill `full`/`disabled` (plugin.py:130-205, hooks.py:838-865) | already enforced | all; prefill full: B4 |
+| `--cuda-graph-backend-decode/prefill`, `--cuda-graph-config`, disaggregation roles | full vs breakable (dedup mixin: breakable only, `cuda_graph_dedup_mixin.py:303`) | n/a | pinned: decode `full`, prefill `full`/`disabled` (`pins.py`) | already enforced | all; prefill full: B4 |
 | `--cuda-graph-bs-*`, `--cuda-graph-max-bs-*`, `--disable-cuda-graph-padding`, `--cuda-graph-max-seq-len-prefill` | set of shapes | no; LOAD errors on a missing bs (hooks.py:648-653) | handled | enforced at LOAD | all |
 | attention graph variants (`ShapeKey.attention_variant`: DSV4.1 candidate indexer on SM100, HIP DSA dual) | several graphs per bs | n/a | rejected at runtime (hooks.py:885-890) | enforced | none (sm90 rows do not create them) |
-| `--enable-profile-cuda-graph`, `SGLANG_GRAPH_BATCH_CAPTURE` | profiler steps | n/a | rejected (plugin.py:163) | enforced | - |
+| `--enable-profile-cuda-graph`, `SGLANG_GRAPH_BATCH_CAPTURE` | profiler steps | n/a | rejected (`pins.py`) | enforced | - |
 | `SGLANG_ENABLE_GRAPH_POOL_BORROW` | pool extents | n/a | forced off (hooks.py:383) | - | - |
 | `SGLANG_ENABLE_GRAPH_POOL_PRECARVE` (`GraphPoolPrecarve`, `full_cuda_graph_backend.py:143,180`) | changes pool layout | no (skipped on both SAVE and LOAD, because Foundry's capture_one bypasses it) | implicitly off. Not stated anywhere | log if the env is set | - |
 | `--enable-memory-saver` + `SGLANG_MEMORY_SAVER_CUDA_GRAPH` (`full_cuda_graph_backend.py:99-102,163-174`) | tms-owned graph memory | SAVE bypasses the tms graph context. A later pause/resume would not back up restored graph memory | **not rejected**, untested | reject in `reject_unsupported_features` | - |
@@ -107,9 +107,9 @@ Every row ran on H200 (sm90). **Nothing ran on sm100/sm120**, and every multi-GP
 | in-graph shared-read external event (`decode_cuda_graph_runner.py:500-515`) | EVENT_RECORD node with an external event | LOAD rebuilds it with a private event (CUDAGraphParallel.cpp:771-793). The host-side event stays None | handled: POST_REPLAY fence (hooks.py:746-758) | the only `make_external_event` site in srt | all |
 | `model_runner.capture_tail_hooks` (`decode_cuda_graph_runner.py:1224`) | extra kernels (dflash/dspark) | only via speculative | speculative rejected | - | - |
 | `tbo_plugin.capture_one_batch_size` (`--enable-two-batch-overlap`; `two_batch_overlap.py:342-371`, `tbo_backend.py:56-81`) | children micro-batch metadata, DeepEP `Buffer.capture()` events | **yes**: builds `forward_batch.tbo_children`, which the children's `out_graph` needs. LOAD's `initialize_attention_metadata_for_bs` never calls it (graph_ops.py:880-913) | **not handled, not rejected** | reject TBO, or call the plugin step in the LOAD pre-pass | - |
-| LoRA dual graph, spec draft/verify, pdmux, elastic-EP recapture, `SGLANG_ENABLE_POST_CAPTURE_KV_SIZING` | variant graphs, multi-stream | various | rejected (plugin.py:215-254, hooks.py:891-899) | enforced | - |
-| `SGLANG_ENABLE_METADATA_GLUE_GRAPH` (`metadata_glue_graph.py`) | a second, sglang-owned graph of the metadata prep | eager warmup + capture at replay time. Not persisted | not rejected; the plugin does not touch it | - | - |
-| PP (`--pp-size`) | PPProxyTensors outputs | none known | allowed, persisted, never run on GPU (plugin.py:217-219) | - | - |
+| LoRA dual graph, spec draft/verify, pdmux, elastic-EP recapture, `SGLANG_ENABLE_POST_CAPTURE_KV_SIZING` | variant graphs, multi-stream | various | rejected (`pins.py`) | enforced | - |
+| `SGLANG_ENABLE_METADATA_GLUE_GRAPH` (`metadata_glue_graph.py`) | a second, sglang-owned graph of the metadata prep | eager warmup + capture at replay time. Not persisted | not rejected; Foundry does not touch it | - | - |
+| PP (`--pp-size`) | PPProxyTensors outputs | none known | allowed, persisted, never run on GPU (`pins.py`) | - | - |
 | `--enable-torch-compile` (`compilation/torch_compile_decoration.py:71-83`: `coordinate_descent_tuning=True`) | inductor Triton kernels | first-call compile + autotune inside capture (M2) | lazy_init bootstrap + autotune guard (graph_ops.py:605-704); requires a warm cache | guard only wraps `benchmark_all_configs`. **[spec]** coordinate-descent tuning benchmarks through another entry point and may bypass the guard | GLM (DSA indexer compile), gpt-oss |
 | `compile_in_capture_mode` (DSV4 helpers, `runner_utils/capture_mode.py:48-57`) | torch.compile'd helpers only under capture | same as above | same | same | B2 |
 
@@ -151,13 +151,13 @@ Choices: `--moe-runner-backend` (`srt/arg_groups/choices.py:133-161`) and `--moe
 | `flashinfer_megamoe` (runner or a2a) | `MoEEpMegaLayer` per layer | **yes**: built on the layer's first forward with a bootstrap collective (`layers/moe/flashinfer_megamoe.py:254-310`). The eager prebuild is **commented out** upstream (`model_executor/model_runner.py:1079-1091`). NVFP4 raises inside capture (`flashinfer_megamoe.py:341-345`) | not handled (loud on SAVE for NVFP4) | loud | none |
 | `flashinfer_cutedsl` MoE | `CuteDslMoEWrapper` (w4a4/w4a16) | **yes**: the wrapper and its CUDA-graph buffers are built on the first forward (`moe_runner/flashinfer_cutedsl.py:302-360`, called at `quantization/modelopt_quant.py:3199`), inside capture on SAVE | not handled | section 3.2 | none |
 | `deep_gemm` (+ `SGLANG_ENABLE_JIT_DEEPGEMM`, `SGLANG_DEEPGEMM_PDL`) | DeepGEMM JIT kernels with cluster (<= 2 **[spec]**), TMA descriptors in params, PDL via `deep_gemm.set_pdl` (`deep_gemm_wrapper/entrypoint.py:292-296`). Masked vs compact layout from a free-memory budget measured before capture (`moe_runner/deep_gemm.py:220-249`) | the runtime init is handled. **`SGLANG_JIT_DEEPGEMM_PRECOMPILE` (default True, `environ.py:1193`)**: the first call sweeps every M, then `synchronize()` + `empty_cache()` (`deep_gemm_wrapper/compile_utils.py:144-186, 262-274, 445-451`), rank-0-of-node only | runtime init: `bootstrap_lazy_runtimes`. Precompile: the EP recipe scripts export `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0` in every mode; Foundry also pins it on SAVE / LOAD | loud (sync in capture), or an asymmetric rank-0 layout | Q30, Q235, B3 |
-| `flashinfer_trtllm` / `_routed` (+ `SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS`) | trtllm-gen cubins. PDL on only when `num_tokens <= 8192` (per-bs graph attribute, `moe_runner/flashinfer_trtllm.py:50-56`) | M1 attributes on flashinfer's cubin handles **[spec]**. The tactic stays default while autotune is off | partly. Autotune pinned off (plugin.py:175) | section 3.1 | none |
+| `flashinfer_trtllm` / `_routed` (+ `SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS`) | trtllm-gen cubins. PDL on only when `num_tokens <= 8192` (per-bs graph attribute, `moe_runner/flashinfer_trtllm.py:50-56`) | M1 attributes on flashinfer's cubin handles **[spec]**. The tactic stays default while autotune is off | partly. Autotune pinned off (`pins.py`) | section 3.1 | none |
 | `SGLANG_ENABLE_MOE_DEFERRED_FINALIZE` (default on) | JIT `moe_finalize_fuse_shared` with PDL (`kernels/jit/csrc/moe/moe_finalize_fuse_shared.cu:372-374`) | no | handled (PDL edges are recorded) | - | trtllm path only: none |
 | mxfp4 fused finalize + TP all-reduce (`SGLANG_FLASHINFER_MOE_FUSED_FINALIZE`) | the probe returns None while capturing, so SAVE captures the **unfused** variant (`quantization/mxfp4_flashinfer_trtllm_moe.py:528-536`) | no for LOAD (self-consistent). It differs from native sglang, which also creates a second push-only CustomAllReduceV2 (`:545-555`) | M2c divergence (perf only) | compare against native kernel lists | B4 **[spec: which runner B4 used]** |
 | triton MoE (TMA path) | `triton.set_allocator` once (`kernels/ops/moe/fused_moe_triton_kernels.py:724-739`). B-weight TensorDescriptor cache keyed by data_ptr (`:744-786`) | no (scratch allocated inside capture is recorded) | handled | - | B4? |
 | marlin / awq / gptq | per-call `torch.zeros` workspace becomes a memset node + pool alloc (`moe_runner/marlin.py:152-154`). JIT marlin sets MaxDynamicSmem | no | handled (smem recorded) | - | none |
 | EPLB (`--enable-eplb`), expert distribution recorder | in-place metadata/weight updates (`eplb/expert_location.py:312-340`). "dynamic" dispatch puts Philox `randint` in the graph (`expert_location_dispatch.py:143-146`) | no, if LOAD rebuilds the tensors at the same addresses. RNG is registered per graph by Foundry | probably fine, untested | - | none |
-| elastic EP (`--elastic-ep-backend`, `--max-ep-size`) | recapture after a scale event | n/a | rejected (plugin.py:236-246, hooks.py:891-899) | enforced | - |
+| elastic EP (`--elastic-ep-backend`, `--max-ep-size`) | recapture after a scale event | n/a | rejected (`pins.py`) | enforced | - |
 | waterfill (`layers/moe/waterfill.py:93-100`) | `_counts_buf` lazily allocated in the first capture, zeroed every call | no content dependency; address from graph #1's pool | fine | - | - |
 
 ### 1.4 Communication
@@ -238,7 +238,7 @@ Rank = likelihood a real deployment hits it × how silent the failure is.
    LOAD never compares GPU identity: `warmup_state.json` stores `gpu_name` but never checks it.
 9. **Pinned-host H2D memcpy nodes** (`--cpu-offload-gb`, possibly the DSV4 c_plan prefill path). A UVA-reported
    endpoint would escape the `srcHost` check **[spec]**.
-10. **Env pins that live only in the recipe, not in the plugin:**
+10. **Env pins that live only in the recipe, not in `pins.py`:**
     - `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0` (default True: a first-call sweep with a sync inside capture on rank 0);
     - `NCCL_CUMEM_ENABLE=0`, `NCCL_NVLS_ENABLE=0`.
 

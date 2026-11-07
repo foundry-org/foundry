@@ -1,5 +1,0 @@
-mode = "load"
-base_addr = 0x600000000000
-region_size = "256GB"
-workspace_root = "foundry_archive_eep_recover"
-# NVSHMEM / mooncake host libraries are auto-detected by foundry; leave nvshmem_host_path unset.
