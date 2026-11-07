@@ -149,8 +149,8 @@ def pin_server_args(server_args: Any) -> None:
 
 def validate_resolved_server_args(server_args: Any) -> None:
     """After ``handle_other_validations``: reject what Foundry cannot persist
-    (speculative decoding other than EAGLE / EAGLE3, LoRA, PD multiplexing,
-    elastic-EP recapture,
+    (speculative decoding other than EAGLE / EAGLE3, adaptive or multi-layer
+    EAGLE, LoRA, PD multiplexing, elastic-EP recapture,
     post-capture KV sizing), re-check the graph config and the strict pins
     after the later cascades, and pin the environment including
     ``NCCL_CUMEM_ENABLE`` (left alone for ``--moe-a2a-backend deepep_v2``)."""

@@ -128,8 +128,8 @@ nvidia-smi per-process memory) plus 3 earlier pairs:
 - **Abandoned** when Phase 2's instantiate thread starts before it finished:
   it stops after its current graph, destroys what it made, and Phase 2 runs as
   without it. A failure only costs speed.
-- **No knob:** always on for an eager SGLang LOAD (decode and prefill graphs);
-  graphs without a valid `.cugraph` are skipped.
+- **Knob:** on for an eager SGLang LOAD (decode and prefill graphs; off only
+  with `FOUNDRY_EXEC_POOL_PREWARM=0`); graphs without a valid `.cugraph` are skipped.
 
 ## Cluster launches
 

@@ -57,6 +57,8 @@ LOAD never runs these warmups → different cache state → different cache hit/
 
 In `patched_capture_one_batch_size` wrap `forward` with a 3-call counter; first two invocations return `None`, the third (inside `_capture_graph`) runs the real forward. The `synchronize` and `barrier` calls in the loop are harmless. JIT and autotune that the warmups normally trigger now run inside the captured graph and are recorded as alloc events — foundry replays them verbatim on LOAD.
 
+**Current design.** `hooks.capture_one` (SAVE) captures directly with no warmup forwards; there is no patched `capture_one_batch_size`.
+
 ## Bug 3 — Per-bs init outside graph capture
 
 ### Symptom
@@ -119,9 +121,4 @@ LOAD's `_patch_init_memory_pool` skipped upstream profiling entirely and went di
 
 ### Fix
 
-One line in `_patch_init_memory_pool`'s LOAD branch:
-
-```python
-torch.cuda.empty_cache()
-self._apply_memory_pool_config(self.memory_pool_config)
-```
+An explicit drain in LOAD's `_patch_init_memory_pool` branch before `_apply_memory_pool_config`. **Current design:** LOAD's `replay_saved_memory_pool_config` (head of `_resolve_memory_pool_config`) runs `gc.collect()` + `torch.cuda.empty_cache()` and returns the saved `MemoryPoolConfig`.

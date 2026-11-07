@@ -2063,10 +2063,12 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
         }
         if (cdx > 0 || cdy > 0 || cdz > 0) {
           // FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES=0: key only records *whether* a node launches
-          // clusters, not the dims. Safe now that every member instantiates its own exec after
-          // apply_on_demand_updates() sets its cluster dims per node (no cuGraphExecUpdate on the
-          // path); it merges the groups that differ only by deep_gemm's per-M cluster size
-          // (EP2: 26 -> ~3 templates). Default keeps the exact dims (previous behaviour).
+          // clusters, not the dims or counts; it merges the groups that differ only by
+          // deep_gemm's per-M cluster size (EP2: 26 -> ~3 templates). Safe in eager mode (every
+          // member instantiates its own exec after apply_on_demand_updates() sets its cluster
+          // dims per node); in share mode the members then switch cluster constants through the
+          // exec update, which needs a driver-side refresh (cudagraph-patch cluster step).
+          // Default keeps the exact dims and counts.
           static const bool cluster_values_in_key = [] {
             const char* e = std::getenv("FOUNDRY_TOPOLOGY_KEY_CLUSTER_VALUES");
             return !(e && (std::string(e) == "0" || std::string(e) == "false"));

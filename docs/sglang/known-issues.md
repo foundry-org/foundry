@@ -43,7 +43,7 @@ start of the graph. The runner keeps it in `self.in_graph_metadata_prep_done` (o
 first capture) and `_publish_read_done(in_graph=True)` hands it to the scheduler, which can then overwrite the shared
 buffers while the rest of the forward still runs.
 
-**What LOAD loses.** LOAD never runs `run_once` (patch 3 in [`hooks.md`](hooks.md) swaps the capture for the
+**What LOAD loses.** LOAD never runs `run_once` (`hooks.capture_one` swaps the capture for the
 archived graph), so `runner.in_graph_metadata_prep_done` stays `None`. The archive does not help either. SAVE
 serializes event-record / event-wait nodes as `EventRecordNode` / `EventWaitNode` with an `event_id` numbered per
 graph in first-seen order (`event_to_id` in `CUDAGraph.cpp`); LOAD creates a fresh private `CUevent` per id
@@ -110,7 +110,7 @@ all-gather instead).
 **Fix.** Two changes, both following the rule that state sglang builds lazily on the first
 forward must be created at the same sequence point on SAVE and LOAD: (1) SAVE no longer runs an
 eager warmup pass; the only pre-capture work is the two one-time initializations that stream
-capture rejects (inductor's lazy init, DeepGEMM's runtime init), run with the allocation region
+capture rejects (DeepGEMM's runtime init), run with the allocation region
 suspended, so the model's compiles and JIT loads happen inside the captured forward and are
 recorded; (2) the gatherer's state is built before capture on both modes (now by sglang's
 warmup, `LogitsProcessor.prebuild_logits_gatherer`), so the graphs capture the multicast gather exactly as native sglang does and it lands at
@@ -199,7 +199,7 @@ localization chain, each step measured:
   dp_rank 1 requests are corrupted (prompt-dependent visibility).
 - NOT an execution-order race: persists under CUDA_LAUNCH_BLOCKING=1.
 - NOT torch-cache aliasing alone: `torch.cuda.empty_cache()` after graph
-  load does not fix it (kept in hooks as hygiene regardless).
+  load does not fix it (the call was kept as hygiene at the time; it no longer exists).
 - ADDRESS-DISPLACEMENT SENSITIVE (smoking gun): planting a 64 MB tensor at
   the exact region boundary (final_alloc_offset, 0x601cb2200000 on the dirty
   rank) makes ALL requests clean — and the canary itself records ZERO
@@ -230,12 +230,12 @@ NVSHMEM traffic and graph-referenced addresses used the SAVE-time address
 while the runtime used the LOAD-time one; whichever eager tensor later
 reused the stale VA got corrupted (logits-path tensors by default).
 
-**Fix** (hooks.py, no dummy forwards): create the buffer (now sglang's warmup
+**Fix** (no dummy forwards): create the buffer (now sglang's warmup
 prebuild, `DeepEPDispatcher.prebuild`) BEFORE the SAVE-side warmup pass, so the buffer is created at the same
 allocation-sequence point in both modes and its address matches by
 construction. Archives must be RE-SAVED (baked addresses change).
 `torch.cuda.empty_cache()` after graph load was also added as allocator
-hygiene. Validated: the repro sequence is fully clean, first token
+hygiene (since removed). Validated: the repro sequence is fully clean, first token
 `<think>` at logprob ~0.0, DP2 regression clean.
 
 **Follow-up.** Add a token-parity check (fixed prompt set, temp 0,

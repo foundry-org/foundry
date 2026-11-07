@@ -34,7 +34,7 @@ prefill) for larger batches and keep it identical across SAVE/LOAD. Foundry-spec
 EP handling is in [`hooks.md`](hooks.md): pre-capture bootstraps (NCCL communicators; the
 DeepEP / DeepEP v2 / Mooncake buffers, expert mappings and logits all-gather state are built by
 sglang's warmup and only checked by Foundry), a SAVE-side
-runtime-init bootstrap (the two one-time inits capture rejects run outside the capture
+runtime-init bootstrap (DeepGEMM's one-time init, which capture rejects, runs outside the capture
 stream; compiles and JIT loads happen inside it), and a
 C++ fix binding the CUDA context on the graph-build pool workers.
 
@@ -66,7 +66,8 @@ Flags are declared in SGLang's `handle_cuda_graph_persistence` step (before the 
 steps read them) and re-checked in `validate_cuda_graph_persistence` (after `handle_other_validations`).
 Environment variables are set in the launcher's `activate()` (at the first resolution step and before any engine
 process is spawned: spawned processes inherit `os.environ`, and sglang reads some of them once at import time),
-re-asserted at the top of every scheduler process and at each spawn site (`configure_subprocess`).
+re-asserted in `validate_cuda_graph_persistence`, at the top of every scheduler process and at each spawn site
+(`configure_subprocess`).
 `NCCL_CUMEM_ENABLE` depends on the all-to-all backend and is pinned in `validate_cuda_graph_persistence`, once
 `--moe-a2a-backend` is resolved.
 
@@ -91,7 +92,8 @@ re-asserted at the top of every scheduler process and at each spawn site (`confi
 | `SGLANG_ENABLE_GRAPH_POOL_BORROW` | `0` | eager allocations would borrow free graph-pool extents whose addresses the restored graphs reference | set to true |
 | `TORCHDYNAMO_DISABLE` | `1` | SAVE runs each shape's first forward inside the capture and torch >= 2.14's dynamo refuses to trace there; pinned by Foundry on SAVE / LOAD, exported by the recipes in every mode | set to anything but 1 |
 
-Rejected instead, because Foundry has no logic for them: speculative decoding other than EAGLE / EAGLE3, LoRA, PD multiplexing, elastic-EP
+Rejected instead, because Foundry has no logic for them: speculative decoding other than EAGLE / EAGLE3 (also adaptive
+speculative decoding and multi-layer EAGLE), LoRA, PD multiplexing, elastic-EP
 recapture, attention graph variants, non-full graph backends, `--disable-cuda-graph`, CUDA-graph profiling,
 `SGLANG_ENABLE_POST_CAPTURE_KV_SIZING`. Profiling and FlashInfer autotune are pinned off with the graph backends;
 FlashInfer's tuned tactics travel with the archive instead: SAVE installs SGLang's per-rank autotune cache file
@@ -151,22 +153,22 @@ A single SAVE pass is enough — SGLang doesn't run a profile-forward at startup
 
 ## What the integration does
 
-(This outline predates the move to per-phase runners; [`hooks.md`](hooks.md) lists the current call sites.)
+[`hooks.md`](hooks.md) lists the call sites in process order.
 
 SAVE:
 
-1. `setup_graph_extension(...)` reserves a VMM region at `base_addr` and creates the per-rank workspace.
-2. Model weights, KV pool, and FlashInfer workspace buffers allocate inside the VMM region at byte-deterministic offsets.
-3. `kernel_warmup` is a no-op.
+1. `setup_graph_extension(...)` (from `before_parallel_init`) reserves a VMM region at `base_addr` and creates the per-rank workspace.
+2. Model weights and KV pool allocate inside the VMM region; sglang's resolver runs and its `MemoryPoolConfig` (plus the context overrides it issued) is written to `warmup_state.json`.
+3. At the first capture scope, the pre-capture bootstraps run and the layout starts. sglang's kernel warmup runs inside its own `capture()`; Foundry adds no warmup forward.
 4. `DecodeCudaGraphRunner.capture` runs the upstream capture loop unchanged (per-shape FlashInfer wrappers and other metadata allocate where sglang puts them); only `FullCudaGraphBackend.capture_one` calls Foundry, to capture into a foundry graph without the two pre-capture warmup forwards.
-5. Each captured graph is written to disk; a manifest groups topologically equivalent graphs.
+5. Each captured graph is written to disk; at the end of each decode-type scope a manifest groups equivalent graphs and the kernel binaries are packed.
 6. The final VMM cursor is recorded as `final_alloc_offset` in `region_layout.json`, with `capture_loop_version = 2`.
 
 LOAD:
 
-1. `setup_graph_extension(...)` restores the VMM region and replays captured fatbins into device code memory; an archive without `capture_loop_version = 2` is refused here (re-SAVE).
-2. Model weights and KV pool re-allocate at the same deterministic offsets. `init_memory_pool` reuses the saved `MemoryPoolConfig` (and calls `torch.cuda.empty_cache()` to mirror SAVE's `_resolve_memory_pool_config` side effect).
-3. `DecodeCudaGraphRunner.capture` preallocates the deterministic range up to `final_alloc_offset`, starts all decode graph builds in one `start_graph_builds(all_paths)` call (the manifest's template/on-demand linking needs one call), then runs the same upstream capture loop as SAVE. Foundry's `capture_one` takes the next archived graph for each shape (`finish_one_graph_load`: its allocator events replay where SAVE captured it) instead of capturing; `forward_fn` never runs.
+1. `setup_graph_extension(...)` restores the recorded kernel binaries (`load_cuda_modules_and_libraries`) and reserves the VMM region; an archive without `capture_loop_version = 2` is refused right after (re-SAVE). The graph-exec memory prewarm thread starts here.
+2. Model weights re-allocate at the same deterministic offsets. `_resolve_memory_pool_config` returns the saved `MemoryPoolConfig` without profiling (after `gc.collect()` + `torch.cuda.empty_cache()` to mirror SAVE's side effect), so the KV pool is allocated with SAVE's sizes.
+3. At the first capture scope the same bootstraps and layout start run, then `preallocate_for_load_mode` maps the recorded range up to `final_alloc_offset`. The runner's `capture` starts all graph builds of the scope in one `start_graph_builds(all_paths)` call (the manifest's template/on-demand linking needs one call), then runs the same upstream capture loop as SAVE. Foundry's `capture_one` takes the next archived graph for each shape (`finish_one_graph_load`: its allocator events replay where SAVE captured it) instead of capturing; `forward_fn` never runs.
 4. The restored graphs sit in the backend's `_graphs` / `_outputs` under the loop's own shape keys; the rest of SGLang's serving path runs unchanged.
 
 ## Doc set
