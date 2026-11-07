@@ -9,12 +9,13 @@ prefill `full` / `disabled`, profiling and FlashInfer autotune off) run in SGLan
 
 | # | SGLang call site | SAVE | LOAD |
 |---|---|---|---|
-| 1 | `sglang.srt.distributed.bootstrap.init_parallel_runtime` (head, `api.before_parallel_init`; called from `Scheduler.__init__` before any `ModelRunner`) | pin dynamo off in-process, wait on barrier works, hold the cyclic GC (until the layout start); `set_device(gpu_id)`, start the Triton cache-key prewarm thread, then `setup_graph_extension` reserves the rank's VMM region before any process group exists | same, plus the binary restore (`load_cuda_modules_and_libraries`, inside `setup_graph_extension`), the capture-loop-version check and then the graph-exec memory prewarm thread (`start_exec_pool_prewarm`) |
+| 1 | `sglang.srt.distributed.bootstrap.init_parallel_runtime` (head, `api.before_parallel_init`; called from `Scheduler.__init__` before any `ModelRunner`) | pin dynamo off in-process, wait on barrier works, hold the cyclic GC (until the layout start); `set_device(gpu_id)`, start the Triton cache-key prewarm thread, then `setup_graph_extension` reserves the rank's VMM region before any process group exists | first, an archive with an `invalid.json` (its SAVE fell back) falls back natively; else the same, plus the binary restore (`load_cuda_modules_and_libraries`, inside `setup_graph_extension`), the capture-loop-version check and then the graph-exec memory prewarm thread (`start_exec_pool_prewarm`) |
 | 2 | `KVCacheConfigurator._resolve_memory_pool_config`: head `api.replay_saved_memory_pool_config`, end `api.record_memory_pool_config` (API 2.3) | head remembers the context-override log position and returns None, so upstream runs; the end call keeps the context overrides it issued (e.g. the Mamba/GDN state-pool size) and writes `warmup_state.json` (pool config + overrides) | head skips profiling: `gc.collect()` + `empty_cache()` (mirrors SAVE's side effects), returns the saved `MemoryPoolConfig`, replays the overrides |
-| 3 | `FullCudaGraphBackend.capture_one` | capture into a `foundry.CUDAGraph` (no warmup forwards), `save_graph` | both runners: hand back the next archived graph for this shape (`restore_next_decode_graph` / `restore_next_prefill_graph`, order checked against the archive); its allocator events replay here (`finish_one_graph_load`); `forward_fn` is not run. `hooks.capture_one` takes the shape, `forward_fn`, the pool and the stream (the prefill request-slot count comes from the enclosing `capture_scope("prefill", ...)`) and returns `(graph, output)`; SGLang's backend stores them |
+| 3 | `FullCudaGraphBackend.capture_one` | capture into a `foundry.CUDAGraph` (no warmup forwards), `save_graph`; a capture that created a dispatcher / logits-processor attribute (or an attention graph variant) falls back instead: graph discarded, attributes reset, SGLang captures natively from this shape on | both runners: hand back the next archived graph for this shape (`restore_next_decode_graph` / `restore_next_prefill_graph`, order checked against the archive); its allocator events replay here (`finish_one_graph_load`); `forward_fn` is not run. `hooks.capture_one` takes the shape, `forward_fn`, the pool and the stream (the prefill request-slot count comes from the enclosing `capture_scope("prefill", ...)`) and returns `(graph, output)`; SGLang's backend stores them |
 | 3b | `DecodeCudaGraphRunner.capture` and its subclasses (EAGLE / EAGLE3 target-verify, draft-decode and draft-extend runners), as `capture_scope("decode", kind=...)` | pre-capture bootstraps and layout start (first scope of the process), upstream capture loop, then after every scope: decode record, manifest, `pack_fatbins`, `record_region_layout` (with `capture_loop_version`) | bootstraps (first scope), `preallocate_for_load_mode` (once), `start_decode_graph_restore(kind)` (one `start_graph_builds` per scope), upstream capture loop with 3 swapping each capture for the archived graph, `finish_decode_graph_restore` (count check); the scope kinds must match SAVE's, in order |
 | 3c | `PrefillCudaGraphRunner.capture`, as `capture_scope("prefill", req_slots=...)` | full backend only; bootstraps if it runs first; writes the prefill record after the loop | same as 3b for the prefill graphs: `start_prefill_graph_restore`, upstream loop with 3 swapping each capture (order and shape checked), `finish_prefill_graph_restore` |
-| 4 | `Engine._launch_scheduler_processes`, around each `proc.start()` | `configure_subprocess(server_args)`: check the resolved graph config, re-assert the environment pins (see [`overview.md`](overview.md#what-foundry-pins-and-why)), set the children's preload environment (hook lib, NVSHMEM host lib, optional udev shim) for the spawn only | same |
+| 4 | `Engine._launch_scheduler_processes`, around each `proc.start()` | `configure_subprocess(server_args)`: check the resolved graph config, re-assert the environment pins (see [`overview.md`](overview.md#what-foundry-pins-and-why)), set the children's preload environment (hook lib, NVSHMEM host lib, optional udev shim) for the spawn only; after a fallback in resolution, only `FOUNDRY_SGLANG_UNSUPPORTED` (the children fall back at activation) | same |
+| 5 | `run_scheduler_process`, after `Scheduler(...)` (`api.log_init_summary`, API 2.4) | one line: graphs saved | one line: graphs restored |
 
 No call site replaces an upstream loop on
 either mode. Kernel warmup needs no call: `BaseRunner.warmup()` runs no model forward and executes at the same
@@ -62,13 +63,14 @@ with its all-reduce through torch symmetric memory (validated attn-TP + EP rows 
 
 - **FlashInfer tactics** (`bootstrap_flashinfer_tactics`, both modes, host-only). The tuned tactics are installed from
   SGLang's autotune cache file on SAVE (and kept in the rank's `warmup_state.json`) and from the archive on LOAD.
-- **sglang's own pre-capture state** (`check_capture_state_prebuilt`, graph_ops). sglang builds, in its
-  EagerRunner warmup (`BaseRunner._prepare_capture_state`, before the first capture scope, both modes), the
-  state its first forward would otherwise create lazily: every MoE dispatcher's buffer (DeepEP, DeepEP v2,
-  Mooncake, NIXL; `BaseDispatcher.prebuild`), the standard dispatcher's expert mapping (EP > 1,
-  `--moe-a2a-backend none`) and the logits all-gather's symmetric-memory state (`MultimemAllGatherer`).
-  Foundry only checks, at the first scope, that none is still pending (it raises naming the object), so all
-  of it exists before the first capture.
+- **sglang's own pre-capture state** (`capture_state_unsupported`, graph_ops; checked first, before the other
+  bootstraps). sglang builds, in its EagerRunner warmup (`BaseRunner._prepare_capture_state`, before the first
+  capture scope, both modes), the state its first forward would otherwise create lazily: every MoE dispatcher's
+  buffer (DeepEP, DeepEP v2, Mooncake; `BaseDispatcher.prebuild`), the standard dispatcher's expert mapping
+  (EP > 1, `--moe-a2a-backend none`) and the logits all-gather's symmetric-memory state (`MultimemAllGatherer`).
+  Foundry only checks, at the first scope, that every dispatcher implements `prebuild`
+  (`BaseDispatcher.implements_prebuild`) and none is still pending; otherwise the engine falls back to native
+  capture (`Unsupported` at `capture state`, [`overview.md`](overview.md)).
 - **NCCL communicator bootstrap** (`bootstrap_collective_connections`). NCCL connects a communicator on its first
   collective, which a capturing stream rejects (seen on the attention-TP sub-group's first reduce-scatter of
   Qwen3.5-35B-A3B attention-TP2 + EP4). Foundry issues small and large all-reduce / all-gather / reduce-scatter on

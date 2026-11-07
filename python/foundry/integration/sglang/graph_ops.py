@@ -50,8 +50,7 @@ _PREFILL_GRAPH_FILENAME_RE = re.compile(
 # flag the captured forwards latch and the prefill output structures.
 _PREFILL_STATE_FILE = "prefill_graphs.json"
 # Per-rank SAVE record of the decode-type capture scopes: their kinds in
-# process order and the output structure of each decode-type graph. Absent in
-# archives saved before 2.1 (one target_decode scope, logits-only outputs).
+# process order and the output structure of each decode-type graph.
 _DECODE_STATE_FILE = "decode_graphs.json"
 # PrefillCudaGraphRunner's only ShapeKey variants (_chunked_prefix_variant).
 _CHUNKED_PREFIX_LABEL = "chunked_prefix:"
@@ -62,13 +61,11 @@ _prefill_output_specs: dict[str, Any] = {}
 _decode_output_specs: dict[str, Any] = {}
 _saved_decode_kinds: list[str] = []
 
-# The decode runner of a process without speculative decoding (and the kind
-# an integration API 2.0 caller implies).
+# The decode runner of a process without speculative decoding (the kind a
+# caller that passes none implies).
 DEFAULT_DECODE_KIND = "target_decode"
 _KIND_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _VARIANT_RE = re.compile(r"^[A-Za-z0-9]+$")
-# Output of a pre-2.1 decode graph: LogitsProcessorOutput(next_token_logits).
-_LEGACY_DECODE_OUTPUT_SPEC: Any = {"lpo": ["next_token_logits"]}
 
 
 def check_decode_kind(kind: str | None) -> str:
@@ -127,7 +124,7 @@ def graph_partition(filename: str) -> str:
     """Manifest partition: prefill graphs and each decode-type scope kind's
     graphs are restored by separate start_graph_builds calls (at their own
     runner's capture point), so they must not share a template. The plain
-    target decode graphs keep the pre-2.1 partition name."""
+    target decode graphs keep the plain "decode" partition name."""
     if _PREFILL_GRAPH_FILENAME_RE.match(filename):
         return "prefill"
     match = _KIND_GRAPH_FILENAME_RE.match(filename)
@@ -217,8 +214,8 @@ def _unflatten_prefill_output(spec: Any, tensors: Any) -> Any:
 
 def _pack_output(output: Any) -> tuple[Any, Any]:
     """Decode-type graph output -> (structure spec, tensor(s) for graph.save):
-    one tensor when the output holds one (the pre-2.1 layout of a
-    logits-only output), else the list in depth-first order."""
+    one tensor when the output holds one, else the list in depth-first
+    order."""
     spec, tensors = _flatten_prefill_output(output)
     if not tensors:
         raise TypeError(f"SGLang decode CUDA graph output holds no tensor: {type(output)!r}")
@@ -345,8 +342,7 @@ _decode_record: dict[str, Any] | None = None
 
 
 def load_decode_graph_state() -> dict[str, Any]:
-    """LOAD: the rank's decode record; an archive saved before 2.1 has none
-    and holds one target_decode scope with logits-only outputs."""
+    """LOAD: the rank's decode record (scope kinds and output structures)."""
     global _decode_record
     if _decode_record is not None:
         return _decode_record
@@ -354,11 +350,12 @@ def load_decode_graph_state() -> dict[str, Any]:
     if cfg is None or cfg.workspace_dir is None:
         raise RuntimeError("Foundry SGLang graph extension is not initialized")
     path = os.path.join(cfg.workspace_dir, _DECODE_STATE_FILE)
-    if os.path.exists(path):
-        with open(path) as f:
-            record = json.load(f)
-    else:
-        record = {"scopes": [DEFAULT_DECODE_KIND], "output_specs": {}}
+    if not os.path.exists(path):
+        raise RuntimeError(
+            f"Foundry decode record not found: {path} (re-save the archive with this version)"
+        )
+    with open(path) as f:
+        record = json.load(f)
     _decode_record = record
     return record
 
@@ -402,8 +399,8 @@ def _log_restore(what: str, n: int, pending: Any, timing: _RestoreTiming, loop_s
     builds = max(0.0, build_end - timing.t0)
     handover = sum(max(0.0, end - max(start, build_end)) for start, end in timing.calls)
     in_calls = sum(end - start for start, end in timing.calls)
-    # "prefill", "decode" (the target_decode scope, pre-2.1 wording) or the
-    # decode-type scope kind.
+    # "prefill", "decode" (the target_decode scope) or another decode-type
+    # scope kind.
     graphs = {"prefill": "SGLang prefill graphs", "decode": "SGLang graphs"}.get(
         what, f"SGLang {what} graphs"
     )
@@ -755,26 +752,119 @@ def bootstrap_lazy_runtimes() -> None:
     logger.info("[Foundry] SGLang lazy runtimes bootstrapped in %.3fs", time.perf_counter() - t0)
 
 
-def check_capture_state_prebuilt(model) -> None:
-    """Both modes, at the first capture scope: verify that sglang's warmup
-    (``BaseRunner._prepare_capture_state``) built the communication state the
-    first forward otherwise creates lazily: every MoE dispatcher's buffer or
-    expert mapping and the logits all-gather state. Built inside a capture, they
-    record garbage (the expert mapping) or abort (DeepEP buffers). Raises naming
-    what is still unbuilt."""
+def capture_state_unsupported(model) -> str | None:
+    """Both modes, at the first capture scope: why sglang's warmup
+    (``BaseRunner._prepare_capture_state``) could not have built the
+    communication state the first forward otherwise creates lazily, or None.
+    Built inside a capture, it records garbage (the expert mapping) or aborts
+    (DeepEP buffers). A dispatcher class without the prebuild protocol
+    (``BaseDispatcher.implements_prebuild``) builds it lazily by design; one
+    that has it but is still ``prebuild_pending`` was skipped."""
     from sglang.srt.layers.logits_processor import LogitsProcessor
     from sglang.srt.layers.moe.token_dispatcher.base import iter_dispatchers
 
-    unbuilt = sorted({type(d).__name__ for d in iter_dispatchers(model) if d.prebuild_pending})
+    dispatchers = _all_dispatchers(iter_dispatchers(model))
+    missing = sorted({type(d).__name__ for d in dispatchers if not d.implements_prebuild})
+    if missing:
+        return f"{', '.join(missing)} {'has' if len(missing) == 1 else 'have'} no prebuild"
+    pending = sorted({type(d).__name__ for d in dispatchers if d.prebuild_pending})
     if any(isinstance(m, LogitsProcessor) and m.logits_gatherer_pending for m in model.modules()):
-        unbuilt.append("LogitsProcessor logits all-gather")
-    if unbuilt:
-        raise RuntimeError(
-            f"[Foundry] lazily built sglang state is still unbuilt at the first capture: "
-            f"{', '.join(unbuilt)}. sglang builds it before capture in "
-            "BaseRunner._prepare_capture_state (prepare_capture_state, run by the "
-            "EagerRunner warmup); this sglang lacks that step or skipped it"
-        )
+        pending.append("LogitsProcessor logits all-gather")
+    if pending:
+        return f"{', '.join(pending)} prebuild left state pending"
+    return None
+
+
+def _all_dispatchers(dispatchers) -> list:
+    """``dispatchers`` and the dispatchers they wrap (attributes or list items,
+    e.g. MaybeTboDeepEPDispatcher's inner ones), each once."""
+    from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+
+    found: dict[int, Any] = {}
+    stack = list(dispatchers)
+    while stack:
+        dispatcher = stack.pop()
+        if id(dispatcher) in found:
+            continue
+        found[id(dispatcher)] = dispatcher
+        for value in vars(dispatcher).values():
+            items = value if isinstance(value, (list, tuple)) else (value,)
+            stack.extend(item for item in items if isinstance(item, BaseDispatcher))
+    return list(found.values())
+
+
+def agree_unsupported(step: str, reason: str | None) -> None:
+    """Raise :class:`Unsupported` on every rank when any rank has a ``reason``.
+
+    A rank that fell back alone would capture natively, with two eager warmup
+    forwards per shape whose collectives the other ranks never issue, and the
+    job would hang; the configuration is the same everywhere, so the ranks
+    normally agree already and this only makes it certain. The vote runs on
+    the world group's CPU (gloo) group: no device memory, so the allocation
+    layout is the same as without it. A non-None vote gathers the reasons."""
+    import torch
+    import torch.distributed as dist
+
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        from sglang.srt.distributed import parallel_state as ps
+
+        world = ps.get_world_group()
+        vote = torch.tensor([0 if reason is None else 1], dtype=torch.int32)
+        dist.all_reduce(vote, op=dist.ReduceOp.MAX, group=world.cpu_group)
+        if not vote.item():
+            return
+        reasons: list = [None] * world.world_size
+        dist.all_gather_object(reasons, reason, group=world.cpu_group)
+        if reason is None:
+            rank, first = next((r, text) for r, text in enumerate(reasons) if text is not None)
+            reason = f"{first} (found on rank {rank})"
+    if reason is not None:
+        from foundry.integration.sglang.api import Unsupported
+
+        raise Unsupported(step, reason)
+
+
+def capture_state_objects(model) -> list:
+    """SAVE: the objects whose attributes a capture must not create: every
+    dispatcher of ``model`` (the wrapped ones too) and its logits processors.
+    Off with ``FOUNDRY_SGLANG_CAPTURE_SNAPSHOT=0`` (diagnosis only)."""
+    if os.environ.get("FOUNDRY_SGLANG_CAPTURE_SNAPSHOT") == "0":
+        return []
+    from sglang.srt.layers.logits_processor import LogitsProcessor
+    from sglang.srt.layers.moe.token_dispatcher.base import iter_dispatchers
+
+    objects = _all_dispatchers(iter_dispatchers(model))
+    return objects + [m for m in model.modules() if isinstance(m, LogitsProcessor)]
+
+
+def attribute_snapshot(objects: list) -> list[tuple[frozenset, frozenset]]:
+    """Per object: (names of all its attributes, names whose value is not
+    None). Names only, no value is read beyond the None check."""
+    return [
+        (frozenset(vars(obj)), frozenset(k for k, v in vars(obj).items() if v is not None))
+        for obj in objects
+    ]
+
+
+def created_attributes(objects: list, before: list) -> list[tuple[Any, str, bool]]:
+    """(object, name, existed as None) of every attribute that went from absent
+    or None to a value since ``before``."""
+    created = []
+    for obj, (names, set_names) in zip(objects, before):
+        for name, value in vars(obj).items():
+            if value is not None and name not in set_names:
+                created.append((obj, name, name in names))
+    return created
+
+
+def reset_created_attributes(created: list) -> None:
+    """Put the attributes back to absent / None, so the next eager forward
+    builds them outside any capture, as natively."""
+    for obj, name, existed in created:
+        if existed:
+            setattr(obj, name, None)
+        else:
+            delattr(obj, name)
 
 
 @dataclass
@@ -860,9 +950,14 @@ def restore_next_decode_graph(key: Any) -> tuple[Any, Any]:
         graph, tensors = FoundryCUDAGraph.finish_one_graph_load(r.pending, r.next)
     r.timing.calls.append((t, time.perf_counter()))
     r.next += 1
-    output = _unflatten_prefill_output(
-        r.output_specs.get(filename, _LEGACY_DECODE_OUTPUT_SPEC), tensors
-    )
+    try:
+        spec = r.output_specs[filename]
+    except KeyError:
+        raise RuntimeError(
+            f"Foundry decode record has no output structure for {filename} "
+            "(re-save the archive with this version)"
+        ) from None
+    output = _unflatten_prefill_output(spec, tensors)
     # Strong reference next to the backend's own.
     state.loaded_graphs[(r.kind, size, variant)] = (graph, output)
     return graph, output
