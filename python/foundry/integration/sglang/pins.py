@@ -394,6 +394,14 @@ ENV_PINS: tuple[EnvPin, ...] = (
         "eager allocations would borrow free graph-pool extents whose addresses the restored "
         "graphs reference",
     ),
+    # Built before capture by _pre_initialize_dcp_push_combine, independent of
+    # the --disable-custom-all-reduce pin.
+    EnvPin(
+        "SGLANG_ENABLE_DCP_PUSH_COMBINE",
+        "0",
+        "the DCP push-combine decode path builds its own CustomAllReduceV2, whose push "
+        "workspace is registered over CUDA IPC outside the recorded region",
+    ),
     # Read by torch.compile when it decorates (sglang applies it at import),
     # so it must be in the environment before the scheduler imports sglang;
     # the scheduler also sets torch._dynamo.config.disable

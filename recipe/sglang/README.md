@@ -13,8 +13,8 @@ once the Foundry adapter lands there.
 
 | Component | Version | Notes |
 |---|---|---|
-| SGLang | branch `foundry-dep` (adapter `sglang.srt.utils.foundry_adapter`) | Requires Foundry integration API **2.x** with minor >= 3 (`FOUNDRY_INTEGRATION_API_MIN_MINOR`); without `--cuda-graph-persistence` every Foundry call site is a no-op. |
-| Foundry | `foundry-core 0.1.0rc2` (this branch, `INTEGRATION_API_VERSION = (2, 3)`) | `pip install "sglang[foundry]"`, or `pip install -e .` from this repo. The wheel must match the torch/CUDA pair SGLang pins (torch 2.14.1 / cu130 for 0.1.0rc2; use the per-pair index in the top-level README for other pairs). |
+| SGLang | branch `foundry-dep` (adapter `sglang.srt.utils.foundry_adapter`) | Requires Foundry integration API **2.x** with minor >= 4 (`FOUNDRY_INTEGRATION_API_MIN_MINOR`); without `--cuda-graph-persistence` every Foundry call site is a no-op. |
+| Foundry | `foundry-core 0.1.0rc4` (this branch, `INTEGRATION_API_VERSION = (2, 4)`) | `pip install "sglang[foundry]"`, or `pip install -e .` from this repo. The wheel must match the torch/CUDA pair SGLang pins (torch 2.14.1 / cu130 for 0.1.0rc4; use the per-pair index in the top-level README for other pairs). |
 
 All scripts share one `foundry.toml` (`workspace_root = "foundry_archive"`); its `mode`
 key, if present, is ignored — the flag's mode wins. Pick a script for your model +
@@ -35,6 +35,7 @@ recipe/sglang/
 ├── serve_qwen3-30ba3b_ep.sh        # Qwen3-30B-A3B (MoE)  expert parallel (DeepEP + DP-attention)
 ├── serve_qwen3-30ba3b_ep_tpattn.sh # Qwen3-30B-A3B (MoE)  expert parallel, TP attention (symm-mem allreduce)
 ├── serve_qwen3-30ba3bfp8_ep_v2.sh  # Qwen3-30B-A3B-FP8    expert parallel, DeepEP v2 (NCCL symmetric windows)
+├── serve_qwen3-30ba3bfp8_ep_v2_eagle3.sh # Qwen3-30B-A3B-FP8 + EAGLE3 draft, DeepEP v2 (speculative decoding graphs)
 ├── serve_qwen3-235ba22b.sh         # Qwen3-235B-A22B      MoE, FP8 (default) or bf16; tpep4, tp2ep4 (4 GPUs min), epN, tp4ep8
 ├── serve_qwen3.5-27b.sh            # Qwen3.5-27B          dense hybrid; single, dp2-8, tp2-8
 ├── serve_qwen3.5-35ba3b.sh         # Qwen3.5-35B-A3B      MoE hybrid; tp2/tp4, ep2-8, tpep2/tpep4
@@ -53,6 +54,7 @@ bash serve_qwen3-1.7b_dp.sh        <dp_size>   [--save|--load]
 bash serve_qwen3-30ba3b_ep.sh          <ep_size>   [--save|--load]
 bash serve_qwen3-30ba3b_ep_tpattn.sh   <ep_size>   [--save|--load]
 bash serve_qwen3-30ba3bfp8_ep_v2.sh    <ep_size>   [--save|--load]
+bash serve_qwen3-30ba3bfp8_ep_v2_eagle3.sh <ep_size> [--save|--load]
 bash serve_qwen3-235ba22b.sh           <cfg>       [--save|--load]     # tpep4 | tp2ep4 | epN | tp4ep8; see "Qwen3.5 and DeepSeek" below
 bash serve_qwen3.5-27b.sh              <cfg>       [--save|--load]     # see "Qwen3.5 and DeepSeek" below
 bash serve_qwen3.5-35ba3b.sh           <cfg>       [--save|--load]
@@ -108,6 +110,7 @@ model or topology before SAVE.
 | Expert parallel | `serve_qwen3-30ba3b_ep.sh` | Qwen3-30B-A3B | DP-attention + DeepEP; fa3 backend; `SGL_MODEL=Qwen/Qwen3-30B-A3B-FP8` for FP8 |
 | Expert parallel, TP attention | `serve_qwen3-30ba3b_ep_tpattn.sh` | Qwen3-30B-A3B | symm-mem allreduce + DeepEP (vLLM-shaped EP); uses the per-phase cuda-graph flags |
 | Expert parallel, DeepEP v2 | `serve_qwen3-30ba3bfp8_ep_v2.sh` | Qwen3-30B-A3B-FP8 | NCCL symmetric windows + GIN instead of NVSHMEM; needs NCCL >= 2.30.7 (see below) |
+| Speculative decoding | `serve_qwen3-30ba3bfp8_ep_v2_eagle3.sh` | Qwen3-30B-A3B-FP8 + `Tengyunw/qwen3_30b_moe_eagle3` | EAGLE3 on the DeepEP v2 layout: target-verify, draft-decode and draft-extend graphs are saved and restored (decode bs 1..32 validated) |
 | Large MoE | `serve_qwen3-235ba22b.sh` | Qwen3-235B-A22B-FP8 | same `<cfg>` vocabulary as the Qwen3.5 scripts; validated tpep4 / tp2ep4 on 4xH200 at 0.7, chunked prefill 2048 |
 
 ## Activation: `--cuda-graph-persistence`
@@ -133,9 +136,11 @@ On SAVE / LOAD, Foundry's resolution hooks pin every config that selects state a
 graph cannot replay (custom all-reduce off, torch symm-mem all-reduce on, NCCL buffer
 registration / cuMem / NVLS off, DeepGEMM precompile sweep off, two-batch overlap off,
 memory-saver / graph-pool variants off, `--dsv4-attn-backend` not `trtllm`), print one
-`[Foundry] pin:` line per value, and stop with the reason on a contrary explicit value;
-unsupported features (speculative decoding other than EAGLE / EAGLE3, LoRA, PD multiplexing, elastic-EP recapture,
-non-full graph backends) are rejected. Full table:
+`[Foundry] pin:` line per value. A contrary explicit value, or a feature Foundry has no logic for
+(speculative decoding other than EAGLE / EAGLE3, LoRA, PD multiplexing, elastic-EP recapture, non-full
+graph backends, a MoE dispatcher without `prebuild()`), is not an error: the server logs
+`[Foundry] unsupported at <step>: <reason>; cuda-graph persistence disabled, continuing natively` and
+captures its graphs natively (a SAVE that fell back marks its archive invalid). Full table:
 [`docs/sglang/overview.md`](../../docs/sglang/overview.md#what-foundry-pins-and-why).
 The scripts pass the collective flags (`--disable-custom-all-reduce --enable-torch-symm-mem`)
 and source `set_env.sh` in every mode, so baseline, SAVE and LOAD capture the same
@@ -149,10 +154,12 @@ graph set; everything else they set is model/topology, not Foundry policy:
 
 ### Verify Foundry is active
 
-The launcher and every scheduler log
-`[Foundry] cuda graph persistence active: pid=<pid> mode=<save|load> config=<toml>`;
-LOAD also logs `[Foundry] Loaded <N> SGLang graphs in <t>s` per rank. No activation
-line means the flag was not passed (SGLang ran natively).
+The launcher prints `[Foundry] cuda graph persistence active: pid=<pid> mode=<save|load> config=<toml>`
+and every scheduler logs `[Foundry] SGLang graph persistence active: mode=<save|load> workspace=<dir>`;
+LOAD also logs `[Foundry] Loaded <N> SGLang <kind> graphs in <t>s` per graph set and rank, and every
+scheduler ends its init with `[Foundry] init summary: cuda-graph persistence <mode>, <N> graphs saved|restored`
+(or `... disabled at <step> (<reason>); graphs captured natively` after a fallback). No activation line
+means the flag was not passed (SGLang ran natively).
 
 ## Installation
 
@@ -168,7 +175,7 @@ python3.12 -m venv venv && source venv/bin/activate
 # SGLang with the Foundry adapter (foundry-org/sglang branch foundry-dep), editable;
 # this also pulls the kernel stack as wheels (sglang-kernel, sgl-deep-ep, sgl-deep-gemm).
 pip install -e sglang/python
-pip install "sglang[foundry]"        # foundry-core >=0.1.0rc2,<0.2, API 2.x
+pip install "sglang[foundry]"        # foundry-core >=0.1.0rc4,<0.2, API 2.4
 # ...or Foundry from this repo instead of the wheel:
 # pip install "cmake>=4.0" ninja wheel pytest
 # pushd foundry && pip install -e . --no-build-isolation && popd

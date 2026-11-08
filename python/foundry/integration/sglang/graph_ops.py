@@ -78,13 +78,22 @@ def check_decode_kind(kind: str | None) -> str:
     return kind
 
 
+def _is_graph_variant(key: Any) -> bool:
+    """One of several graphs per shape: multi-stream (PD multiplexing;
+    stream_idx left ShapeKey with upstream #43898), an attention variant or a
+    sharded-verify logits variant."""
+    return any(
+        getattr(key, field, None) is not None
+        for field in ("stream_idx", "attention_variant", "logits_variant")
+    )
+
+
 def _decode_shape(key: Any) -> tuple[int, str | None]:
     """(size, variant label) of a decode-type ShapeKey(size, variant_label,
-    attention_variant; older sglang also stream_idx). Multi-stream (PD multiplexing) and
-    attention graph variants are not persisted; a variant label (the EAGLE
-    draft runner's greedy / sampling graph pair) is, by name."""
-    # stream_idx left ShapeKey with PD multiplexing (upstream #43898)
-    if getattr(key, "stream_idx", None) is not None or key.attention_variant is not None:
+    attention_variant, logits_variant; older sglang also stream_idx). Graph
+    variants (:func:`_is_graph_variant`) are not persisted; a variant label
+    (the EAGLE draft runner's greedy / sampling graph pair) is, by name."""
+    if _is_graph_variant(key):
         raise ValueError(f"Foundry SGLang save/load does not support graph variants: {key!r}")
     label = key.variant_label
     if label is not None and (not isinstance(label, str) or not _VARIANT_RE.match(label)):
@@ -104,8 +113,7 @@ def _graph_filename(index: int, key: Any, kind: str = DEFAULT_DECODE_KIND) -> st
 
 def _prefill_shape(key: Any) -> tuple[int, int]:
     """(num_tokens, prefix chunks) of a prefill ShapeKey."""
-    # stream_idx left ShapeKey with PD multiplexing (upstream #43898)
-    if getattr(key, "stream_idx", None) is not None or key.attention_variant is not None:
+    if _is_graph_variant(key):
         raise ValueError(f"Foundry SGLang save/load does not support graph variants: {key!r}")
     label = key.variant_label
     if label is None:
