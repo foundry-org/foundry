@@ -431,15 +431,12 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
         raise RuntimeError("[Foundry] capture_one called outside capture_scope")
     req_slots = _scope[1]
     kind = _scope[2]
-    # ShapeKey.attention_variant (e.g. DSV4.1 candidate-indexer graphs on
-    # SM100, the HIP DSA dual graph): several graphs per shape, which the
-    # archive cannot represent.
-    variant = getattr(shape_key, "attention_variant", None)
+    variant = _graph_variant(shape_key)
     if mode == CUDAGraphExtensionMode.LOAD:
         if variant is not None:
             raise RuntimeError(
-                f"[Foundry] shape {shape_key} restores an attention graph variant "
-                f"({variant!r}); Foundry save/load does not support graph variants"
+                f"[Foundry] shape {shape_key} restores a graph variant ({variant}); "
+                "Foundry save/load does not support graph variants"
             )
         # LOAD, both runners: the upstream capture loop runs (see
         # capture_scope) and only the capture is replaced, by the archived
@@ -485,9 +482,21 @@ _snapshot_objects: list = []
 _discarded_graphs: list = []
 
 
+def _graph_variant(shape_key) -> str | None:
+    """The ShapeKey field that makes this shape one of several graphs, as
+    ``field=value``, or None: ``attention_variant`` (DSV4.1 candidate-indexer
+    graphs on SM100, the HIP DSA dual graph) or ``logits_variant`` (sharded
+    verify's vocab-shard logits). The archive holds one graph per shape."""
+    for field in ("attention_variant", "logits_variant"):
+        value = getattr(shape_key, field, None)
+        if value is not None:
+            return f"{field}={value!r}"
+    return None
+
+
 def _save_capture(shape_key, variant, forward_fn, *, pool, stream):
-    """SAVE: capture one shape, unless it is unsupported on any rank: an
-    attention graph variant, or the capture created an attribute of a
+    """SAVE: capture one shape, unless it is unsupported on any rank: a
+    graph variant, or the capture created an attribute of a
     dispatcher or logits processor. Such an attribute lives in graph-pool
     memory that later graphs and eager forwards would share, where a native
     capture builds it in its eager warmup; so the graph is discarded, the
@@ -506,7 +515,7 @@ def _save_capture(shape_key, variant, forward_fn, *, pool, stream):
     graph = out = None
     created = []
     if variant is not None:
-        reason = f"shape {shape_key} is an attention graph variant ({variant!r})"
+        reason = f"shape {shape_key} is a graph variant ({variant})"
     else:
         before = attribute_snapshot(_snapshot_objects)
         with graph_pool_capture_scope():
