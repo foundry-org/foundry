@@ -328,6 +328,10 @@ def mark_layout_start() -> None:
     gc.collect()
     torch.cuda.empty_cache()
     release_cyclic_gc()
+    # The chunk every capture's RNG capture-state tensors are carved from:
+    # one large-pool allocation here on both modes, so no capture (SAVE) or
+    # graph restore (LOAD) allocates for them later.
+    cge.rng_slab_reserve()
     if cfg.mode != CUDAGraphExtensionMode.SAVE:
         return
     _layout_start_offset = cge.get_current_alloc_offset()

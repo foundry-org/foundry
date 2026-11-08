@@ -55,6 +55,55 @@
 
 // #define FOUNDRY_DEBUG  // Verbose logging (see README "Debugging"); same flag as hook.cpp
 
+namespace foundry {
+namespace rng_slab {
+// The two one-element int64 tensors of a capture's RNG state (seed / offset
+// extragraph) come from here instead of the caching allocator's small pool:
+// consecutive slots of a 2 MiB int64 tensor (large pool, one allocation per
+// 131072 captures). A small-pool block per capture would make SAVE's small
+// segments grow with the capture count while LOAD's grow at another point
+// (LOAD re-creates the states in finish_one_graph_load), and every later
+// small default-pool tensor the graphs bake in would land elsewhere. Slots
+// are never freed: the states live as long as the graphs.
+static std::mutex g_mutex;
+static std::vector<at::Tensor> g_chunks;
+static int64_t g_next = 0;
+constexpr int64_t kChunkElems = (2 << 20) / sizeof(int64_t);
+
+static void add_chunk_locked(const at::TensorOptions& options) {
+  // Default stream: the chunk belongs to the default pool, never to a
+  // capture's private pool.
+  c10::cuda::CUDAStreamCaptureModeGuard capture_mode_guard(cudaStreamCaptureModeRelaxed);
+  c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getDefaultCUDAStream());
+  g_chunks.push_back(at::empty({kChunkElems}, options));
+  g_next = 0;
+}
+
+// Both modes call this at the layout start, so the first chunk is allocated at
+// the same point on SAVE and LOAD, outside any capture's record window.
+void reserve() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (g_chunks.empty()) {
+    add_chunk_locked(at::TensorOptions().device(at::kCUDA).dtype(at::kLong));
+  }
+}
+
+static at::Tensor take_slot(const at::TensorOptions& options) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (g_chunks.empty()) {
+    add_chunk_locked(options);
+  }
+  // A second chunk would be allocated inside a capture (SAVE) or a graph
+  // restore (LOAD), at points that differ between the modes: refuse instead.
+  TORCH_CHECK(g_next < kChunkElems, "[foundry] RNG slab exhausted: more than ", kChunkElems / 2,
+              " graph captures in this process");
+  at::Tensor slot = g_chunks.back().narrow(0, g_next, 1);
+  g_next += 1;
+  return slot;
+}
+}  // namespace rng_slab
+}  // namespace foundry
+
 namespace at {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wattributes"
@@ -79,8 +128,8 @@ __attribute__((visibility("hidden"))) void CUDAGeneratorCaptureState::initialize
   c10::cuda::CUDAStreamCaptureModeGuard capture_mode_guard(cudaStreamCaptureModeRelaxed);
   c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getDefaultCUDAStream());
 
-  rng_state_seed_extragraph_ = at::empty({1}, options);
-  rng_state_offset_extragraph_ = at::empty({1}, options);
+  rng_state_seed_extragraph_ = foundry::rng_slab::take_slot(options);
+  rng_state_offset_extragraph_ = foundry::rng_slab::take_slot(options);
   // Captured graphs bake in these buffers' addresses: make the storage
   // non-resizable so nothing can reallocate it.
   rng_state_seed_extragraph_.storage().unsafeGetStorageImpl()->set_resizable(false);
@@ -197,8 +246,8 @@ __attribute__((visibility("hidden"))) void CUDAGeneratorCaptureState::initialize
   c10::cuda::CUDAStreamCaptureModeGuard capture_mode_guard(cudaStreamCaptureModeRelaxed);
   c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getDefaultCUDAStream());
 
-  rng_state_seed_extragraph_ = at::empty({1}, options);
-  rng_state_offset_extragraph_ = at::empty({1}, options);
+  rng_state_seed_extragraph_ = foundry::rng_slab::take_slot(options);
+  rng_state_offset_extragraph_ = foundry::rng_slab::take_slot(options);
 
   c10::cuda::getDefaultCUDAStream().synchronize();
 
@@ -2293,11 +2342,9 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
   }
 
   {
-    // Suspend the tracked region: the first register_graph lazily
-    // allocates seed/offset_extragraph_ (see finish_one_graph_load_impl
-    // in CUDAGraphParallel.cpp for the full rationale); in-region pool
-    // growth here would push the VMM cursor past the recorded
-    // start_base_addr and abort the replay below.
+    // The RNG capture state's tensors come from the slab reserved at the
+    // layout start (rng_slab), so this registration allocates nothing; the
+    // suspended region only guards a torch version whose registration would.
     foundry::SuspendAllocationRegion suspend_region;
     const json::array& generators_array = root.at("generators").as_array();
     for (const auto& gen_val : generators_array) {
