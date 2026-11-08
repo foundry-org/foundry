@@ -104,11 +104,18 @@ def test_torch_symm_mem_may_be_turned_off_by_sglang(model_dir, capsys):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["NVSHMEM_DISABLE_NCCL", "TORCHDYNAMO_DISABLE"])
-def test_env_pin_is_present(name):
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("NVSHMEM_DISABLE_NCCL", "1"),
+        ("TORCHDYNAMO_DISABLE", "1"),
+        ("SGLANG_ENABLE_DCP_PUSH_COMBINE", "0"),
+    ],
+)
+def test_env_pin_is_present(name, value):
     """Dropping one of these costs seconds per engine start or breaks replay;
     removing it must fail a test."""
-    assert {pin.name: pin.value for pin in pins.ENV_PINS}.get(name) == "1"
+    assert {pin.name: pin.value for pin in pins.ENV_PINS}.get(name) == value
 
 
 def test_env_pins_are_inherited_by_spawned_processes(clean_pin_env):

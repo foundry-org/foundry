@@ -91,11 +91,12 @@ re-asserted in `validate_cuda_graph_persistence`, at the top of every scheduler 
 | `SGLANG_ENABLE_METADATA_GLUE_GRAPH` | `0` | the attention-metadata prep is captured into a second graph Foundry does not save | set to true |
 | `SGLANG_ENABLE_GRAPH_POOL_PRECARVE` | `0` | only upstream `capture_one` runs the precarve (measured over its two eager warmups, minted at the first capture); Foundry's `capture_one` replaces it on SAVE and LOAD, so the flag would be a no-op and the graph pool would not match a native run's layout | set to true |
 | `SGLANG_ENABLE_GRAPH_POOL_BORROW` | `0` | eager allocations would borrow free graph-pool extents whose addresses the restored graphs reference | set to true |
+| `SGLANG_ENABLE_DCP_PUSH_COMBINE` | `0` | the DCP push-combine decode path builds its own CustomAllReduceV2 before capture, independent of `--disable-custom-all-reduce`; its push workspace is registered over CUDA IPC outside the recorded region | set to true |
 | `TORCHDYNAMO_DISABLE` | `1` | SAVE runs each shape's first forward inside the capture and torch >= 2.14's dynamo refuses to trace there; pinned by Foundry on SAVE / LOAD, exported by the recipes in every mode | set to anything but 1 |
 
 Not supported, because Foundry has no logic for them: speculative decoding other than EAGLE / EAGLE3 (also adaptive
-speculative decoding and multi-layer EAGLE), LoRA, PD multiplexing, elastic-EP
-recapture, attention graph variants, non-full graph backends, `--disable-cuda-graph`, CUDA-graph profiling,
+speculative decoding and multi-layer EAGLE), LoRA, PD multiplexing, elastic-EP recapture, graph variants (attention variants, sharded-verify logits
+variants), non-full graph backends, `--disable-cuda-graph`, CUDA-graph profiling,
 `SGLANG_ENABLE_POST_CAPTURE_KV_SIZING`. Profiling and FlashInfer autotune are pinned off with the graph backends;
 FlashInfer's tuned tactics travel with the archive instead: SAVE installs SGLang's per-rank autotune cache file
 (written by a plain start of the same model) and keeps its content in the rank's `warmup_state.json` (section
@@ -114,7 +115,7 @@ initialises natively (normal graph capture). The steps that can fall back, all b
 `server args` / `environment` (the resolution steps above; pins already declared by then stay), `archive` (LOAD of
 an archive whose SAVE fell back, before any setup), `capture state` (first capture scope: a dispatcher without
 `prebuild`, or state still pending) and `capture` (each SAVE capture: an attribute of a dispatcher or logits
-processor created inside the capture, or an attention graph variant; the graph is discarded and the attributes
+processor created inside the capture, or a graph variant; the graph is discarded and the attributes
 reset, so that shape and the rest are captured natively). The scope and capture decisions are voted over the world
 group's CPU group, so all ranks fall back together. A SAVE that falls back writes `invalid.json` into its rank
 workspace and the workspace root. After LOAD starts restoring graphs, every Foundry failure is an error.
