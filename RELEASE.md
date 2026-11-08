@@ -1,8 +1,116 @@
-# Foundry 0.1.0rc3
+# Foundry 0.1.0rc4
+
+Third release candidate of 0.1.0 (same wheel pairs and index layout as rc2).
+
+## Highlights
+
+- **Native fallback outside the supported configurations** (SGLang integration
+  API 2.4). Before any graph is restored, Foundry raises `Unsupported(step,
+  reason)` at its detection points (environment and server-args pins, the
+  `invalid.json` marker of an archive whose SAVE fell back, the capture state at
+  the first capture scope, and on SAVE every captured shape); SGLang's adapter
+  logs `[Foundry] unsupported at <step>: <reason>; cuda-graph persistence
+  disabled, continuing natively` and captures its graphs natively. The scope and
+  capture decisions are voted over the world group, so all ranks fall back
+  together; `--disable-cuda-graph` makes persistence a quiet no-op; every
+  scheduler ends its init with one summary line (graphs saved / restored /
+  disabled at step). After LOAD starts restoring graphs, failures stay errors.
+- **EAGLE / EAGLE3 speculative decoding graphs are persisted**: the
+  target-verify, draft-decode and draft-extend graph sets, each saved and
+  restored on its own (`capture_scope('decode', kind=...)`,
+  `decode_graphs.json` records scope order and output structure). Adaptive and
+  multi-layer EAGLE and the other algorithms fall back.
+- **FlashInfer tuned tactics travel with the archive**: autotune stays pinned
+  off, SAVE installs SGLang's per-rank autotune cache file and keeps its content
+  in the rank's `warmup_state.json`, LOAD installs that section (12-17 % decode
+  throughput on FlashInfer MoE paths; foundry#25).
+- **Pre-capture state is built by SGLang, checked by Foundry**: SGLang's
+  `BaseRunner._prepare_capture_state` builds the lazy communication state
+  (DeepEP / Mooncake buffers, dispatcher expert mappings, the logits gatherer)
+  before the first capture scope on both modes through the dispatcher
+  `prebuild()` protocol; Foundry's per-backend bootstraps are gone and a
+  dispatcher without the protocol is reported as unsupported at `capture state`.
+- **Deterministic pre-layout allocations**: `ProcessGroup.barrier()`'s async
+  Work is waited at the call and the cyclic collector is held off from
+  `before_parallel_init` to the layout start, so two run-dependent frees no
+  longer move host tensors that EAGLE3 draft graphs address (DeepEP v2 target:
+  draft-decode index out of bounds or a lower accept length on LOAD).
+- **Graph fidelity across SAVE/LOAD**: event creation flags (rebuilt event
+  nodes no longer carry timing: 2.6 us per record/wait pair on replay), kernel
+  node cluster dimensions, the cluster count in the exec-share topology key (a
+  grid-only `cuGraphExecUpdate` of a cluster node leaves its device cluster
+  constants stale on driver 595: FlashInfer's Lamport all-reduce fusion then
+  read a wrong token stride), failed kernel-node attribute queries are reported
+  (`FOUNDRY_ALLOW_ATTR_QUERY_FAILURE=1` to continue), `loaded_events` /
+  `bind_events` let the host bind its own events to a restored graph, the hook
+  resolves `dlsym(RTLD_NEXT)` from the caller.
+- **Pins and rejections** live in `pins.py` (the plugin module is gone); new
+  since rc3: `SGLANG_ENABLE_DCP_PUSH_COMBINE=0` (the DCP push-combine path
+  builds its own CustomAllReduceV2 before capture, independent of
+  `--disable-custom-all-reduce`) and `ShapeKey.logits_variant` (sharded verify)
+  rejected like `attention_variant`. What rc3 rejected with an error (a
+  contrary pin, LoRA, PD multiplexing, elastic-EP recapture, non-EAGLE
+  speculative decoding, `SGLANG_ENABLE_POST_CAPTURE_KV_SIZING`) now falls back
+  natively.
+- FlashInfer SM90 GDN CuTe-DSL prefill kernels come from Foundry's object cache
+  again by default (`FOUNDRY_FLASHINFER_GDN_CUTE_CACHE=0` turns it off): 10 s
+  of JIT per Qwen3.5 start.
+
+## Removed
+
+- The plugin route (`FOUNDRY_GRAPH_EXTENSION_CONFIG`, `plugin.py`): SGLang's
+  own call sites (`--cuda-graph-persistence`) are the only route; the API
+  2.2-only entry points (`record_memory_pool_overrides`,
+  `before/after_alloc_memory_pool`) with it.
+- Foundry's per-backend pre-capture bootstraps (`bootstrap_logits_gatherer`,
+  `bootstrap_deepep_buffer` and the v2 / Mooncake variants,
+  `bootstrap_expert_mappings`); SGLang builds that state (see Highlights).
+- The scratch skip: `scratch_space_size` in the TOML is ignored (logged once).
+- The post-load `empty_cache`, the dynamo-related SAVE bootstraps (dynamo is
+  pinned off), `FOUNDRY_SGLANG_CAPTURE_TRACE`.
+- LOAD of archives saved before API 2.1 (no `decode_graphs.json` record, or no
+  output structure): refused with a message; re-SAVE.
+
+## Validation
+
+2x H200 (driver 595.71.05, torch 2.14.1 / cu130), 2026-11-07/08, SGLang
+`foundry-dep` (9fccf82eda): unit + `tests/sgl` suites and SGLang's adapter
+and e2e tests green; Qwen3-30B-A3B-FP8 TP2 (262 graphs per rank), EP2 DeepEP
+v2 (256) and EP2 + EAGLE3 (72 across three kinds): SAVE and LOAD allocation
+offsets equal on every rank, LOAD greedy outputs and logprobs identical to
+native (sequential and batched), EAGLE3 accept length identical; native -> LOAD
+to the first `/health` 200: 103 -> 37 s, 116 -> 37 s, 45 -> 38 s. Fallback
+rows (a dispatcher without `prebuild`, LOAD of the archive its SAVE marked
+invalid, state created inside a capture, a reason found on one rank only, a
+contrary pin, `--disable-cuda-graph`) start natively with output identical to
+native. 1x H200, 256 decode
+graphs per set with SGLang's server warmup skipped: Qwen3.5-2B 53.5 -> 25.3 s,
+Qwen3-1.7B (FlashInfer, 4 prefill graphs) 40.5 -> 28.8 s, Qwen3-30B-A3B-FP8 +
+EAGLE3 (768 graphs) 109.4 -> 31.4 s; restore 0.35 / 0.65 / 1.3 s; the first
+request after LOAD costs the same as after a native start.
+
+## Upgrading
+
+- Re-SAVE every archive: the archive layout (per-kind graph sets,
+  `decode_graphs.json`, tactics in `warmup_state.json`) and the pre-layout
+  allocation sequence changed; archives from rc3 are refused.
+- SAVE and LOAD must run with the same environment and flags: DeepEP v2
+  graphs take NCCL's window by an address the driver places (512 MiB steps),
+  which Foundry does not control; the recipes' `set_env.sh` is the shared set.
+- SGLang `foundry-dep` is rebased on upstream main (FlashInfer 0.7.3,
+  sgl-deep-gemm 0.2.6) and requires integration API 2.x with minor >= 4, i.e.
+  `foundry-core >= 0.1.0rc4`; the `sglang[foundry]` extra pins it.
+- Archives saved with a DeepEP v3 / NIXL / Mori / Pplx dispatcher, LoRA, PD
+  multiplexing or a non-EAGLE speculative algorithm were never valid; such
+  servers now start natively with the `unsupported at` line instead.
+
+## Previous Releases
+
+## Foundry 0.1.0rc3
 
 Second release candidate of 0.1.0 (same wheel pairs and index layout as rc2).
 
-## Highlights
+### Highlights
 
 - **Exec share mode** (`FOUNDRY_ENABLE_EXEC_SHARE=1`): one executable graph per
   template, members switched with `cuGraphExecUpdate`; members are grouped by
@@ -28,11 +136,11 @@ Second release candidate of 0.1.0 (same wheel pairs and index layout as rc2).
   about 5 minutes on one GPU, the Qwen3.5-35B-A3B 2-GPU e2e (tp2, ep2, tpep2)
   and the 4-GPU cases are opt-in (`tests/README.md`).
 
-## Removed
+### Removed
 
 - `foundry.graph.CUDAGraph.instantiate` / `raw_cuda_graph_exec` (never bound).
 
-## Validation
+### Validation
 
 2x H200 (driver 595.71.05, torch 2.14.1 / cu130, SGLang foundry-dep
 e5ba719e30), 2026-10-16: default test run 207 passed; Qwen3.5-35B-A3B tp2 /
@@ -43,15 +151,13 @@ native. Exec share LOAD without cudagraph-patch verified (real route, 256
 graphs per rank in 0.7 s). The 16 cold-start rows of the paper (4x H200)
 remain strict-exact with the NVSHMEM pin.
 
-## Upgrading
+### Upgrading
 
 - Archives written with rc2 still load; re-SAVE to get the `cuLibraryLoadData`
   restore and the NVSHMEM-pin allocation layout (SAVE and LOAD must run with
   the same `set_env.sh`).
 - SGLang's `--dp-size N --enable-dp-attention` is deprecated: use
   `--attn-dp-size N` (the recipes do).
-
-## Previous Releases
 
 ## Foundry 0.1.0rc2
 
