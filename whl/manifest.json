@@ -110,5 +110,61 @@
   "torch": "2.14",
   "url": "https://github.com/foundry-org/foundry/releases/download/v0.1.0rc3/foundry_core-0.1.0rc3-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
   "version": "0.1.0rc3"
+ },
+ "foundry_core-0.1.0rc4+cu130.torch2.13-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl": {
+  "cuda": "cu130",
+  "sha256": "36b38c123d0d62555a45aee4808c2f143ae6e55870727d9c106636822788330b",
+  "torch": "2.13",
+  "url": "https://github.com/foundry-org/foundry/releases/download/v0.1.0rc4/foundry_core-0.1.0rc4%2Bcu130.torch2.13-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  "version": "0.1.0rc4"
+ },
+ "foundry_core-0.1.0rc4+cu130.torch2.13-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl": {
+  "cuda": "cu130",
+  "sha256": "5f10d1403f6621b6e5810a68b482aad182dddc511acae0e3f15fefb66f105167",
+  "torch": "2.13",
+  "url": "https://github.com/foundry-org/foundry/releases/download/v0.1.0rc4/foundry_core-0.1.0rc4%2Bcu130.torch2.13-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  "version": "0.1.0rc4"
+ },
+ "foundry_core-0.1.0rc4+cu130.torch2.13-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl": {
+  "cuda": "cu130",
+  "sha256": "52bd2c248c291b9c5339f177c08d321904e3819d57a848d9d936cb9439f3805f",
+  "torch": "2.13",
+  "url": "https://github.com/foundry-org/foundry/releases/download/v0.1.0rc4/foundry_core-0.1.0rc4%2Bcu130.torch2.13-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  "version": "0.1.0rc4"
+ },
+ "foundry_core-0.1.0rc4+cu130.torch2.13-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl": {
+  "cuda": "cu130",
+  "sha256": "9a8899fd08b2e9d3f308fae9bb8a74735306e637e3fbf9410d86958a9101c88e",
+  "torch": "2.13",
+  "url": "https://github.com/foundry-org/foundry/releases/download/v0.1.0rc4/foundry_core-0.1.0rc4%2Bcu130.torch2.13-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  "version": "0.1.0rc4"
+ },
+ "foundry_core-0.1.0rc4-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl": {
+  "cuda": "cu130",
+  "sha256": "5dc977f1a3995f851a8aacebb76af1fbd6485e63dd84510f1b59395397826d7b",
+  "torch": "2.14",
+  "url": "https://github.com/foundry-org/foundry/releases/download/v0.1.0rc4/foundry_core-0.1.0rc4-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  "version": "0.1.0rc4"
+ },
+ "foundry_core-0.1.0rc4-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl": {
+  "cuda": "cu130",
+  "sha256": "287ced9629417faece763e1693c348e88c5543c2b764a23c1080b4567cd7190b",
+  "torch": "2.14",
+  "url": "https://github.com/foundry-org/foundry/releases/download/v0.1.0rc4/foundry_core-0.1.0rc4-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  "version": "0.1.0rc4"
+ },
+ "foundry_core-0.1.0rc4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl": {
+  "cuda": "cu130",
+  "sha256": "3e009d10f8541712d2e0fe7a17184abfb118d3a665258980b172e9a3b5a2cee9",
+  "torch": "2.14",
+  "url": "https://github.com/foundry-org/foundry/releases/download/v0.1.0rc4/foundry_core-0.1.0rc4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  "version": "0.1.0rc4"
+ },
+ "foundry_core-0.1.0rc4-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl": {
+  "cuda": "cu130",
+  "sha256": "ad70003c799ae0fafeb65140537e1445c00c1ebacc1beb521f72f53285384945",
+  "torch": "2.14",
+  "url": "https://github.com/foundry-org/foundry/releases/download/v0.1.0rc4/foundry_core-0.1.0rc4-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  "version": "0.1.0rc4"
  }
 }
