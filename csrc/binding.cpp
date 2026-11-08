@@ -56,6 +56,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Stop allocation region for CUDA VMM hooks");
 
   m.def(
+      "rng_slab_reserve", []() { ::foundry::rng_slab::reserve(); },
+      "Allocate the chunk backing every capture's RNG capture-state tensors (same point on "
+      "SAVE and LOAD: the layout start)");
+
+  m.def(
       "resume_allocation_region", []() { ::foundry::resume_allocation_region(); },
       "Resume previously set allocation region for CUDA VMM hooks");
 
