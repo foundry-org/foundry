@@ -3,7 +3,8 @@
 """The pins and rejections (pins.FIELD_PINS / ENV_PINS,
 reject_unsupported_features; sglang reaches them through api.pin_server_args
 and api.validate_resolved_server_args): flags and environment variables that
-select state Foundry cannot replay, and features it cannot persist.
+select state Foundry cannot replay, and features it cannot persist. Every
+reject raises api.Unsupported, on which sglang's adapter falls back natively.
 
 CPU only (no GPU, no server, no weights): records are built on a mini
 config.json with device="cuda", like sglang's own
@@ -13,6 +14,7 @@ test/registered/unit/server_args/test_resolution_declarations.py.
 """
 
 import os
+import re
 from types import SimpleNamespace
 from unittest import mock
 
@@ -21,7 +23,7 @@ import pytest
 pytest.importorskip("sglang")
 
 from _sglang_helpers import run_python  # noqa: E402
-from foundry.integration.sglang import pins  # noqa: E402
+from foundry.integration.sglang import api, pins  # noqa: E402
 from sglang.srt.arg_groups.overrides import resolution_result  # noqa: E402
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 
@@ -69,7 +71,7 @@ def test_non_trtllm_dsv4_backend_is_kept(model_dir):
     ],
 )
 def test_explicit_contrary_flag_is_rejected(model_dir, fields, match):
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(api.Unsupported, match=match):
         pins.pin_unreplayable_fields(_unresolved(model_dir, **fields))
 
 
@@ -79,7 +81,7 @@ def test_later_step_that_undoes_a_strict_pin_is_rejected(model_dir):
     sa = _unresolved(model_dir)
     pins.pin_unreplayable_fields(sa)
     declare_resolution(sa, "some_model_override", enable_two_batch_overlap=True)
-    with pytest.raises(ValueError, match="set by some_model_override"):
+    with pytest.raises(api.Unsupported, match="set by some_model_override"):
         pins.validate_pinned_fields(sa)
 
 
@@ -136,12 +138,16 @@ def test_env_pin_already_set_to_the_pinned_value_is_kept(clean_pin_env):
 
 @pytest.mark.parametrize("pin", pins.ENV_PINS, ids=lambda pin: pin.name)
 def test_explicit_contrary_env_is_rejected(clean_pin_env, pin):
+    """Rejected before any variable is set: the native fallback inherits the
+    environment as the user gave it."""
     contrary = "0" if pin.value == "1" else "1"
     os.environ[pin.name] = contrary
     with pytest.raises(
-        ValueError, match=f"{pin.name}='{contrary}' \\(Foundry needs {pin.value}\\)"
-    ):
+        api.Unsupported, match=f"{pin.name}='{contrary}' \\(Foundry needs {pin.value}\\)"
+    ) as info:
         pins.apply_env_pins()
+    assert info.value.step == "environment"
+    assert all(other.name not in os.environ for other in pins.ENV_PINS if other is not pin)
 
 
 def test_nccl_cumem_is_pinned_once_the_a2a_backend_is_known(clean_pin_env):
@@ -151,7 +157,7 @@ def test_nccl_cumem_is_pinned_once_the_a2a_backend_is_known(clean_pin_env):
 
 def test_explicit_nccl_cumem_is_rejected(clean_pin_env):
     os.environ[pins.NCCL_CUMEM_PIN.name] = "1"
-    with pytest.raises(ValueError, match="NCCL_CUMEM_ENABLE='1'"):
+    with pytest.raises(api.Unsupported, match="NCCL_CUMEM_ENABLE='1'"):
         pins.apply_env_pins(SimpleNamespace(moe_a2a_backend="none"))
 
 
@@ -207,7 +213,7 @@ def test_supported_record_passes(restore_environ):
     ],
 )
 def test_unsupported_features_are_rejected(restore_environ, overrides, match):
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(api.Unsupported, match=match):
         pins.reject_unsupported_features(_ns(**overrides))
 
 
@@ -215,7 +221,7 @@ def test_elastic_recapture_is_rejected_where_the_path_exists(restore_environ):
     ns = _ns(elastic_ep_backend="mooncake", max_ep_size=8)
     with (
         mock.patch.object(pins, "_elastic_recapture_path_exists", return_value=True),
-        pytest.raises(ValueError, match="elastic-EP CUDA-graph recapture"),
+        pytest.raises(api.Unsupported, match="elastic-EP CUDA-graph recapture"),
     ):
         pins.reject_unsupported_features(ns)
     with mock.patch.object(pins, "_elastic_recapture_path_exists", return_value=False):
@@ -224,7 +230,7 @@ def test_elastic_recapture_is_rejected_where_the_path_exists(restore_environ):
 
 def test_post_capture_kv_sizing_is_rejected(restore_environ):
     os.environ["SGLANG_ENABLE_POST_CAPTURE_KV_SIZING"] = "1"
-    with pytest.raises(ValueError, match="POST_CAPTURE_KV_SIZING"):
+    with pytest.raises(api.Unsupported, match="POST_CAPTURE_KV_SIZING"):
         pins.reject_unsupported_features(_ns())
 
 
@@ -240,18 +246,29 @@ def persistence(clean_pin_env):
     api.validate_resolved_server_args. api.activate (process-global config;
     test_dependency_route runs it in fresh interpreters) is marked done."""
     adapter = pytest.importorskip("sglang.srt.utils.foundry_adapter")
-    from foundry.integration.sglang import api
 
     with (
         mock.patch.object(api, "_active", ("save", None)),
+        mock.patch.object(api, "_unsupported", None),
         mock.patch.object(adapter, "_active", adapter._NOOP),
     ):
-        yield
+        yield adapter
 
 
 def _resolve(model_dir, **fields):
     sa = _unresolved(model_dir, cuda_graph_persistence="save", **fields)
     sa.resolve_once()
+    return sa
+
+
+def _resolve_unsupported(model_dir, persistence, match, **fields):
+    """Resolution falls back instead of failing: the adapter is off and the
+    reason names the flag. Returns the record."""
+    sa = _resolve(model_dir, **fields)
+    assert not persistence.get_foundry_adapter().enabled
+    step, reason, _quiet = api._unsupported
+    assert step == "server args"
+    assert re.search(match, reason), reason
     return sa
 
 
@@ -282,11 +299,14 @@ def test_explicit_full_prefill_is_honoured(model_dir, persistence):
         ("cuda_graph_backend_decode", "Foundry persists full decode graphs only"),
     ],
 )
-def test_non_full_backend_flag_is_rejected(model_dir, persistence, field, match):
+def test_non_full_backend_flag_falls_back(model_dir, persistence, field, match):
+    """Nothing is declared: the record resolves as without the flag."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
-    with pytest.raises(ValueError, match=match):
-        _resolve(model_dir, **{field: Backend.BREAKABLE})
+    sa = _resolve_unsupported(model_dir, persistence, match, **{field: Backend.BREAKABLE})
+    declared = dict(sa._resolved_overrides)
+    assert pins.RESOLUTION_SOURCE not in declared
+    assert pins.PIN_RESOLUTION_SOURCE not in declared
 
 
 @pytest.mark.parametrize(
@@ -299,19 +319,19 @@ def test_non_full_backend_flag_is_rejected(model_dir, persistence, field, match)
 def test_cuda_graph_config_json_is_validated(model_dir, persistence, json_cfg, match):
     """JSON outranks the per-phase flags, so the flag check alone misses it.
     (Passed as the parsed dict: parse_cuda_graph_config reads ``.items()``.)"""
-    with pytest.raises(ValueError, match=match):
-        _resolve(model_dir, cuda_graph_config=json_cfg)
+    _resolve_unsupported(model_dir, persistence, match, cuda_graph_config=json_cfg)
 
 
 @pytest.mark.parametrize("field", ["disable_cuda_graph", "disable_decode_cuda_graph"])
-def test_disable_cuda_graph_is_rejected_not_overridden(model_dir, persistence, field):
-    with pytest.raises(ValueError, match="cannot be combined with Foundry"):
-        _resolve(model_dir, **{field: True})
+def test_disable_cuda_graph_falls_back_not_overridden(model_dir, persistence, field):
+    sa = _resolve_unsupported(model_dir, persistence, "disable-cuda-graph", **{field: True})
+    assert pins.RESOLUTION_SOURCE not in dict(sa._resolved_overrides)
 
 
-def test_profile_cuda_graph_is_rejected(model_dir, persistence):
-    with pytest.raises(ValueError, match="enable-profile-cuda-graph"):
-        _resolve(model_dir, enable_profile_cuda_graph=True)
+def test_profile_cuda_graph_falls_back(model_dir, persistence):
+    _resolve_unsupported(
+        model_dir, persistence, "enable-profile-cuda-graph", enable_profile_cuda_graph=True
+    )
 
 
 def test_every_field_pin_is_applied_on_sglang_defaults(model_dir, persistence, capsys):
@@ -333,9 +353,12 @@ def test_pinned_value_given_explicitly_is_accepted(model_dir, persistence):
 
 
 @pytest.mark.parametrize("field", ["enable_symm_mem", "enable_mscclpp"])
-def test_explicit_contrary_flag_is_rejected_by_resolution(model_dir, persistence, field):
-    with pytest.raises(ValueError, match=f"--{field.replace('_', '-')}=True"):
-        _resolve(model_dir, **{field: True})
+def test_explicit_contrary_flag_falls_back_in_resolution(model_dir, persistence, field):
+    """Also the graph pins stay undeclared: the conflict is found before any
+    declaration (pins.check_pinnable)."""
+    flag = f"--{field.replace('_', '-')}=True"
+    sa = _resolve_unsupported(model_dir, persistence, flag, **{field: True})
+    assert pins.RESOLUTION_SOURCE not in dict(sa._resolved_overrides)
 
 
 def test_nccl_cumem_is_pinned_by_resolution(model_dir, persistence):

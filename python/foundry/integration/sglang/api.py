@@ -23,7 +23,10 @@ apart; a 2.0 caller passes none, which means the plain target decode runner.
 only they called (``record_memory_pool_overrides``,
 ``before_alloc_memory_pool``, ``after_alloc_memory_pool``,
 ``validate_graph_config``, ``apply_env_pins``, ``after_parallel_init``,
-``after_runner_distributed_init``) are gone.
+``after_runner_distributed_init``) are gone. 2.4 adds the fallback contract:
+the detection points raise :class:`Unsupported` (never another type), the
+adapter catches exactly that type, calls :func:`deactivate` and continues
+natively; :func:`log_init_summary` closes the scheduler's init.
 
 Call sites (SGLang side, in process order):
 
@@ -46,7 +49,20 @@ DP-controller spawn                              :func:`configure_subprocess`
 decode runner ``capture``                        :func:`capture_scope`
 prefill runner ``capture``                       :func:`capture_scope`
 ``FullCudaGraphBackend.capture_one``             :func:`capture_one` (replaces the body)
+``run_scheduler_process``, after ``Scheduler``   :func:`log_init_summary` (2.4)
 ===============================================  =========================================
+
+Fallback (2.4). Outside the configurations Foundry supports, a detection point
+raises :class:`Unsupported` and the adapter calls :func:`deactivate`: SGLang
+continues with its native initialisation (normal graph capture). The points
+are the resolution steps (``step="server args"``, ``"environment"``), LOAD of an
+archive SAVE marked invalid (``"archive"``, :func:`before_parallel_init`), the
+first capture scope (``"capture state"``: a dispatcher without the prebuild
+protocol, or state still pending) and every SAVE capture (``"capture"``: an
+attribute of a dispatcher or logits processor created inside the capture, or an
+attention graph variant). The scope and capture decisions are agreed over the
+world group, so every rank falls back together. LOAD has no fallback once its
+graph restore started: a failure there is an error.
 
 Every function except :func:`activate` requires an
 active process (:func:`activate` ran in it).
@@ -55,6 +71,7 @@ active process (:func:`activate` ran in it).
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import sys
@@ -63,11 +80,31 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-INTEGRATION_API_VERSION = (2, 3)
+INTEGRATION_API_VERSION = (2, 4)
 MODES = ("save", "load")
 FLAG = "--cuda-graph-persistence"
+# Set only around the spawns of a launcher that fell back (configure_subprocess),
+# so its schedulers fall back at activation: [step, reason] as JSON.
+UNSUPPORTED_ENV = "FOUNDRY_SGLANG_UNSUPPORTED"
 
 _active: tuple[str, str | None] | None = None
+_unsupported: tuple[str, str, bool] | None = None
+
+
+class Unsupported(Exception):
+    """This configuration is outside what Foundry persists, detected at
+    ``step`` before any graph was restored. The adapter catches exactly this
+    type, calls :func:`deactivate` and continues natively; ``inherited``: the
+    launcher fell back and this scheduler only learns it at activation."""
+
+    def __init__(self, step: str, reason: str, *, inherited: bool = False, quiet: bool = False):
+        super().__init__(f"unsupported at {step}: {reason}")
+        self.step = step
+        self.reason = reason
+        self.inherited = inherited
+        # quiet: persistence has nothing to do (CUDA graphs are off); the
+        # adapter logs it at INFO, not as a fallback warning.
+        self.quiet = quiet
 
 
 def activate(*, mode: str, config_path: str | None = None) -> None:
@@ -83,6 +120,10 @@ def activate(*, mode: str, config_path: str | None = None) -> None:
     global _active
     if mode not in MODES:
         raise ValueError(f"{FLAG} must be one of {MODES}, got {mode!r}")
+    inherited = os.environ.get(UNSUPPORTED_ENV)
+    if inherited:
+        step, reason, quiet = json.loads(inherited)
+        raise Unsupported(step, reason, inherited=True, quiet=quiet)
     key = (mode, os.path.abspath(config_path) if config_path else None)
     if _active is not None:
         if _active != key:
@@ -130,6 +171,33 @@ def _require_active() -> None:
         raise RuntimeError("[Foundry] not active in this process: call activate() first")
 
 
+def deactivate(*, step: str, reason: str, quiet: bool = False) -> None:
+    """Called by the adapter after it caught :class:`Unsupported`: every later
+    function is a no-op (the mode becomes none). In a scheduler past setup,
+    the allocation region and the kernel-binary dump stop, and SAVE marks the
+    archive invalid (``invalid.json`` in the rank's workspace and the
+    workspace root), so a LOAD of it falls back at :func:`before_parallel_init`.
+    A launcher passes the decision to its spawns (:func:`configure_subprocess`).
+    Idempotent; also valid in a process whose :func:`activate` raised."""
+    global _unsupported
+    if _unsupported is not None:
+        return
+    _unsupported = (step, reason, quiet)
+    from foundry.integration.sglang import hooks
+
+    hooks.deactivate(step, reason)
+
+
+def log_init_summary() -> None:
+    """End of the scheduler's init (after ``Scheduler`` is built): one line with
+    what this rank saved or restored. A process that fell back logs nothing
+    here (the adapter prints the fallback line)."""
+    _require_active()
+    from foundry.integration.sglang import hooks
+
+    hooks.log_init_summary()
+
+
 # ---------------------------------------------------------------------------
 # Server-args resolution (launcher)
 # ---------------------------------------------------------------------------
@@ -139,20 +207,23 @@ def pin_server_args(server_args: Any) -> None:
     """Before ``apply_inkling_prefill_cuda_graph_default``: pin decode ``full``,
     prefill ``full`` / ``disabled`` (default ``disabled``), profiling and
     FlashInfer autotune off, and every flag that selects state Foundry cannot
-    replay (``pins.FIELD_PINS``); conflicting user values raise."""
+    replay (``pins.FIELD_PINS``). A conflicting user value raises
+    :class:`Unsupported` before anything is declared, so the fallback resolves
+    the record as without the flag."""
     _require_active()
     from foundry.integration.sglang import pins
 
+    pins.check_pinnable(server_args)
     pins.pin_graph_fields(server_args)
     pins.pin_unreplayable_fields(server_args)
 
 
 def validate_resolved_server_args(server_args: Any) -> None:
-    """After ``handle_other_validations``: reject what Foundry cannot persist
-    (speculative decoding other than EAGLE / EAGLE3, adaptive or multi-layer
-    EAGLE, LoRA, PD multiplexing, elastic-EP recapture,
-    post-capture KV sizing), re-check the graph config and the strict pins
-    after the later cascades, and pin the environment including
+    """After ``handle_other_validations``: raise :class:`Unsupported` for what
+    Foundry cannot persist (speculative decoding other than EAGLE / EAGLE3,
+    adaptive or multi-layer EAGLE, LoRA, PD multiplexing, elastic-EP
+    recapture, post-capture KV sizing), re-check the graph config and the
+    strict pins after the later cascades, and pin the environment including
     ``NCCL_CUMEM_ENABLE`` (left alone for ``--moe-a2a-backend deepep_v2``)."""
     _require_active()
     from foundry.integration.sglang import pins
@@ -176,11 +247,16 @@ def configure_subprocess(server_args: Any = None):
     ``FOUNDRY_MODE``; the parent's environment is restored on exit. With
     ``server_args``, first checks that the record was resolved with Foundry's
     graph pins and re-asserts the environment pins (both permanent and
-    idempotent)."""
-    _require_active()
+    idempotent). After :func:`deactivate` it only passes the fallback to the
+    child (:data:`UNSUPPORTED_ENV`), which then falls back at activation."""
     from foundry.integration.sglang import hooks, pins
     from foundry.integration.sglang import runtime as rt
 
+    if _unsupported is not None:
+        with rt.scoped_environ({UNSUPPORTED_ENV: json.dumps(list(_unsupported))}):
+            yield
+        return
+    _require_active()
     if server_args is not None:
         hooks._check_resolved_graph_config(server_args)
     pins.apply_env_pins(server_args)
@@ -196,7 +272,8 @@ def configure_subprocess(server_args: Any = None):
 def before_parallel_init(device: str) -> None:
     """Head of ``bootstrap.init_parallel_runtime``: bind this rank's VMM region
     (on its own device) before any communicator exists; LOAD also restores the
-    CUDA modules and starts the graph-exec pool prewarm."""
+    CUDA modules and starts the graph-exec pool prewarm. LOAD of an archive SAVE
+    marked invalid raises :class:`Unsupported` first, before any of it."""
     _require_active()
     from foundry.integration.sglang import hooks
 
@@ -259,7 +336,9 @@ def capture_scope(
     pinned off; SAVE installs the file's tactics and keeps them in the rank's
     ``warmup_state.json``, LOAD installs them from there, so both run the same
     kernels without a tuning pass. The file need not exist (SAVE then warns
-    and the archive carries no tactics)."""
+    and the archive carries no tactics). The first scope raises
+    :class:`Unsupported` (``step="capture state"``) for a dispatcher without
+    the prebuild protocol or with state still pending, on every rank alike."""
     _require_active()
     from foundry.integration.sglang import hooks
 
@@ -271,7 +350,11 @@ def capture_one(shape_key: Any, forward_fn, *, pool: Any, stream: Any):
     :func:`capture_scope`) and returns ``(graph, output)`` for SGLang to
     store: SAVE captures the shape on ``stream`` into ``pool`` without warm-up
     forwards and archives it; LOAD restores the archived graph and runs no
-    forward."""
+    forward. SAVE raises :class:`Unsupported` (``step="capture"``, on every
+    rank alike) when the capture created an attribute of a dispatcher or logits
+    processor, or the shape is an attention graph variant: the graph of this
+    shape is discarded and the attributes reset, so SGLang captures it and the
+    rest natively; the graphs captured before stay in use."""
     _require_active()
     from foundry.integration.sglang import hooks
 

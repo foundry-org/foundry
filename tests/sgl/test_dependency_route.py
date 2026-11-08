@@ -86,20 +86,45 @@ def test_flag_pins_graph_fields_and_environment(model_dir, tmp_path):
     assert "[Foundry] cuda graph persistence active:" in result.stderr
 
 
-def test_contrary_flag_is_rejected_naming_the_sglang_flag(model_dir, tmp_path):
+def test_contrary_flag_falls_back_naming_the_sglang_flag(model_dir, tmp_path):
+    """Resolution succeeds without Foundry's graph pins, and a scheduler
+    spawned through the adapter falls back at its activation too."""
     result = _run_python(
         _resolve_code(
             model_dir,
             {"cuda_graph_persistence": "save", "enable_two_batch_overlap": True},
-        ),
+        )
+        + """
+        import subprocess, sys
+        from sglang.srt.utils.foundry_adapter import get_foundry_adapter
+        assert not get_foundry_adapter().enabled
+        # Nothing of Foundry's was declared (sglang's own TBO rule may still
+        # disable the prefill graphs).
+        from foundry.integration.sglang import pins
+        assert pins.RESOLUTION_SOURCE not in dict(sa._resolved_overrides)
+        # Inside the generated source: escaped newlines, so dedent() still sees
+        # one indentation.
+        child = (
+            "from types import SimpleNamespace\\n"
+            "from sglang.srt.utils.foundry_adapter import activate_foundry\\n"
+            "a = activate_foundry(SimpleNamespace(cuda_graph_persistence='save', "
+            "cuda_graph_persistence_config=None))\\n"
+            "assert not a.enabled\\n"
+            "print('CHILD OK')\\n"
+        )
+        with get_foundry_adapter().configure_subprocess(sa):
+            out = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True)
+        assert "CHILD OK" in out.stdout, out.stderr[-4000:]
+        print("OK")
+        """,
         cwd=tmp_path,
     )
-    assert result.returncode != 0
-    assert "not supported with Foundry graph persistence (--cuda-graph-persistence)" in (
-        result.stderr
-    ), result.stderr[-4000:]
-    assert "--enable-two-batch-overlap=True: not validated with Foundry" in result.stderr
-    assert "FOUNDRY_GRAPH_EXTENSION_CONFIG" not in result.stderr
+    assert result.returncode == 0 and "OK" in result.stdout, result.stderr[-4000:]
+    assert (
+        "[Foundry] unsupported at server args: --enable-two-batch-overlap=True: not validated "
+        "with Foundry"
+    ) in result.stderr, result.stderr[-4000:]
+    assert "cuda-graph persistence disabled, continuing natively" in result.stderr
 
 
 def test_config_without_mode_is_rejected(model_dir, tmp_path):
