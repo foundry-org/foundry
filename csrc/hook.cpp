@@ -4419,6 +4419,18 @@ void replay_hook_events_from_json(const boost::json::object& events_obj) {
   if (events_obj.contains("start_base_addr")) {
     uint64_t start_base_addr = events_obj.at("start_base_addr").to_number<uint64_t>();
     if (start_base_addr >= tls_storage.current_alloc_base_addr) {
+      if (start_base_addr > tls_storage.current_alloc_base_addr) {
+        // SAVE allocated something before this graph that LOAD did not (e.g. a
+        // caching-allocator segment that only SAVE grew): the cursor jumps over
+        // the gap so the graph's own events still land at SAVE's offsets, but
+        // every allocation LOAD makes later lands elsewhere than on SAVE.
+        fprintf(stderr,
+                "[HOOK] WARNING: replay cursor 0x%llx is %.2f MB behind SAVE's start 0x%llx; "
+                "moving up (LOAD allocated less than SAVE before this graph)\n",
+                (unsigned long long)tls_storage.current_alloc_base_addr,
+                (start_base_addr - tls_storage.current_alloc_base_addr) / (1024.0 * 1024.0),
+                (unsigned long long)start_base_addr);
+      }
       tls_storage.current_alloc_base_addr = static_cast<CUdeviceptr>(start_base_addr);
     } else {
       // LOAD mode consumed more memory than SAVE mode before graph loading.
