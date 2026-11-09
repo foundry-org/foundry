@@ -203,15 +203,15 @@ def test_supported_record_passes(restore_environ):
     # Elastic EP without recapture (max_ep_size == tp_size) is allowed.
     pins.reject_unsupported_features(_ns(elastic_ep_backend="mooncake", max_ep_size=4))
     # EAGLE-family speculative decoding is persisted.
-    for algo in ("EAGLE", "EAGLE3", "eagle3", "NEXTN"):
+    for algo in ("EAGLE", "EAGLE3", "eagle3", "NEXTN", "DFLASH", "NGRAM", "DSPARK"):
         pins.reject_unsupported_features(_ns(speculative_algorithm=algo))
 
 
 @pytest.mark.parametrize(
     "overrides, match",
     [
-        (dict(speculative_algorithm="NGRAM"), "speculative decoding"),
-        (dict(speculative_algorithm="DFLASH"), "speculative decoding"),
+        (dict(speculative_algorithm="UNO"), "speculative decoding"),
+        (dict(speculative_algorithm="STANDALONE"), "speculative decoding"),
         (dict(speculative_algorithm="EAGLE", speculative_adaptive=True), "adaptive"),
         (dict(speculative_algorithm="EAGLE3", enable_multi_layer_eagle=True), "multi-layer"),
         (dict(enable_lora=True), "LoRA"),
