@@ -94,10 +94,12 @@ re-asserted in `validate_cuda_graph_persistence`, at the top of every scheduler 
 | `SGLANG_ENABLE_DCP_PUSH_COMBINE` | `0` | the DCP push-combine decode path builds its own CustomAllReduceV2 before capture, independent of `--disable-custom-all-reduce`; its push workspace is registered over CUDA IPC outside the recorded region | set to true |
 | `TORCHDYNAMO_DISABLE` | `1` | SAVE runs each shape's first forward inside the capture and torch >= 2.14's dynamo refuses to trace there; pinned by Foundry on SAVE / LOAD, exported by the recipes in every mode | set to anything but 1 |
 
-Not supported, because Foundry has no logic for them: speculative decoding other than EAGLE / EAGLE3 (also adaptive
-speculative decoding and multi-layer EAGLE), LoRA, PD multiplexing, elastic-EP recapture, graph variants (attention variants, sharded-verify logits
+Not supported, because Foundry has no logic for them: speculative decoding other than EAGLE / EAGLE3 / NEXTN / DFLASH /
+NGRAM / DSPARK (also adaptive speculative decoding and multi-layer EAGLE), LoRA, PD multiplexing, elastic-EP recapture, graph variants (attention variants, sharded-verify logits
 variants), non-full graph backends, `--disable-cuda-graph`, CUDA-graph profiling,
-`SGLANG_ENABLE_POST_CAPTURE_KV_SIZING`. Profiling and FlashInfer autotune are pinned off with the graph backends;
+`SGLANG_ENABLE_POST_CAPTURE_KV_SIZING`. DSPARK needs `SGLANG_DSPARK_USE_GREEDY_DRAFT=1` (or
+`SGLANG_DSPARK_FOLDED_PROPOSAL=0`): its sampling draft allocates `step_logits` at the first use under an
+`assert not capturing`, which SAVE's capture of the first forward trips. Profiling and FlashInfer autotune are pinned off with the graph backends;
 FlashInfer's tuned tactics travel with the archive instead: SAVE installs SGLang's per-rank autotune cache file
 (written by a plain start of the same model) and keeps its content in the rank's `warmup_state.json` (section
 `flashinfer_tactics`), LOAD installs that section, so both sides run the tuned kernels without a tuning pass
