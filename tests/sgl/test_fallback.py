@@ -219,7 +219,6 @@ def _breakable_scope(monkeypatch):
     dp = SimpleNamespace(prefill_graph_has_dp_gather=False)
     monkeypatch.setattr(runtime_context, "get_flags", lambda: SimpleNamespace(dp=dp))
     monkeypatch.setattr(hooks, "_prefill_backend_is_breakable", lambda: True)
-    monkeypatch.setattr(rt, "_default_pool_small_free", lambda: {})
     monkeypatch.setattr(rt, "log_alloc_offset", lambda label: None)
 
 
@@ -263,7 +262,7 @@ def test_breakable_attention_variant_falls_back_before_capture(scheduler, monkey
     with adapter.capture_scope(phase="prefill", model=_model(_PrebuiltDispatcher()), req_slots=1):
         captured = adapter.capture_one_breakable(shape_key=key, capture=capture)
     assert captured is None
-    assert "attention graph variant" in _marker(cfg)["reason"]
+    assert "graph variant" in _marker(cfg)["reason"]
 
 
 # ---------------------------------------------------------------------------

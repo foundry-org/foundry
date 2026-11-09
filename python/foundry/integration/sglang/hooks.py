@@ -572,11 +572,9 @@ def capture_one_breakable(shape_key, capture):
         )
     if mode == CUDAGraphExtensionMode.LOAD:
         return breakable_ops.restore_shape(shape_key)
-    variant = getattr(shape_key, "attention_variant", None)
+    variant = _graph_variant(shape_key)
     if variant is not None:
-        _agree_capture_supported(
-            f"shape {shape_key} is an attention graph variant ({variant!r})", [], None
-        )
+        _agree_capture_supported(f"shape {shape_key} is a graph variant ({variant})", [], None)
     else:
         _agree_capture_supported(None, [], None)
 

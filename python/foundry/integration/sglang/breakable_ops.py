@@ -259,12 +259,12 @@ def begin_scope(model: Any) -> None:
 
 
 def _shape(key: Any) -> tuple[int, int]:
-    from foundry.integration.sglang.graph_ops import _prefill_shape
+    from foundry.integration.sglang.graph_ops import _is_graph_variant, _prefill_shape
 
-    if getattr(key, "attention_variant", None) is not None:
+    if _is_graph_variant(key):
         raise RuntimeError(
-            f"[Foundry] shape {key} captures an attention graph variant; Foundry save/load "
-            "does not support graph variants"
+            f"[Foundry] shape {key} captures a graph variant; Foundry save/load does not "
+            "support graph variants"
         )
     return _prefill_shape(key)
 
@@ -286,10 +286,9 @@ def save_shape(key: Any, capture) -> tuple[Any, Any]:
     state = get_state()
     ws = _workspace_dir()
     tokens, chunks = _shape(key)
-    from foundry.integration.sglang import runtime as rt
-
-    with rt.no_small_pool_growth(f"breakable shape t={tokens}"):
-        graph, stored = capture(segment_graph_factory=FoundryCUDAGraph)
+    # The segments' RNG capture states come from the slab reserved at the
+    # layout start (rng_slab), so the capture grows no torch pool.
+    graph, stored = capture(segment_graph_factory=FoundryCUDAGraph)
     tensors: list[torch.Tensor] = []
     enc = _Encoder(_module_names, tensors)
     breaks = []
