@@ -137,7 +137,7 @@ graph cannot replay (custom all-reduce off, torch symm-mem all-reduce on, NCCL b
 registration / cuMem / NVLS off, DeepGEMM precompile sweep off, two-batch overlap off,
 memory-saver / graph-pool variants off, `--dsv4-attn-backend` not `trtllm`), print one
 `[Foundry] pin:` line per value. A contrary explicit value, or a feature Foundry has no logic for
-(speculative decoding other than EAGLE / EAGLE3, LoRA, PD multiplexing, elastic-EP recapture, non-full
+(speculative decoding other than EAGLE / EAGLE3 / NEXTN / DFLASH / NGRAM / DSPARK, LoRA, PD multiplexing, elastic-EP recapture, non-full
 graph backends, a MoE dispatcher without `prebuild()`), is not an error: the server logs
 `[Foundry] unsupported at <step>: <reason>; cuda-graph persistence disabled, continuing natively` and
 captures its graphs natively (a SAVE that fell back marks its archive invalid). Full table:

@@ -16,7 +16,7 @@ integration, called through ``api.py`` from SGLang's resolution steps:
   see "Pins" below).
 - ``validate_cuda_graph_persistence`` (``api.validate_resolved_server_args``,
   after ``handle_other_validations``): features Foundry does not support
-  (speculative decoding other than EAGLE / EAGLE3), once speculative
+  (speculative decoding outside SUPPORTED_SPECULATIVE_ALGORITHMS), once speculative
   decoding, LoRA and elastic EP are resolved; the resolved graph config
   (which also covers ``--cuda-graph-config`` JSON) and the pinned flags are
   checked again after the later cascades, and ``NCCL_CUMEM_ENABLE`` is pinned
@@ -185,7 +185,10 @@ def _elastic_recapture_path_exists() -> bool:
 # The other algorithms (STANDALONE, NGRAM, DFLASH, DSPARK, UNO, FROZEN_KV_MTP
 # and plugin-registered ones) run other workers and runners and stay
 # rejected.
-SUPPORTED_SPECULATIVE_ALGORITHMS = ("EAGLE", "EAGLE3", "NEXTN")
+# EAGLE-family (target-verify + draft-decode + draft-extend graph sets) and the
+# verify-only algorithms whose target and draft run the plain decode runner in
+# TARGET_VERIFY mode (kinds target_verify / draft_verify).
+SUPPORTED_SPECULATIVE_ALGORITHMS = ("EAGLE", "EAGLE3", "NEXTN", "DFLASH", "NGRAM", "DSPARK")
 
 
 def reject_unsupported_features(server_args: Any) -> None:
