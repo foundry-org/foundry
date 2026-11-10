@@ -83,6 +83,9 @@ _LAYOUT_FILE = "region_layout.json"
 # allocates the per-bs wrappers in another order; LOAD cannot replay it).
 CAPTURE_LOOP_VERSION = 2
 _layout_start_offset: int | None = None
+# LOAD with a share manifest: (canonical rank, [(kernel, param, offset, width, value)]),
+# set by hooks.before_parallel_init after the manifest check.
+_archive_share: tuple[int, list] | None = None
 _final_alloc_offset: int = 0
 # Written by a SAVE that fell back (api.deactivate) into its rank's workspace
 # and the workspace root; LOAD falls back when it finds either.
@@ -181,6 +184,18 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
     rank = compute_workspace_rank(server_args, tp_rank, pp_rank, dp_rank)
     Path(cfg.workspace_root).mkdir(parents=True, exist_ok=True)
     workspace_dir = Path(cfg.workspace_root) / f"rank_{rank}"
+    if cfg.mode == CUDAGraphExtensionMode.LOAD and _archive_share is not None:
+        # Archive share: restore the canonical rank's archive; the "= rank" sites
+        # are written into the param bytes as each .cugraph is read.
+        canonical, patches = _archive_share
+        workspace_dir = Path(cfg.workspace_root) / f"rank_{canonical}"
+        cge.set_param_patches(patches)
+        logger.info(
+            "[Foundry] archive share: rank %d restores rank_%d with %d '= rank' patch site(s)",
+            rank,
+            canonical,
+            len(patches),
+        )
     cfg.workspace_dir = str(workspace_dir)
     logger.info(
         "[Foundry] SGLang rank=%d (tp_rank=%d pp_rank=%d dp_rank=%s replica=%d "
@@ -198,6 +213,9 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
         if workspace_dir.exists():
             shutil.rmtree(workspace_dir)
         workspace_dir.mkdir(parents=True, exist_ok=True)
+        from foundry.integration.sglang import share
+
+        share.write_rank_config(str(workspace_dir), rank, server_args, torch.cuda.current_device())
         # A marker of an earlier SAVE; this SAVE writes its own only after the
         # ranks agreed at a capture scope, which every rank reaches after this.
         (Path(cfg.workspace_root) / _INVALID_FILE).unlink(missing_ok=True)
@@ -392,6 +410,15 @@ def record_region_layout() -> int:
             )
         )
     return _final_alloc_offset
+
+
+def set_archive_share(canonical: int, patches: list) -> None:
+    global _archive_share
+    _archive_share = (canonical, patches)
+
+
+def archive_share_active() -> bool:
+    return _archive_share is not None
 
 
 def check_capture_loop_version() -> None:

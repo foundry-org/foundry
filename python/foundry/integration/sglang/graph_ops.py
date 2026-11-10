@@ -420,6 +420,19 @@ def _log_restore(what: str, n: int, pending: Any, timing: _RestoreTiming, loop_s
         builds,
         handover,
     )
+    from foundry import ops as _ops
+    from foundry.integration.sglang import runtime as _rt
+
+    if _rt.archive_share_active():
+        patched, misses = _ops.param_patch_counts()
+        logger.info(
+            "[Foundry] archive share: %d param patch(es) applied, %d unappliable", patched, misses
+        )
+        if misses or not patched:
+            raise RuntimeError(
+                f"Foundry archive share: {patched} patches applied, {misses} unappliable: the "
+                "canonical archive does not match the manifest's patch sites"
+            )
     logger.info(
         "[Foundry] SGLang %s capture loop on LOAD: %.3fs (%d shapes, restore %.3fs, "
         "per-shape prep %.3fs)",

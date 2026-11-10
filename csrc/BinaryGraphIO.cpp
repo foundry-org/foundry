@@ -10,6 +10,8 @@
 #include <iomanip>
 #include <unordered_map>
 #include <cstring>
+#include <string_view>
+#include <atomic>
 
 namespace foundry {
 
@@ -782,6 +784,66 @@ boost::json::value read_and_parse_binary_graph(const std::string& bin_path) {
 // No JSON construction. Used for direct-access in prepare_on_demand_graph.
 // ============================================================================
 
+namespace {
+std::vector<ParamPatch> g_param_patches;
+std::atomic<uint64_t> g_patched{0};
+std::atomic<uint64_t> g_patch_misses{0};
+
+void apply_param_patches(BinaryGraphFile& f) {
+  namespace bf = binary_format;
+  if (g_param_patches.empty())
+    return;
+  const size_t n = f.header.num_nodes;
+  const size_t node_bytes = f.section_size(bf::SECTION_NODE_TABLE);
+  const size_t idx_bytes = f.section_size(bf::SECTION_KERNEL_PARAM_INDEX);
+  const size_t data_bytes = f.section_size(bf::SECTION_KERNEL_PARAM_DATA);
+  const size_t str_bytes = f.section_size(bf::SECTION_STRING_TABLE);
+  if (node_bytes < n * sizeof(bf::BinNodeEntry))
+    return;
+  uint8_t* param_data = f.data.data() + f.sections[bf::SECTION_KERNEL_PARAM_DATA].offset;
+  const uint8_t* index = f.section_ptr<uint8_t>(bf::SECTION_KERNEL_PARAM_INDEX);
+  for (size_t i = 0; i < n; ++i) {
+    const bf::BinNodeEntry& e = f.node_table()[i];
+    if (e.type != bf::NODE_KERNEL)
+      continue;
+    const auto& k = e.kernel;
+    if (static_cast<size_t>(k.function_name_offset) + k.function_name_length > str_bytes)
+      continue;
+    const std::string_view name(f.string_table() + k.function_name_offset, k.function_name_length);
+    for (const auto& p : g_param_patches) {
+      if (name.find(p.kernel_substr) == std::string_view::npos)
+        continue;
+      const size_t at = static_cast<size_t>(k.param_index_offset) + 8ull * p.param_index;
+      if (p.param_index >= k.num_params || at + sizeof(bf::BinParamEntry) > idx_bytes ||
+          p.width == 0 || p.width > 8) {
+        g_patch_misses++;
+        continue;
+      }
+      bf::BinParamEntry pe;
+      memcpy(&pe, index + at, sizeof(pe));
+      if (static_cast<size_t>(p.byte_offset) + p.width > pe.size ||
+          static_cast<size_t>(pe.data_offset) + pe.size > data_bytes) {
+        g_patch_misses++;
+        continue;
+      }
+      uint64_t v = p.value;
+      memcpy(param_data + pe.data_offset + p.byte_offset, &v, p.width);  // little endian
+      g_patched++;
+    }
+  }
+}
+}  // namespace
+
+void set_param_patches(std::vector<ParamPatch> patches) {
+  g_param_patches = std::move(patches);
+  g_patched = 0;
+  g_patch_misses = 0;
+}
+
+std::pair<uint64_t, uint64_t> param_patch_counts() {
+  return {g_patched.load(), g_patch_misses.load()};
+}
+
 BinaryGraphFile read_binary_graph_file(const std::string& bin_path) {
   namespace bf = binary_format;
   BinaryGraphFile result;
@@ -808,6 +870,7 @@ BinaryGraphFile read_binary_graph_file(const std::string& bin_path) {
   result.sections =
       reinterpret_cast<const bf::SectionEntry*>(result.data.data() + sizeof(bf::FileHeader));
 
+  apply_param_patches(result);
   return result;
 }
 

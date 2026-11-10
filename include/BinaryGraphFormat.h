@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <utility>
+#include <vector>
 
 // Forward declare to avoid pulling in boost/json.hpp in the header
 namespace boost {
@@ -325,5 +327,21 @@ struct BinaryGraphFile {
 // Read a .cugraph file into a BinaryGraphFile (lightweight, no JSON construction).
 // Returns an invalid BinaryGraphFile if the file doesn't exist or has bad format.
 BinaryGraphFile read_binary_graph_file(const std::string& bin_path);
+
+// Archive share (LOAD): kernel-parameter byte patches applied by read_binary_graph_file to
+// every .cugraph it reads, in memory, before any node is built from it. A patch matches every
+// kernel node whose function name contains kernel_substr and writes the low `width` bytes of
+// `value` (little endian) at byte_offset of param param_index. Set before the graph loads start.
+struct ParamPatch {
+  std::string kernel_substr;
+  uint32_t param_index;
+  uint32_t byte_offset;
+  uint32_t width;
+  uint64_t value;
+};
+void set_param_patches(std::vector<ParamPatch> patches);
+// (patched params, params a patch matched by name but could not apply: index or range out of
+// bounds)
+std::pair<uint64_t, uint64_t> param_patch_counts();
 
 }  // namespace foundry

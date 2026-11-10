@@ -209,6 +209,42 @@ def _check_archive_valid(parallel) -> None:
         )
 
 
+def _check_archive_share(parallel) -> None:
+    """LOAD, before anything is set up: with a share manifest at the workspace
+    root, check this rank's configuration and device placement against it and
+    select the canonical rank's archive (+ the "= rank" patches). Every rank
+    checks the device index of EVERY rank of the world (computed from the
+    launch), so all ranks take the same decision and fall back together."""
+    from sglang.srt.runtime_context import get_device, get_server_args
+
+    from foundry.integration.sglang import share
+
+    cfg = get_config()
+    manifest = share.read_manifest(cfg.workspace_root) if cfg is not None else None
+    if manifest is None:
+        return
+    rank = compute_workspace_rank(parallel, *_workspace_ranks(parallel))
+    server_args = get_server_args()
+    dev = get_device()
+    tp_size = int(parallel.tp_size)
+    nnodes = int(getattr(parallel, "nnodes", 1) or 1)
+    per_node = max(tp_size // nnodes, 1)
+    base = int(getattr(dev, "base_gpu_id", 0) or 0)
+    step = int(getattr(dev, "gpu_id_step", 1) or 1)
+    gpu_ids = {r: base + (r % per_node) * step for r in range(tp_size * int(parallel.pp_size))}
+    own = int(dev.gpu_id)
+    if gpu_ids.get(rank) != own:
+        logger.warning(
+            "[Foundry] archive share: computed device of rank %d is cuda:%s, actual cuda:%d",
+            rank,
+            gpu_ids.get(rank),
+            own,
+        )
+        gpu_ids[rank] = own
+    canonical, patches = share.check_load(manifest, rank, server_args, gpu_ids)
+    rt.set_archive_share(canonical, patches)
+
+
 def before_parallel_init(device: str) -> None:
     """Head of ``bootstrap.init_parallel_runtime``: bind this
     rank's VMM region before any communicator exists."""
@@ -220,6 +256,7 @@ def before_parallel_init(device: str) -> None:
     parallel = get_parallel()
     if mode == CUDAGraphExtensionMode.LOAD:
         _check_archive_valid(parallel)
+        _check_archive_share(parallel)
     _disable_dynamo()
     _wait_on_barrier_works()
     rt.hold_cyclic_gc()

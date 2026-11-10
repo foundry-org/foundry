@@ -3,6 +3,8 @@
 #include <c10/cuda/CUDAException.h>
 #include <pybind11/stl.h>
 #include <cstring>
+#include <tuple>
+#include "BinaryGraphFormat.h"
 #include "CUDAGraph.h"
 #include "CUDAGraphInternal.h"
 #include "metadata.h"
@@ -64,6 +66,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("size"),
       "Preallocate memory in the allocation region for fast subsequent allocations");
 
+  m.def(
+      "set_param_patches",
+      [](const std::vector<std::tuple<std::string, uint32_t, uint32_t, uint32_t, uint64_t>>&
+             patches) {
+        std::vector<::foundry::ParamPatch> v;
+        for (const auto& [k, pi, off, w, val] : patches)
+          v.push_back({k, pi, off, w, val});
+        ::foundry::set_param_patches(std::move(v));
+      },
+      py::arg("patches"),
+      "Archive share: (kernel_substr, param_index, byte_offset, width, value) patches applied "
+      "in memory to every .cugraph read afterwards");
+  m.def(
+      "param_patch_counts", []() { return ::foundry::param_patch_counts(); },
+      "(patched params, unappliable matches) since set_param_patches");
   m.def(
       "get_live_region_ranges", []() { return ::foundry::get_live_region_ranges(); },
       "Live (offset, size) ranges inside the allocation region, relative to its base");
