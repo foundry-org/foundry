@@ -410,14 +410,15 @@ def classify(
     noise = 0
     for site, vals in values.items():
         gf, node, param, off, width = site
+        if site in noise_keys:
+            # Differs between SAVEs of one rank: never a rank word, left as captured.
+            noise += 1
+            continue
         adds = {v - r for r, v in vals.items()}
         if param >= 0 and len(vals) == len(members) and len(adds) == 1:
             # The rank id, or the rank id plus a constant (a per-rank counter).
             name = base[gf]["nodes"][node][1]
             rank_sites.add((gf, name, param, off, width, adds.pop()))
-            continue
-        if site in noise_keys:
-            noise += 1
             continue
         unexplained.append((gf, node, base[gf]["nodes"][node][1][:100], param, off, width, vals))
     # A symbolic site is patched on EVERY node whose kernel name contains it:
