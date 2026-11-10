@@ -296,7 +296,7 @@ def _diag_nixl_outside_region(mode, workspace_dir: str) -> None:
                 saved_probe = json.load(f)["probe"]
             patches = []
             for g, k, pi, off, v in d["sites"]:
-                kind = "dispatch" if "8dispatch" in k else "combine"
+                kind = _diag_nixl_kind(k)
                 delta = probe[kind][pi] - saved_probe[kind][pi]
                 patches.append((g, k, pi, off, 8, (v + delta) & 0xFFFFFFFFFFFFFFFF))
             if _archive_share is not None:
@@ -314,6 +314,18 @@ def _diag_nixl_outside_region(mode, workspace_dir: str) -> None:
         return buf
 
     NixlEPBuffer.get_nixl_buffer = classmethod(get_nixl_buffer)
+
+
+def _diag_nixl_kind(kernel_name: str) -> str | None:
+    """DIAGNOSTIC ONLY: the NIXL EP kernel a relocation site belongs to."""
+    for marker, kind in (
+        ("8dispatch", "dispatch"),
+        ("7combine", "combine"),
+        ("query_mask_buffer", "query"),
+    ):
+        if marker in kernel_name:
+            return kind
+    return None
 
 
 def _diag_nixl_probe_params(state) -> dict:
@@ -342,6 +354,7 @@ def _diag_nixl_probe_params(state) -> dict:
         hook()
         _, _, hook2 = buf.combine(y, idx, w, handle, async_finish=False, return_recv_hook=True)
         hook2()
+        buf.query_mask_buffer(torch.zeros(n_ranks, dtype=torch.int32, device="cuda"))
     lib = ctypes.CDLL("libcuda.so.1")
 
     class KParams(ctypes.Structure):  # CUDA_KERNEL_NODE_PARAMS_v2
@@ -377,7 +390,7 @@ def _diag_nixl_probe_params(state) -> dict:
             lib.cuKernelGetName(ctypes.byref(name), ctypes.c_void_p(p.kern))
             info, h = lib.cuKernelGetParamInfo, p.kern
         nm = (name.value or b"").decode()
-        kind = "dispatch" if "8dispatch" in nm else ("combine" if "7combine" in nm else None)
+        kind = _diag_nixl_kind(nm)
         if kind is None or kind in out:
             continue
         vals = []
