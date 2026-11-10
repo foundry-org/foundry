@@ -218,6 +218,10 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
     _ = torch._C._cuda_getCurrentBlasHandle()
     t_blas = time.perf_counter() - t1
     _state = CUDAGraphExtensionState(rank=rank)
+    if os.environ.get("FOUNDRY_DIAG_MEMHIST") == "1":
+        # DIAGNOSTIC ONLY (eep-archive-share study): caching-allocator history with Python stacks
+        # from here to the end of SAVE, dumped by record_region_layout (memhist.pickle).
+        torch.cuda.memory._record_memory_history(max_entries=1000000, stacks="python")
     logger.info(
         "[Foundry] SGLang graph extension setup completed in %.3f s "
         "(binary restore %.3f s, region reserve %.3f s, cuBLAS handle %.3f s)",
@@ -372,6 +376,12 @@ def record_region_layout() -> int:
             state.final_alloc_offset = _final_alloc_offset
             save_warmup_state(state)
     logger.info("[Foundry] SGLang final_alloc_offset=%d", _final_alloc_offset)
+    if os.environ.get("FOUNDRY_DIAG_MEMHIST") == "1" and cfg.workspace_dir is not None:
+        # DIAGNOSTIC ONLY (eep-archive-share study)
+        import pickle
+
+        with open(os.path.join(cfg.workspace_dir, "memhist.pickle"), "wb") as f:
+            pickle.dump(torch.cuda.memory._snapshot(), f)
     if cfg.workspace_dir is not None and os.environ.get("FOUNDRY_SGLANG_CHECK_ARCHIVE") == "1":
         # Opt-in (reads every .cugraph): report graph pointers that LOAD will not have.
         from foundry.integration.sglang import archive_check

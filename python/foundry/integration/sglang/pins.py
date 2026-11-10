@@ -453,6 +453,13 @@ def _unreplayable_plan(server_args: Any) -> tuple[list[str], dict[str, Any], lis
     for pin in FIELD_PINS:
         if not hasattr(server_args, pin.field):
             continue
+        # DIAGNOSTIC ONLY (eep-archive-share study): two ranks per GPU / one GPU per
+        # process, where torch symmetric memory's rendezvous rejects shared ordinals.
+        if (
+            pin.field == "enable_torch_symm_mem"
+            and os.environ.get("FOUNDRY_DIAG_SKIP_SYMM_MEM_PIN") == "1"
+        ):
+            continue
         raw = getattr(server_args, pin.field)
         if _contrary(pin, raw):
             errors.append(f"{pin.flag}={raw!r}: {pin.reason}")
