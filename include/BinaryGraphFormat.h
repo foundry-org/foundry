@@ -333,6 +333,7 @@ BinaryGraphFile read_binary_graph_file(const std::string& bin_path);
 // kernel node whose function name contains kernel_substr and writes the low `width` bytes of
 // `value` (little endian) at byte_offset of param param_index. Set before the graph loads start.
 struct ParamPatch {
+  std::string graph_file;  // basename of the .cugraph it applies to; empty = every file
   std::string kernel_substr;
   uint32_t param_index;
   uint32_t byte_offset;

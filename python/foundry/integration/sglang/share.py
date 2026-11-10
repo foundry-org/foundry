@@ -177,7 +177,12 @@ def check_load(manifest: dict, rank: int, server_args, gpu_ids: dict[int, int]) 
     for s in manifest["patch_sites"]:
         if s["value"] != "rank":
             refuse(f"patch site value {s['value']!r} is not supported")
-        patches.append((s["kernel"], s["param"], s["offset"], s["width"], rank))
+        value = rank + int(s.get("add", 0))
+        if value < 0 or value >= 1 << (8 * int(s["width"])):
+            refuse(f"patch value {value} does not fit {s['width']} byte(s) at {s['kernel'][:60]}")
+        patches.append(
+            (s.get("graph", ""), s["kernel"], s["param"], s["offset"], s["width"], value)
+        )
     return canonical, patches
 
 
@@ -365,7 +370,7 @@ def classify(
 
     ``members``: rank -> {graph file: loaded graph} (the canonical rank included);
     ``controls``: rank -> graphs of a second SAVE of the same rank, or None.
-    Returns {"rank_sites": [(kernel, param, offset, width)], "noise": n,
+    Returns {"rank_sites": [(graph, kernel, param, offset, width, add)], "noise": n,
     "unexplained": [(graph, node, kernel, param, offset, width, values)]}."""
     base = members[canonical]
     noise_keys = set()
@@ -389,9 +394,11 @@ def classify(
     noise = 0
     for site, vals in values.items():
         gf, node, param, off, width = site
-        if param >= 0 and len(vals) == len(members) and all(v == r for r, v in vals.items()):
+        adds = {v - r for r, v in vals.items()}
+        if param >= 0 and len(vals) == len(members) and len(adds) == 1:
+            # The rank id, or the rank id plus a constant (a per-rank counter).
             name = base[gf]["nodes"][node][1]
-            rank_sites.add((name, param, off, width))
+            rank_sites.add((gf, name, param, off, width, adds.pop()))
             continue
         if site in noise_keys:
             noise += 1
@@ -400,8 +407,10 @@ def classify(
     # A symbolic site is patched on EVERY node whose kernel name contains it:
     # each such node must hold the rank there on every rank of the class.
     checked = []
-    for name, param, off, width in sorted(rank_sites):
+    for gfile, name, param, off, width, add in sorted(rank_sites):
         for gf, g in base.items():
+            if gf != gfile:
+                continue
             for i, node in enumerate(g["nodes"]):
                 if node[0] != "kernel" or name not in node[1]:
                     continue
@@ -410,13 +419,13 @@ def classify(
                     ok = (
                         param < len(p)
                         and off + width <= len(p[param])
-                        and int.from_bytes(p[param][off : off + width], "little") == r
+                        and int.from_bytes(p[param][off : off + width], "little") == r + add
                     )
                     if not ok:
                         unexplained.append(
-                            (gf, i, node[1][:100], param, off, width, f"rank {r}: not the rank id")
+                            (gf, i, node[1][:100], param, off, width, f"rank {r}: not rank + {add}")
                         )
-        checked.append((name, param, off, width))
+        checked.append((gfile, name, param, off, width, add))
     return {"rank_sites": checked, "noise": noise, "unexplained": unexplained}
 
 
@@ -493,7 +502,9 @@ def make_manifest(
         f"[Foundry share] {len(ranks)} ranks, {len(classes)} class(es): "
         + "; ".join(f"rank_{c} <- {v['members']}" for c, v in report.items())
     )
-    out(f"[Foundry share] '= rank' sites: {sorted(sites)}")
+    out(f"[Foundry share] {len(sites)} '= rank (+ constant)' site(s):")
+    for g, k, p, o, w, a in sorted(sites):
+        out(f"    {g} {k[:70]} param {p} +{o} ({w} B) = rank + {a}")
     if unexplained_all:
         out(
             f"[Foundry share] {len(unexplained_all)} differing words are neither the rank id nor "
@@ -516,8 +527,16 @@ def make_manifest(
         "device_index": device_index,
         "signature": {c: sigs[int(c)] for c in device_index},
         "patch_sites": [
-            {"kernel": k, "param": p, "offset": o, "width": w, "value": "rank"}
-            for k, p, o, w in sorted(sites)
+            {
+                "graph": g,
+                "kernel": k,
+                "param": p,
+                "offset": o,
+                "width": w,
+                "value": "rank",
+                "add": a,
+            }
+            for g, k, p, o, w, a in sorted(sites)
         ],
         "verification": {
             "control": os.path.abspath(control) if control else None,

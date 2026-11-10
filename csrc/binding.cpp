@@ -68,15 +68,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def(
       "set_param_patches",
-      [](const std::vector<std::tuple<std::string, uint32_t, uint32_t, uint32_t, uint64_t>>&
-             patches) {
+      [](const std::vector<
+          std::tuple<std::string, std::string, uint32_t, uint32_t, uint32_t, uint64_t>>& patches) {
         std::vector<::foundry::ParamPatch> v;
-        for (const auto& [k, pi, off, w, val] : patches)
-          v.push_back({k, pi, off, w, val});
+        for (const auto& [g, k, pi, off, w, val] : patches)
+          v.push_back({g, k, pi, off, w, val});
         ::foundry::set_param_patches(std::move(v));
       },
       py::arg("patches"),
-      "Archive share: (kernel_substr, param_index, byte_offset, width, value) patches applied "
+      "Archive share: (graph_file, kernel_substr, param_index, byte_offset, width, value) "
+      "patches applied "
       "in memory to every .cugraph read afterwards");
   m.def(
       "param_patch_counts", []() { return ::foundry::param_patch_counts(); },

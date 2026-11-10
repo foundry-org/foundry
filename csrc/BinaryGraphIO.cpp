@@ -789,10 +789,12 @@ std::vector<ParamPatch> g_param_patches;
 std::atomic<uint64_t> g_patched{0};
 std::atomic<uint64_t> g_patch_misses{0};
 
-void apply_param_patches(BinaryGraphFile& f) {
+void apply_param_patches(BinaryGraphFile& f, const std::string& path) {
   namespace bf = binary_format;
   if (g_param_patches.empty())
     return;
+  const size_t slash = path.find_last_of('/');
+  const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
   const size_t n = f.header.num_nodes;
   const size_t node_bytes = f.section_size(bf::SECTION_NODE_TABLE);
   const size_t idx_bytes = f.section_size(bf::SECTION_KERNEL_PARAM_INDEX);
@@ -811,6 +813,8 @@ void apply_param_patches(BinaryGraphFile& f) {
       continue;
     const std::string_view name(f.string_table() + k.function_name_offset, k.function_name_length);
     for (const auto& p : g_param_patches) {
+      if (!p.graph_file.empty() && p.graph_file != base)
+        continue;
       if (name.find(p.kernel_substr) == std::string_view::npos)
         continue;
       const size_t at = static_cast<size_t>(k.param_index_offset) + 8ull * p.param_index;
@@ -870,7 +874,7 @@ BinaryGraphFile read_binary_graph_file(const std::string& bin_path) {
   result.sections =
       reinterpret_cast<const bf::SectionEntry*>(result.data.data() + sizeof(bf::FileHeader));
 
-  apply_param_patches(result);
+  apply_param_patches(result, bin_path);
   return result;
 }
 
