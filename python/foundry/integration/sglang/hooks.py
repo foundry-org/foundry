@@ -261,6 +261,16 @@ def _check_archive_share(parallel) -> None:
         # DIAGNOSTIC: a scale joiner's NIXL rank argument is its global rank.
         patch_rank = rank + int(getattr(parallel, "ep_join_rank_offset", 0) or 0)
     canonical, patches = share.check_load(manifest, patch_rank, server_args, gpu_ids)
+    if os.environ.get("FOUNDRY_DIAG_ELASTIC_JOINER") == "1":
+        logger.info(
+            "[Foundry] DIAG rank patch: rank=%d ep_join_rank_offset=%s patch_rank=%d "
+            "canonical=%d values=%s",
+            rank,
+            getattr(parallel, "ep_join_rank_offset", None),
+            patch_rank,
+            canonical,
+            sorted({p[-1] for p in patches}),
+        )
     rt.set_archive_share(canonical, patches)
 
 
