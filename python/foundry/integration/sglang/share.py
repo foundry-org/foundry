@@ -155,6 +155,20 @@ def _differs(field: str, archive, this) -> str:
     return f"{field} differs (archive {archive!r}, this rank {this!r})"
 
 
+# DIAGNOSTIC ONLY (cross-size LOAD study): with FOUNDRY_DIAG_SHARE_ANY_EP_SIZE=1 a manifest
+# from another EP size is accepted. Only the fields that scale with the EP size at a fixed
+# per-rank configuration (S slots, per-rank pool and chunk) are skipped; all others are checked.
+_DIAG_ANY_EP_SIZE_FIELDS = (
+    "tp_size",
+    "ep_size",
+    "attn_dp_size",
+    "dp_size",
+    "ep_num_redundant_experts",
+    "max_running_requests",
+    "chunked_prefill_size",
+)
+
+
 def check_load(manifest: dict, rank: int, server_args, gpu_ids: dict[int, int]) -> tuple[int, list]:
     """LOAD: (canonical rank, patches with this rank's values) or raise
     ``Unsupported``. ``gpu_ids``: the device index of every rank of the world as
@@ -167,14 +181,20 @@ def check_load(manifest: dict, rank: int, server_args, gpu_ids: dict[int, int]) 
 
     if manifest.get("format_version") != FORMAT_VERSION:
         refuse(_differs("format_version", manifest.get("format_version"), FORMAT_VERSION))
+    any_size = os.environ.get("FOUNDRY_DIAG_SHARE_ANY_EP_SIZE") == "1"
     fields = config_fields(server_args)
     for k, v in manifest["fields"].items():
+        if any_size and k in _DIAG_ANY_EP_SIZE_FIELDS:
+            continue
         if fields.get(k) != v:
             refuse(_differs(k, v, fields.get(k)))
     world = manifest["world_size"]
-    if len(gpu_ids) != world:
+    if len(gpu_ids) != world and not any_size:
         refuse(_differs("world_size", world, len(gpu_ids)))
     rank_map = {int(r): int(c) for r, c in manifest["rank_map"].items()}
+    if any_size:
+        canonical_rank = min(rank_map.values())
+        rank_map = {r: rank_map.get(r, canonical_rank) for r in gpu_ids}
     if rank not in rank_map:
         refuse(f"rank {rank} is not in the manifest's rank map")
     devices = {int(c): int(d) for c, d in manifest["device_index"].items()}
