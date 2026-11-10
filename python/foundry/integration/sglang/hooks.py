@@ -9,6 +9,7 @@ import contextlib
 import dataclasses
 import gc
 import logging
+import os
 import threading
 import time
 from dataclasses import asdict
@@ -209,6 +210,70 @@ def _check_archive_valid(parallel) -> None:
         )
 
 
+def _check_archive_share(parallel) -> None:
+    """LOAD, before anything is set up: with a share manifest at the workspace
+    root, check this rank's configuration and device placement against it and
+    select the canonical rank's archive (+ the "= rank" patches). Every rank
+    checks the device index of EVERY rank of the world (computed from the
+    launch), so all ranks take the same decision and fall back together."""
+    from sglang.srt.runtime_context import get_device, get_server_args
+
+    from foundry.integration.sglang import share
+
+    cfg = get_config()
+    manifest = share.read_manifest(cfg.workspace_root) if cfg is not None else None
+    if manifest is None:
+        return
+    rank = compute_workspace_rank(parallel, *_workspace_ranks(parallel))
+    server_args = get_server_args()
+    dev = get_device()
+    tp_size = int(parallel.tp_size)
+    nnodes = int(getattr(parallel, "nnodes", 1) or 1)
+    per_node = max(tp_size // nnodes, 1)
+    base = int(getattr(dev, "base_gpu_id", 0) or 0)
+    step = int(getattr(dev, "gpu_id_step", 1) or 1)
+    world = tp_size * int(parallel.pp_size)
+    try:
+        from sglang.srt.environ import envs
+
+        one_visible = bool(envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get())
+    except Exception:
+        one_visible = os.environ.get("SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS", "").lower() in (
+            "1",
+            "true",
+        )
+    if one_visible:
+        # sglang utils/device.py maybe_reindex_device_id: every worker sees its GPU as 0.
+        gpu_ids = {r: 0 for r in range(world)}
+    else:
+        gpu_ids = {r: base + (r % per_node) * step for r in range(world)}
+    own = int(dev.gpu_id)
+    if gpu_ids.get(rank) != own:
+        # The launch placement is not the one this check assumes: refuse rather than
+        # load with a wrong device assumption (this rank alone; logged loudly).
+        raise Unsupported(
+            "archive share",
+            f"device placement unknown (computed cuda:{gpu_ids.get(rank)} for rank {rank}, "
+            f"actual cuda:{own})",
+        )
+    patch_rank = rank
+    if os.environ.get("FOUNDRY_DIAG_ELASTIC_JOINER") == "1":
+        # DIAGNOSTIC: a scale joiner's NIXL rank argument is its global rank.
+        patch_rank = rank + int(getattr(parallel, "ep_join_rank_offset", 0) or 0)
+    canonical, patches = share.check_load(manifest, patch_rank, server_args, gpu_ids)
+    if os.environ.get("FOUNDRY_DIAG_ELASTIC_JOINER") == "1":
+        logger.info(
+            "[Foundry] DIAG rank patch: rank=%d ep_join_rank_offset=%s patch_rank=%d "
+            "canonical=%d values=%s",
+            rank,
+            getattr(parallel, "ep_join_rank_offset", None),
+            patch_rank,
+            canonical,
+            sorted({p[-1] for p in patches}),
+        )
+    rt.set_archive_share(canonical, patches)
+
+
 def before_parallel_init(device: str) -> None:
     """Head of ``bootstrap.init_parallel_runtime``: bind this
     rank's VMM region before any communicator exists."""
@@ -220,6 +285,7 @@ def before_parallel_init(device: str) -> None:
     parallel = get_parallel()
     if mode == CUDAGraphExtensionMode.LOAD:
         _check_archive_valid(parallel)
+        _check_archive_share(parallel)
     _disable_dynamo()
     _wait_on_barrier_works()
     rt.hold_cyclic_gc()

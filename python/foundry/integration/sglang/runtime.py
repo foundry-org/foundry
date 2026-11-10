@@ -83,6 +83,9 @@ _LAYOUT_FILE = "region_layout.json"
 # allocates the per-bs wrappers in another order; LOAD cannot replay it).
 CAPTURE_LOOP_VERSION = 2
 _layout_start_offset: int | None = None
+# LOAD with a share manifest: (canonical rank, [(kernel, param, offset, width, value)]),
+# set by hooks.before_parallel_init after the manifest check.
+_archive_share: tuple[int, list] | None = None
 _final_alloc_offset: int = 0
 # Written by a SAVE that fell back (api.deactivate) into its rank's workspace
 # and the workspace root; LOAD falls back when it finds either.
@@ -181,7 +184,25 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
     rank = compute_workspace_rank(server_args, tp_rank, pp_rank, dp_rank)
     Path(cfg.workspace_root).mkdir(parents=True, exist_ok=True)
     workspace_dir = Path(cfg.workspace_root) / f"rank_{rank}"
+    if cfg.mode == CUDAGraphExtensionMode.LOAD and _archive_share is not None:
+        # Archive share: restore the canonical rank's archive; the "= rank" sites
+        # are written into the param bytes as each .cugraph is read.
+        canonical, patches = _archive_share
+        workspace_dir = Path(cfg.workspace_root) / f"rank_{canonical}"
+        cge.set_param_patches(patches)
+        logger.info(
+            "[Foundry] archive share: rank %d restores rank_%d with %d '= rank' patch site(s)",
+            rank,
+            canonical,
+            len(patches),
+        )
     cfg.workspace_dir = str(workspace_dir)
+    logger.info(
+        "[Foundry] SGLang rank=%d device=cuda:%d CUDA_VISIBLE_DEVICES=%s",
+        rank,
+        torch.cuda.current_device(),
+        os.environ.get("CUDA_VISIBLE_DEVICES"),
+    )
     logger.info(
         "[Foundry] SGLang rank=%d (tp_rank=%d pp_rank=%d dp_rank=%s replica=%d "
         "attention_dp=%s) workspace_dir=%s",
@@ -198,6 +219,9 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
         if workspace_dir.exists():
             shutil.rmtree(workspace_dir)
         workspace_dir.mkdir(parents=True, exist_ok=True)
+        from foundry.integration.sglang import share
+
+        share.write_rank_config(str(workspace_dir), rank, server_args, torch.cuda.current_device())
         # A marker of an earlier SAVE; this SAVE writes its own only after the
         # ranks agreed at a capture scope, which every rank reaches after this.
         (Path(cfg.workspace_root) / _INVALID_FILE).unlink(missing_ok=True)
@@ -218,6 +242,12 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
     _ = torch._C._cuda_getCurrentBlasHandle()
     t_blas = time.perf_counter() - t1
     _state = CUDAGraphExtensionState(rank=rank)
+    if os.environ.get("FOUNDRY_DIAG_MEMHIST") == "1":
+        # DIAGNOSTIC ONLY (eep-archive-share study): caching-allocator history with Python stacks
+        # from here to the end of SAVE, dumped by record_region_layout (memhist.pickle).
+        torch.cuda.memory._record_memory_history(max_entries=1000000, stacks="python")
+    if os.environ.get("FOUNDRY_DIAG_NIXL_OUTSIDE_REGION") == "1":
+        _diag_nixl_outside_region(cfg.mode, str(workspace_dir))
     logger.info(
         "[Foundry] SGLang graph extension setup completed in %.3f s "
         "(binary restore %.3f s, region reserve %.3f s, cuBLAS handle %.3f s)",
@@ -226,6 +256,156 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
         t_region,
         t_blas,
     )
+
+
+def _diag_nixl_outside_region(mode, workspace_dir: str) -> None:
+    """DIAGNOSTIC ONLY (NIXL EP study): build the NIXL EP buffer with the region
+    suspended (its cuMemAlloc fallback otherwise lands in a region chunk that UCX
+    cuda_ipc cannot map) and log the driver-placed addresses for SAVE vs LOAD.
+    Both modes capture a probe graph (_diag_nixl_probe_params); SAVE stores its
+    params in <rank>/nixl_diag.json. LOAD, when the rank dir holds nixl_reloc.json
+    (sites made offline from the SAVE archive), moves every listed param word by
+    the probe's LOAD - SAVE difference of the same kernel and param index. A single
+    delta is wrong: NIXL's allocations do not keep their relative placement."""
+    from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+    orig = NixlEPBuffer.get_nixl_buffer.__func__
+
+    def get_nixl_buffer(cls, *args, **kwargs):
+        if cls._state().buffer is not None:
+            return orig(cls, *args, **kwargs)
+        with allocation_region_suspended():
+            buf = orig(cls, *args, **kwargs)
+            probe = _diag_nixl_probe_params(cls._state())
+        rdma = buf.get_local_buffer_tensor(torch.uint8, use_rdma_buffer=True)
+        base = rdma.data_ptr()
+        logger.info(
+            "[Foundry] DIAG nixl buffer outside region: rdma_buffer=0x%x size=%d probe=%s",
+            base,
+            rdma.numel(),
+            {k: [hex(v) for v in vs] for k, vs in probe.items()},
+        )
+        if mode == CUDAGraphExtensionMode.SAVE:
+            with open(os.path.join(workspace_dir, "nixl_diag.json"), "w") as f:
+                json.dump({"rdma_base": base, "rdma_size": rdma.numel(), "probe": probe}, f)
+        reloc = os.path.join(workspace_dir, "nixl_reloc.json")
+        if mode == CUDAGraphExtensionMode.LOAD and os.path.exists(reloc):
+            with open(reloc) as f:
+                d = json.load(f)
+            with open(os.path.join(workspace_dir, "nixl_diag.json")) as f:
+                saved_probe = json.load(f)["probe"]
+            patches = []
+            for g, k, pi, off, v in d["sites"]:
+                kind = _diag_nixl_kind(k)
+                delta = probe[kind][pi] - saved_probe[kind][pi]
+                patches.append((g, k, pi, off, 8, (v + delta) & 0xFFFFFFFFFFFFFFFF))
+            if _archive_share is not None:
+                patches += _archive_share[1]  # set_param_patches replaces, keep the rank sites
+            cge.set_param_patches(patches)
+            deltas = {
+                kind: [hex(a - b) for a, b in zip(probe[kind], saved_probe[kind]) if a != b]
+                for kind in probe
+            }
+            logger.info(
+                "[Foundry] DIAG nixl relocation over %d site(s); probe deltas %s",
+                len(patches),
+                deltas,
+            )
+        return buf
+
+    NixlEPBuffer.get_nixl_buffer = classmethod(get_nixl_buffer)
+
+
+def _diag_nixl_kind(kernel_name: str) -> str | None:
+    """DIAGNOSTIC ONLY: the NIXL EP kernel a relocation site belongs to."""
+    for marker, kind in (
+        ("8dispatch", "dispatch"),
+        ("7combine", "combine"),
+        ("query_mask_buffer", "query"),
+    ):
+        if marker in kernel_name:
+            return kind
+    return None
+
+
+def _diag_nixl_probe_params(state) -> dict:
+    """DIAGNOSTIC ONLY: capture (never replay) one NIXL dispatch + combine with
+    the engine's buffer and return each kernel's 8-byte params by index; run with
+    the region suspended so the probe's tensors and graph stay out of the layout."""
+    import ctypes
+
+    from nixl_ep import topk_idx_t
+
+    buf = state.buffer
+    n_ranks = state.max_ranks  # NIXL rank_bound = num_experts / num_local_experts, as the engine
+    hidden, max_tok = state.hidden_size, state.num_max_dispatch_tokens_per_rank
+    n_exp = state.num_local_experts * n_ranks
+    x = torch.zeros(1, hidden, dtype=torch.bfloat16, device="cuda")
+    idx = torch.arange(8, dtype=topk_idx_t, device="cuda").view(1, 8)
+    w = torch.ones(1, 8, dtype=torch.float32, device="cuda")
+    y = torch.zeros(
+        state.num_local_experts, max_tok * n_ranks, hidden, dtype=torch.bfloat16, device="cuda"
+    )
+    g = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(g, capture_error_mode="thread_local"):
+        _, _, handle, _, hook = buf.dispatch(
+            x, idx, max_tok, n_exp, use_fp8=True, async_finish=False, return_recv_hook=True
+        )
+        hook()
+        _, _, hook2 = buf.combine(y, idx, w, handle, async_finish=False, return_recv_hook=True)
+        hook2()
+        buf.query_mask_buffer(torch.zeros(n_ranks, dtype=torch.int32, device="cuda"))
+    lib = ctypes.CDLL("libcuda.so.1")
+
+    class KParams(ctypes.Structure):  # CUDA_KERNEL_NODE_PARAMS_v2
+        _fields_ = (
+            [("func", ctypes.c_void_p)]
+            + [(f, ctypes.c_uint) for f in ["gx", "gy", "gz", "bx", "by", "bz", "smem"]]
+            + [
+                ("kernelParams", ctypes.POINTER(ctypes.c_void_p)),
+                ("extra", ctypes.c_void_p),
+                ("kern", ctypes.c_void_p),
+                ("ctx", ctypes.c_void_p),
+            ]
+        )
+
+    graph = ctypes.c_void_p(int(g.raw_cuda_graph()))
+    n = ctypes.c_size_t(0)
+    lib.cuGraphGetNodes(graph, None, ctypes.byref(n))
+    nodes = (ctypes.c_void_p * n.value)()
+    lib.cuGraphGetNodes(graph, nodes, ctypes.byref(n))
+    out = {}
+    for node in nodes:
+        t = ctypes.c_int(-1)
+        lib.cuGraphNodeGetType(ctypes.c_void_p(node), ctypes.byref(t))
+        if t.value != 0:
+            continue
+        p = KParams()
+        lib.cuGraphKernelNodeGetParams_v2(ctypes.c_void_p(node), ctypes.byref(p))
+        name = ctypes.c_char_p()
+        if p.func:
+            lib.cuFuncGetName(ctypes.byref(name), ctypes.c_void_p(p.func))
+            info, h = lib.cuFuncGetParamInfo, p.func
+        else:
+            lib.cuKernelGetName(ctypes.byref(name), ctypes.c_void_p(p.kern))
+            info, h = lib.cuKernelGetParamInfo, p.kern
+        nm = (name.value or b"").decode()
+        kind = _diag_nixl_kind(nm)
+        if kind is None or kind in out:
+            continue
+        vals = []
+        for i in range(64):
+            off, sz = ctypes.c_size_t(0), ctypes.c_size_t(0)
+            if (
+                info(ctypes.c_void_p(h), ctypes.c_size_t(i), ctypes.byref(off), ctypes.byref(sz))
+                != 0
+            ):
+                break
+            raw = ctypes.string_at(p.kernelParams[i], sz.value)
+            vals.append(int.from_bytes(raw[:8].ljust(8, b"\0"), "little") if sz.value == 8 else 0)
+        out[kind] = vals
+    del g
+    return out
 
 
 @contextlib.contextmanager
@@ -372,6 +552,12 @@ def record_region_layout() -> int:
             state.final_alloc_offset = _final_alloc_offset
             save_warmup_state(state)
     logger.info("[Foundry] SGLang final_alloc_offset=%d", _final_alloc_offset)
+    if os.environ.get("FOUNDRY_DIAG_MEMHIST") == "1" and cfg.workspace_dir is not None:
+        # DIAGNOSTIC ONLY (eep-archive-share study)
+        import pickle
+
+        with open(os.path.join(cfg.workspace_dir, "memhist.pickle"), "wb") as f:
+            pickle.dump(torch.cuda.memory._snapshot(), f)
     if cfg.workspace_dir is not None and os.environ.get("FOUNDRY_SGLANG_CHECK_ARCHIVE") == "1":
         # Opt-in (reads every .cugraph): report graph pointers that LOAD will not have.
         from foundry.integration.sglang import archive_check
@@ -382,6 +568,15 @@ def record_region_layout() -> int:
             )
         )
     return _final_alloc_offset
+
+
+def set_archive_share(canonical: int, patches: list) -> None:
+    global _archive_share
+    _archive_share = (canonical, patches)
+
+
+def archive_share_active() -> bool:
+    return _archive_share is not None
 
 
 def check_capture_loop_version() -> None:
@@ -479,6 +674,12 @@ def log_alloc_offset(label: str) -> None:
     if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
         return
     offset = cge.get_current_alloc_offset()
+    if os.environ.get("FOUNDRY_DIAG_MEMHIST_DUMP_AT") == label and cfg.workspace_dir is not None:
+        # DIAGNOSTIC ONLY: allocator history up to this checkpoint (needs FOUNDRY_DIAG_MEMHIST=1).
+        import pickle
+
+        with open(os.path.join(cfg.workspace_dir, f"memhist_{label}.pickle"), "wb") as f:
+            pickle.dump(torch.cuda.memory._snapshot(), f)
     # Free device memory alongside the region offset: LOAD ends with less free
     # memory than SAVE at identical offsets (resident kernel images, reserved
     # ranges SAVE had already freed), and this trail is how that gap is measured.
