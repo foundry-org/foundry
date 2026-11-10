@@ -86,59 +86,47 @@ def _i32(v):
     return int(v).to_bytes(4, "little")
 
 
-def _rank_graph(r, junk=b"\0\0\0\0", ptr=b"\x00\x10\x00\x00"):
+DISPATCH = "_ZN7deep_ep6legacy12internode_ll8dispatchILb1E"
+COMBINE = "_ZN7deep_ep6legacy12internode_ll7combineILb0E"
+
+
+def _dispatch_params(r):
+    return [b"\0" * 8] * 22 + [_i32(r), _i32(2)]
+
+
+def _rank_graph(r, junk=b"\0\0\0\0"):
+    combine = [b"\0" * 8] * 19 + [_i32(r)]
     return {
         "g.cugraph": _graph(
             [
-                ("deep_ep::dispatch", [ptr, _i32(7), _i32(r)]),
-                ("fa3", [b"\x01\x00\x00\x00" + junk]),
-                ("deep_ep::dispatch", [ptr, _i32(7), _i32(r)]),
+                (DISPATCH, _dispatch_params(r)),
+                ("nvjet_sm90_tst", [b"\x01\x00\x00\x00" + junk]),
+                (COMBINE, combine),
             ]
         )
     }
 
 
-def test_classify_rank_sites_and_control_noise():
-    members = {0: _rank_graph(0, junk=b"AAAA"), 1: _rank_graph(1, junk=b"BBBB")}
-    controls = {0: _rank_graph(0, junk=b"CCCC"), 1: _rank_graph(1, junk=b"DDDD")}
-    res = share.classify(0, members, controls)
-    assert res["rank_sites"] == [("g.cugraph", "deep_ep::dispatch", 2, 0, 4, 0)]
-    assert res["noise"] == 1
+def test_classify_patches_only_declared_rank_args():
+    members = {0: _rank_graph(0, junk=_i32(872)), 1: _rank_graph(1, junk=_i32(873))}
+    res = share.classify(0, members, None)
+    assert res["rank_sites"] == [("", COMBINE, 19, 0, 4), ("", DISPATCH, 22, 0, 4)]
+    # The nvjet word (872 + rank) is reused as captured, not patched.
+    assert res["reused"] == {"cuBLAS nvjet": 1}
     assert res["unexplained"] == []
 
 
-def test_classify_refuses_unexplained_words():
-    # A pointer that differs between ranks but not between two SAVEs of a rank.
-    members = {0: _rank_graph(0), 1: _rank_graph(1, ptr=b"\x00\x12\x00\x00")}
-    controls = {0: _rank_graph(0), 1: _rank_graph(1, ptr=b"\x00\x12\x00\x00")}
+def test_classify_control_only_reports_noise():
+    members = {0: _rank_graph(0, junk=b"AAAA"), 1: _rank_graph(1, junk=b"BBBB")}
+    controls = {0: _rank_graph(0, junk=b"CCCC"), 1: _rank_graph(1, junk=b"DDDD")}
     res = share.classify(0, members, controls)
-    assert res["unexplained"] and res["unexplained"][0][3] == 0
+    assert res["reused"] == {"cuBLAS nvjet": 1} and res["control_noise"] == 1
+    assert res["unexplained"] == []
 
 
-def test_classify_symbolic_site_must_hold_on_every_matching_node():
-    # The second dispatch node holds a constant where the first holds the rank:
-    # patching by kernel name would corrupt it, so it is reported.
+def test_classify_refuses_declared_arg_without_rank():
     def graph(r):
-        return {
-            "g.cugraph": _graph(
-                [("deep_ep::dispatch", [_i32(r)]), ("deep_ep::dispatch", [_i32(0)])]
-            )
-        }
+        return {"g.cugraph": _graph([(DISPATCH, _dispatch_params(0))])}
 
     res = share.classify(0, {0: graph(0), 1: graph(1)}, None)
-    assert res["rank_sites"] == [("g.cugraph", "deep_ep::dispatch", 0, 0, 4, 0)]
-    assert any("not rank + 0" in str(u[-1]) for u in res["unexplained"])
-
-
-def test_classify_rank_plus_constant_and_load_value():
-    def graph(r):
-        return {"g.cugraph": _graph([("nvjet", [_i32(872 + r)]), ("nvjet", [_i32(872 + r)])])}
-
-    res = share.classify(0, {0: graph(0), 1: graph(1)}, None)
-    assert res["rank_sites"] == [("g.cugraph", "nvjet", 0, 0, 4, 872)] and res["unexplained"] == []
-    m = _manifest(
-        patch_sites=[
-            {"kernel": "nvjet", "param": 0, "offset": 0, "width": 4, "value": "rank", "add": 872}
-        ]
-    )
-    assert share.check_load(m, 1, _args(), {0: 0, 1: 0})[1] == [("", "nvjet", 0, 0, 4, 873)]
+    assert any("not the rank id" in str(u[-1]) for u in res["unexplained"])

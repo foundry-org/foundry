@@ -8,13 +8,14 @@ post-SAVE tool groups ranks whose archives are identical up to kernel
 parameters equal to the rank id, writes ``share_manifest.json`` at the
 workspace root and can prune the non-canonical rank directories::
 
-    python -m foundry.integration.sglang.share make <workspace> [--control <workspace2>]
-        [--assume-noise] [--prune]
+    python -m foundry.integration.sglang.share make <workspace> [--control <ws2>]... [--prune]
 
-``--control`` is a second SAVE of the same configuration: parameter words that
-differ between two SAVEs of the same rank are uninitialised host bytes and are
-ignored. Without a control, differing words that are not the rank id refuse the
-manifest unless ``--assume-noise`` is given (their count is then recorded).
+Only declared library arguments that carry the rank id are patched
+(:data:`DECLARED_RANK_ARGS`: DeepEP low-latency dispatch / combine ``rank``); the
+tool verifies that each holds the rank on every rank and refuses otherwise. All
+other differing parameter words are reused from the canonical rank as captured
+and reported by kernel family; ``--control`` (other SAVEs of the same
+configuration) only reports how many of them are same-rank noise.
 
 LOAD with a manifest: before anything is set up, this rank's configuration is
 checked against the manifest (:func:`check_load`); a mismatch raises
@@ -373,18 +374,80 @@ def param_diffs(ga: dict, gb: dict) -> dict:
     return out
 
 
+# Declared rank arguments: (kernel-name substrings that must all occur, param index, byte
+# offset, width). Only these words are patched on LOAD; every other differing word is
+# reused from the canonical rank as captured.
+DECLARED_RANK_ARGS = (
+    (("deep_ep", "internode_ll", "8dispatch"), 22, 0, 4),  # DeepEP LL dispatch(..., int rank, ...)
+    (("deep_ep", "internode_ll", "7combine"), 19, 0, 4),  # DeepEP LL combine(..., int rank, ...)
+)
+
+_FAMILIES = (
+    ("deep_ep", "DeepEP"),
+    ("flashinfer", "FlashInfer"),
+    ("flash", "FlashAttention"),
+    ("nvjet", "cuBLAS nvjet"),
+    ("cublas", "cuBLAS"),
+    ("deep_gemm", "DeepGEMM"),
+    ("nccl", "NCCL"),
+    ("at6native", "ATen"),
+    ("sglang", "sglang kernels"),
+    ("triton", "Triton"),
+)
+
+
+def kernel_family(name: str) -> str:
+    low = name.lower()
+    for key, fam in _FAMILIES:
+        if key in low:
+            return fam
+    return "other"
+
+
+def _declared(name: str):
+    for subs, param, off, width in DECLARED_RANK_ARGS:
+        if all(s in name for s in subs):
+            return param, off, width
+    return None
+
+
 def classify(
     canonical: int,
     members: dict[int, dict],
-    controls: dict[int, dict] | None,
+    controls: dict[int, Any] | None,
 ) -> dict:
-    """Classify the parameter differences of the ranks of one class.
+    """Parameter differences of the ranks of one class.
 
-    ``members``: rank -> {graph file: loaded graph} (the canonical rank included);
-    ``controls``: rank -> graphs of a second SAVE of the same rank, or None.
-    Returns {"rank_sites": [(graph, kernel, param, offset, width, add)], "noise": n,
-    "unexplained": [(graph, node, kernel, param, offset, width, values)]}."""
+    ``members``: rank -> {graph file: loaded graph} (canonical included); ``controls``:
+    rank -> graphs (or a list of them) of other SAVEs of that rank, optional, only used
+    to report how many reused words are same-rank noise. Returns
+    {"rank_sites": [(graph, kernel, param, offset, width)], "reused": {family: words},
+    "control_noise": n, "unexplained": [...]} where "unexplained" lists declared rank
+    arguments whose captured value is not the rank id (the manifest is refused)."""
     base = members[canonical]
+    rank_sites: set = set()
+    unexplained = []
+    for gf, g in base.items():
+        for i, node in enumerate(g["nodes"]):
+            if node[0] != "kernel":
+                continue
+            decl = _declared(node[1])
+            if decl is None:
+                continue
+            param, off, width = decl
+            for r in members:
+                p = members[r][gf]["nodes"][i][3]
+                ok = (
+                    param < len(p)
+                    and off + width <= len(p[param])
+                    and int.from_bytes(p[param][off : off + width], "little") == r
+                )
+                if not ok:
+                    unexplained.append(
+                        (gf, i, node[1][:100], param, off, width, f"rank {r}: not the rank id")
+                    )
+            rank_sites.add(("", node[1], param, off, width))
+    declared_keys = {(k, p, o) for _g, k, p, o, _w in rank_sites}
     noise_keys = set()
     if controls:
         for r, saves in controls.items():
@@ -397,59 +460,33 @@ def classify(
                     for gf, g in runs[x].items():
                         for key in param_diffs(g, runs[y][gf]):
                             noise_keys.add((gf,) + key)
-    # Per (graph, site): the value on every rank.
-    values: dict[tuple, dict[int, int]] = {}
+    reused: dict[str, int] = {}
+    seen = set()
+    control_noise = 0
     for r, graphs in members.items():
         if r == canonical:
             continue
         for gf, g in graphs.items():
-            for key, (a, b) in param_diffs(base[gf], g).items():
-                values.setdefault((gf,) + key, {canonical: a})[r] = b
-    rank_sites: set = set()
-    unexplained = []
-    noise = 0
-    for site, vals in values.items():
-        gf, node, param, off, width = site
-        if site in noise_keys:
-            # Differs between SAVEs of one rank: never a rank word, left as captured.
-            noise += 1
-            continue
-        adds = {v - r for r, v in vals.items()}
-        if param >= 0 and len(vals) == len(members) and len(adds) == 1:
-            # The rank id, or the rank id plus a constant (a per-rank counter).
-            name = base[gf]["nodes"][node][1]
-            rank_sites.add((gf, name, param, off, width, adds.pop()))
-            continue
-        unexplained.append((gf, node, base[gf]["nodes"][node][1][:100], param, off, width, vals))
-    # A symbolic site is patched on EVERY node whose kernel name contains it:
-    # each such node must hold the rank there on every rank of the class.
-    checked = []
-    for gfile, name, param, off, width, add in sorted(rank_sites):
-        for gf, g in base.items():
-            if gf != gfile:
-                continue
-            for i, node in enumerate(g["nodes"]):
-                if node[0] != "kernel" or name not in node[1]:
+            for key in param_diffs(base[gf], g):
+                node, param, off, _w = key
+                name = base[gf]["nodes"][node][1]
+                if (name, param, off) in declared_keys or (gf,) + key in seen:
                     continue
-                for r in members:
-                    p = members[r][gf]["nodes"][i][3]
-                    ok = (
-                        param < len(p)
-                        and off + width <= len(p[param])
-                        and int.from_bytes(p[param][off : off + width], "little") == r + add
-                    )
-                    if not ok:
-                        unexplained.append(
-                            (gf, i, node[1][:100], param, off, width, f"rank {r}: not rank + {add}")
-                        )
-        checked.append((gfile, name, param, off, width, add))
-    return {"rank_sites": checked, "noise": noise, "unexplained": unexplained}
+                seen.add((gf,) + key)
+                fam = kernel_family(name) if param != -2 else "memcpy/memset"
+                reused[fam] = reused.get(fam, 0) + 1
+                control_noise += (gf,) + key in noise_keys
+    return {
+        "rank_sites": sorted(rank_sites),
+        "reused": reused,
+        "control_noise": control_noise,
+        "unexplained": unexplained,
+    }
 
 
 def make_manifest(
     workspace: str,
     control: str | list[str] | None = None,
-    assume_noise: bool = False,
     prune: bool = False,
     out=print,
 ) -> int:
@@ -488,55 +525,54 @@ def make_manifest(
                 cdir = os.path.join(ctl, f"rank_{r}")
                 csig, cg = rank_signature(cdir)
                 if csig != sigs[r]:
-                    out(
-                        f"[Foundry share] {cdir} differs from rank_{r} beyond params: not a control"
-                    )
+                    out(f"[Foundry share] {cdir} differs from rank_{r} structurally: not a control")
                     return 2
                 controls[r].append(cg)
     rank_map, device_index, sites, report = {}, {}, set(), {}
     unexplained_all = []
+    reused_all: dict[str, int] = {}
     noise_total = 0
     for members in classes.values():
         c = members[0]
         res = classify(c, {r: graphs[r] for r in members}, controls)
         for r in members:
             rank_map[str(r)] = c
-        device_index[str(c)] = configs[c]["device_index"]
-        for r in members:
             if configs[r]["device_index"] != configs[c]["device_index"]:
                 res["unexplained"].append(
                     ("-", -1, "device index", -1, 0, 0, {r: configs[r]["device_index"]})
                 )
+        device_index[str(c)] = configs[c]["device_index"]
         sites.update(res["rank_sites"])
         unexplained_all += res["unexplained"]
-        noise_total += res["noise"]
+        for fam, n in res["reused"].items():
+            reused_all[fam] = reused_all.get(fam, 0) + n
+        noise_total += res["control_noise"]
         report[str(c)] = {
             "members": members,
             "rank_sites": len(res["rank_sites"]),
-            "noise_words": res["noise"],
-            "unexplained_words": len(res["unexplained"]),
+            "reused_words": sum(res["reused"].values()),
         }
     out(
         f"[Foundry share] {len(ranks)} ranks, {len(classes)} class(es): "
         + "; ".join(f"rank_{c} <- {v['members']}" for c, v in report.items())
     )
-    out(f"[Foundry share] {len(sites)} '= rank (+ constant)' site(s):")
-    for g, k, p, o, w, a in sorted(sites):
-        out(f"    {g} {k[:70]} param {p} +{o} ({w} B) = rank + {a}")
+    out(f"[Foundry share] {len(sites)} declared rank-argument site(s):")
+    for _g, k, p, o, w in sorted(sites):
+        out(f"    {k[:90]} param {p} +{o} ({w} B) = rank")
+    out(
+        f"[Foundry share] {sum(reused_all.values())} other differing param words reused as "
+        f"captured: {dict(sorted(reused_all.items(), key=lambda kv: -kv[1]))}"
+        + (f"; {noise_total} of them differ between SAVEs of one rank" if controls else "")
+    )
     if unexplained_all:
         out(
-            f"[Foundry share] {len(unexplained_all)} differing words are neither the rank id nor "
-            f"control noise{'' if controls else ' (no control given)'}:"
+            f"[Foundry share] {len(unexplained_all)} declared rank argument(s) "
+            "do not hold the rank:"
         )
-        groups: dict = {}
-        for u in unexplained_all:
-            key = (u[2][:60], u[3], u[4], u[5])
-            groups.setdefault(key, []).append(u[6])
-        for (k, p, o, w), vals in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-            out(f"    {len(vals):5d} x {k} param {p} +{o} ({w} B), e.g. {vals[0]}")
-        if controls or not assume_noise:
-            out("[Foundry share] refused: no manifest written")
-            return 1
+        for u in unexplained_all[:20]:
+            out(f"    {u}")
+        out("[Foundry share] refused: no manifest written")
+        return 1
     manifest = {
         "format_version": FORMAT_VERSION,
         "world_size": len(ranks),
@@ -549,23 +585,14 @@ def make_manifest(
         "device_index": device_index,
         "signature": {c: sigs[int(c)] for c in device_index},
         "patch_sites": [
-            {
-                "graph": g,
-                "kernel": k,
-                "param": p,
-                "offset": o,
-                "width": w,
-                "value": "rank",
-                "add": a,
-            }
-            for g, k, p, o, w, a in sorted(sites)
+            {"graph": g, "kernel": k, "param": p, "offset": o, "width": w, "value": "rank"}
+            for g, k, p, o, w in sorted(sites)
         ],
         "verification": {
+            "declared_rank_args": [list(d[0]) + [d[1]] for d in DECLARED_RANK_ARGS],
+            "reused_words_by_family": reused_all,
             "controls": [os.path.abspath(c) for c in control_list],
-            "noise_words_ignored": noise_total,
-            "assumed_noise_words": len(unexplained_all)
-            if (unexplained_all and assume_noise)
-            else 0,
+            "reused_words_same_rank_noise": noise_total if controls else None,
             "classes": report,
         },
     }
@@ -589,16 +616,12 @@ def main(argv=None) -> int:
     mk.add_argument(
         "--control",
         action="append",
-        help="another SAVE workspace of the same configuration (repeatable)",
-    )
-    mk.add_argument(
-        "--assume-noise",
-        action="store_true",
-        help="without --control: accept differing non-rank words as noise (recorded)",
+        help="another SAVE workspace of the same configuration (repeatable; only reports how "
+        "many reused words are same-rank noise)",
     )
     mk.add_argument("--prune", action="store_true", help="delete the non-canonical rank dirs")
     a = ap.parse_args(argv)
-    return make_manifest(a.workspace, a.control, a.assume_noise, a.prune)
+    return make_manifest(a.workspace, a.control, a.prune)
 
 
 if __name__ == "__main__":
