@@ -9,6 +9,7 @@ import contextlib
 import dataclasses
 import gc
 import logging
+import os
 import threading
 import time
 from dataclasses import asdict
@@ -231,16 +232,30 @@ def _check_archive_share(parallel) -> None:
     per_node = max(tp_size // nnodes, 1)
     base = int(getattr(dev, "base_gpu_id", 0) or 0)
     step = int(getattr(dev, "gpu_id_step", 1) or 1)
-    gpu_ids = {r: base + (r % per_node) * step for r in range(tp_size * int(parallel.pp_size))}
+    world = tp_size * int(parallel.pp_size)
+    try:
+        from sglang.srt.environ import envs
+
+        one_visible = bool(envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get())
+    except Exception:
+        one_visible = os.environ.get("SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS", "").lower() in (
+            "1",
+            "true",
+        )
+    if one_visible:
+        # sglang utils/device.py maybe_reindex_device_id: every worker sees its GPU as 0.
+        gpu_ids = {r: 0 for r in range(world)}
+    else:
+        gpu_ids = {r: base + (r % per_node) * step for r in range(world)}
     own = int(dev.gpu_id)
     if gpu_ids.get(rank) != own:
-        logger.warning(
-            "[Foundry] archive share: computed device of rank %d is cuda:%s, actual cuda:%d",
-            rank,
-            gpu_ids.get(rank),
-            own,
+        # The launch placement is not the one this check assumes: refuse rather than
+        # load with a wrong device assumption (this rank alone; logged loudly).
+        raise Unsupported(
+            "archive share",
+            f"device placement unknown (computed cuda:{gpu_ids.get(rank)} for rank {rank}, "
+            f"actual cuda:{own})",
         )
-        gpu_ids[rank] = own
     canonical, patches = share.check_load(manifest, rank, server_args, gpu_ids)
     rt.set_archive_share(canonical, patches)
 
