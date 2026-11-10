@@ -198,6 +198,12 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
         )
     cfg.workspace_dir = str(workspace_dir)
     logger.info(
+        "[Foundry] SGLang rank=%d device=cuda:%d CUDA_VISIBLE_DEVICES=%s",
+        rank,
+        torch.cuda.current_device(),
+        os.environ.get("CUDA_VISIBLE_DEVICES"),
+    )
+    logger.info(
         "[Foundry] SGLang rank=%d (tp_rank=%d pp_rank=%d dp_rank=%s replica=%d "
         "attention_dp=%s) workspace_dir=%s",
         rank,
