@@ -335,8 +335,8 @@ def rank_signature(rank_dir: str) -> tuple[str, dict]:
             h.update(json.dumps(_json_without(p, ("timestamp",)), sort_keys=True).encode())
         elif f.startswith("graph_") and f.endswith(".json"):
             continue  # JSON twin of the .cugraph (params included); the binary is compared
-        elif f == "memhist.pickle":
-            continue
+        elif f in ("memhist.pickle", "nixl_diag.json", "nixl_reloc.json"):
+            continue  # diagnostic files (FOUNDRY_DIAG_MEMHIST / FOUNDRY_DIAG_NIXL_OUTSIDE_REGION)
         else:
             h.update(f.encode() + _sha(p).encode())
     return h.hexdigest(), graphs
@@ -380,10 +380,13 @@ def param_diffs(ga: dict, gb: dict) -> dict:
 DECLARED_RANK_ARGS = (
     (("deep_ep", "internode_ll", "8dispatch"), 22, 0, 4),  # DeepEP LL dispatch(..., int rank, ...)
     (("deep_ep", "internode_ll", "7combine"), 19, 0, 4),  # DeepEP LL combine(..., int rank, ...)
+    (("nixl_ep", "ep_kernels", "8dispatch"), 22, 0, 4),  # NIXL EP LL dispatch(..., int rank, ...)
+    (("nixl_ep", "ep_kernels", "7combine"), 20, 0, 4),  # NIXL EP LL combine(..., int rank, ...)
 )
 
 _FAMILIES = (
     ("deep_ep", "DeepEP"),
+    ("nixl_ep", "NIXL EP"),
     ("flashinfer", "FlashInfer"),
     ("flash", "FlashAttention"),
     ("nvjet", "cuBLAS nvjet"),
