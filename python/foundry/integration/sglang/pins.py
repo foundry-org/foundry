@@ -232,6 +232,15 @@ def reject_unsupported_features(server_args: Any) -> None:
             f"elastic-EP CUDA-graph recapture (--elastic-ep-backend with --max-ep-size={max_ep} "
             f"> tp size {cfg.tp_size}): graphs recaptured after a scale event cannot be restored"
         )
+    if (
+        getattr(cfg, "moe_a2a_backend", None) == "nixl"
+        and os.environ.get("FOUNDRY_DIAG_NIXL_OUTSIDE_REGION") != "1"
+    ):
+        unsupported.append(
+            "NIXL EP (--moe-a2a-backend nixl): its buffers come from cuMemAlloc (no fabric "
+            "handles), which UCX cuda_ipc cannot map inside the region, and outside it they "
+            "are driver-placed, so the restored dispatch/combine params would be stale"
+        )
     if os.environ.get("SGLANG_ENABLE_POST_CAPTURE_KV_SIZING", "").lower() in ("1", "true"):
         unsupported.append(
             "SGLANG_ENABLE_POST_CAPTURE_KV_SIZING: the KV pool is re-sized from post-capture "
