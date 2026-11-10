@@ -580,15 +580,22 @@ def capture_one_breakable(shape_key, capture):
 
     def checked_capture(**kwargs):
         # As _save_capture: a capture that created a dispatcher or logits
-        # processor attribute falls back on every rank (raised before
-        # save_shape writes this shape's files).
+        # processor attribute, or a break Foundry cannot archive, falls back
+        # on every rank (raised before save_shape writes this shape's files).
         from foundry.integration.sglang.graph_ops import attribute_snapshot, created_attributes
 
         before = attribute_snapshot(_snapshot_objects)
         graph, out = capture(**kwargs)
         created = created_attributes(_snapshot_objects, before)
-        _agree_capture_supported(_created_reason(created), created, graph)
-        return graph, out
+        reason = _created_reason(created)
+        encoded = None
+        if reason is None:
+            try:
+                encoded = breakable_ops.encode_breaks(graph)
+            except breakable_ops.UnsupportedBreak as exc:
+                reason = f"shape {shape_key}: {exc}"
+        _agree_capture_supported(reason, created, graph)
+        return graph, out, encoded
 
     return breakable_ops.save_shape(shape_key, checked_capture)
 

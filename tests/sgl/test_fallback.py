@@ -251,6 +251,34 @@ def test_breakable_capture_that_creates_state_falls_back(scheduler, monkeypatch)
     assert "_PrebuiltDispatcher.cache" in marker["reason"]
 
 
+def test_breakable_break_foundry_cannot_archive_falls_back(scheduler, monkeypatch):
+    """A break Foundry cannot archive (here a closure that is not a
+    functools.partial) goes through the capture vote like created state: the
+    shape is not archived, its graph is kept aside and the backend captures
+    natively, instead of an UnsupportedBreak error at SAVE."""
+    from foundry.integration.sglang import breakable_ops
+
+    adapter, cfg, _ = scheduler("save")
+    _breakable_scope(monkeypatch)
+    recorded = []
+    monkeypatch.setattr(breakable_ops, "save_state", lambda **kw: recorded.append(kw))
+    graph = _Graph()
+    graph._break_fns = [lambda: None]
+
+    def capture(**kwargs):
+        return graph, torch.zeros(1)
+
+    key = SimpleNamespace(size=8, variant_label=None, attention_variant=None)
+    with adapter.capture_scope(phase="prefill", model=_model(_PrebuiltDispatcher()), req_slots=1):
+        captured = adapter.capture_one_breakable(shape_key=key, capture=capture)
+    assert captured is None
+    assert graph.resets == 0 and graph in hooks._discarded_graphs
+    assert recorded == []
+    marker = _marker(cfg)
+    assert marker["step"] == "capture"
+    assert "not a functools.partial" in marker["reason"]
+
+
 def test_breakable_attention_variant_falls_back_before_capture(scheduler, monkeypatch):
     adapter, cfg, _ = scheduler("save")
     _breakable_scope(monkeypatch)

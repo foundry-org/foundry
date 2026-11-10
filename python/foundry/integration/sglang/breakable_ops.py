@@ -279,16 +279,10 @@ class _EmptySegment:
         pass
 
 
-def save_shape(key: Any, capture) -> tuple[Any, Any]:
-    """SAVE: capture one breakable shape and archive it."""
-    from foundry.integration.sglang.graph_ops import _flatten_prefill_output
-
-    state = get_state()
-    ws = _workspace_dir()
-    tokens, chunks = _shape(key)
-    # The segments' RNG capture states come from the slab reserved at the
-    # layout start (rng_slab), so the capture grows no torch pool.
-    graph, stored = capture(segment_graph_factory=FoundryCUDAGraph)
+def encode_breaks(graph: Any) -> tuple[list[torch.Tensor], list[dict]]:
+    """SAVE: the breaks of a captured shape as data, with the tensors they
+    reference. Raises :class:`UnsupportedBreak` for a break Foundry cannot
+    archive; the caller turns that into the capture vote's reason."""
     tensors: list[torch.Tensor] = []
     enc = _Encoder(_module_names, tensors)
     breaks = []
@@ -301,6 +295,21 @@ def save_shape(key: Any, capture) -> tuple[Any, Any]:
                 "kwargs": enc(kwargs, f"break[{i}].kwargs"),
             }
         )
+    return tensors, breaks
+
+
+def save_shape(key: Any, capture) -> tuple[Any, Any]:
+    """SAVE: capture one breakable shape and archive it. ``capture`` returns
+    ``(graph, output, encode_breaks(graph))``: the capture vote needs the
+    encoding, so it runs before any file of this shape is written."""
+    from foundry.integration.sglang.graph_ops import _flatten_prefill_output
+
+    state = get_state()
+    ws = _workspace_dir()
+    tokens, chunks = _shape(key)
+    # The segments' RNG capture states come from the slab reserved at the
+    # layout start (rng_slab), so the capture grows no torch pool.
+    graph, stored, (tensors, breaks) = capture(segment_graph_factory=FoundryCUDAGraph)
     out_spec, out_tensors = _flatten_prefill_output(stored)
     first_out = len(tensors)
     tensors.extend(out_tensors)

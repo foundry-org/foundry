@@ -115,10 +115,11 @@ initialises natively (normal graph capture). The steps that can fall back, all b
 `server args` / `environment` (the resolution steps above; pins already declared by then stay), `archive` (LOAD of
 an archive whose SAVE fell back, before any setup), `capture state` (first capture scope: a dispatcher without
 `prebuild`, or state still pending) and `capture` (each SAVE capture: an attribute of a dispatcher or logits
-processor created inside the capture, or a graph variant; the graph is discarded and the attributes
-reset, so that shape and the rest are captured natively). The scope and capture decisions are voted over the world
-group's CPU group, so all ranks fall back together. A SAVE that falls back writes `invalid.json` into its rank
-workspace and the workspace root. After LOAD starts restoring graphs, every Foundry failure is an error.
+processor created inside the capture, a graph variant, or a breakable-prefill break Foundry cannot archive;
+the graph is discarded and the attributes reset, so that shape and the rest are captured natively). The scope
+and capture decisions are voted over the world group's CPU group, so all ranks fall back together. A SAVE that
+falls back writes `invalid.json` into its rank workspace and the workspace root. After LOAD starts restoring
+graphs, every Foundry failure is an error.
 
 ## How to use
 
