@@ -433,6 +433,11 @@ def _log_restore(what: str, n: int, pending: Any, timing: _RestoreTiming, loop_s
                 f"Foundry archive share: {patched} patches applied, {misses} unappliable: the "
                 "canonical archive does not match the manifest's patch sites"
             )
+    elif os.environ.get("FOUNDRY_DIAG_NIXL_OUTSIDE_REGION") == "1":
+        patched, misses = _ops.param_patch_counts()
+        logger.info(
+            "[Foundry] DIAG nixl relocation: %d patch(es) applied, %d unappliable", patched, misses
+        )
     logger.info(
         "[Foundry] SGLang %s capture loop on LOAD: %.3fs (%d shapes, restore %.3fs, "
         "per-shape prep %.3fs)",
