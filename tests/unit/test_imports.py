@@ -27,7 +27,6 @@ PUBLIC_MODULES = [
     "foundry.integration.sglang.api",
     "foundry.integration.sglang.archive_check",
     "foundry.integration.sglang.config",
-    "foundry.integration.sglang.flashinfer_cute_cache",
     "foundry.integration.sglang.graph_ops",
     "foundry.integration.sglang.hooks",
     "foundry.integration.sglang.nvtx",

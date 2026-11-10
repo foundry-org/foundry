@@ -84,9 +84,6 @@ with its all-reduce through torch symmetric memory (validated attn-TP + EP rows 
   (DeepGEMM per-shape JIT compile and `cuLibraryLoadFromFile`) happens inside the captured forward
   and is recorded like any other capture-time event. No eager forward runs on either mode, and
   SAVE and LOAD reach the layout start at the same cursor.
-- **GDN CuTe-DSL cache** (both modes, after the bootstraps, only when the FlashInfer SM90 GDN prefill kernels are in
-  use): the kernels load from FlashInfer's `.o` cache instead of compiling in every scheduler; on by default
-  (`FOUNDRY_FLASHINFER_GDN_CUTE_CACHE=0` turns it off). Host-side only.
 - **No backend-specific code.** LOAD runs the upstream loop, so sglang itself re-creates all per-shape host state
   (FlashInfer / fa3 / hybrid decode metadata, the `deepep_adapter` captured mode, TBO / LoRA buffers) exactly as on
   SAVE. Restored graphs never run `run_once`, so they carry no in-graph shared-read marker; SGLang's
