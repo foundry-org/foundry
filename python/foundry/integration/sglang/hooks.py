@@ -256,7 +256,11 @@ def _check_archive_share(parallel) -> None:
             f"device placement unknown (computed cuda:{gpu_ids.get(rank)} for rank {rank}, "
             f"actual cuda:{own})",
         )
-    canonical, patches = share.check_load(manifest, rank, server_args, gpu_ids)
+    patch_rank = rank
+    if os.environ.get("FOUNDRY_DIAG_ELASTIC_JOINER") == "1":
+        # DIAGNOSTIC: a scale joiner's NIXL rank argument is its global rank.
+        patch_rank = rank + int(getattr(parallel, "ep_join_rank_offset", 0) or 0)
+    canonical, patches = share.check_load(manifest, patch_rank, server_args, gpu_ids)
     rt.set_archive_share(canonical, patches)
 
 

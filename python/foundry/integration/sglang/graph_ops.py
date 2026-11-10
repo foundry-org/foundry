@@ -656,7 +656,8 @@ def bootstrap_collective_connections() -> None:
             )
         connected.append(f"{group.unique_name}(ws={ws})")
     ws = dist.get_world_size()
-    for n in sizes:
+    # DIAGNOSTIC: a scale joiner has no admitted WORLD at init; its own groups were done above.
+    for n in () if diag_scale_joiner() else sizes:
         dist.all_reduce(torch.ones(n, dtype=torch.bfloat16, device=device), group=dist.group.WORLD)
         dist.all_gather_into_tensor(
             wide(ws, n, fill=False),
@@ -829,6 +830,16 @@ def _all_dispatchers(dispatchers) -> list:
     return list(found.values())
 
 
+def diag_scale_joiner() -> bool:
+    """DIAGNOSTIC ONLY (FOUNDRY_DIAG_ELASTIC_JOINER=1): this process is an elastic-EP scale
+    joiner restoring at init; Foundry's collectives stay inside its own cohort."""
+    if os.environ.get("FOUNDRY_DIAG_ELASTIC_JOINER") != "1":
+        return False
+    from sglang.srt.runtime_context import get_exec
+
+    return bool(get_exec().moe.is_ep_scale_joiner)
+
+
 def agree_unsupported(step: str, reason: str | None) -> None:
     """Raise :class:`Unsupported` on every rank when any rank has a ``reason``.
 
@@ -844,7 +855,8 @@ def agree_unsupported(step: str, reason: str | None) -> None:
     if dist.is_initialized() and dist.get_world_size() > 1:
         from sglang.srt.distributed import parallel_state as ps
 
-        world = ps.get_world_group()
+        # DIAGNOSTIC: a scale joiner votes within its own cohort (WORLD spans unadmitted ranks).
+        world = ps.get_tp_group() if diag_scale_joiner() else ps.get_world_group()
         vote = torch.tensor([0 if reason is None else 1], dtype=torch.int32)
         dist.all_reduce(vote, op=dist.ReduceOp.MAX, group=world.cpu_group)
         if not vote.item():

@@ -674,6 +674,12 @@ def log_alloc_offset(label: str) -> None:
     if cfg is None or cfg.mode == CUDAGraphExtensionMode.NONE:
         return
     offset = cge.get_current_alloc_offset()
+    if os.environ.get("FOUNDRY_DIAG_MEMHIST_DUMP_AT") == label and cfg.workspace_dir is not None:
+        # DIAGNOSTIC ONLY: allocator history up to this checkpoint (needs FOUNDRY_DIAG_MEMHIST=1).
+        import pickle
+
+        with open(os.path.join(cfg.workspace_dir, f"memhist_{label}.pickle"), "wb") as f:
+            pickle.dump(torch.cuda.memory._snapshot(), f)
     # Free device memory alongside the region offset: LOAD ends with less free
     # memory than SAVE at identical offsets (resident kernel images, reserved
     # ranges SAVE had already freed), and this trail is how that gap is measured.

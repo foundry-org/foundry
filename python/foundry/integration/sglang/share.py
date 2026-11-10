@@ -194,7 +194,7 @@ def check_load(manifest: dict, rank: int, server_args, gpu_ids: dict[int, int]) 
     rank_map = {int(r): int(c) for r, c in manifest["rank_map"].items()}
     if any_size:
         canonical_rank = min(rank_map.values())
-        rank_map = {r: rank_map.get(r, canonical_rank) for r in gpu_ids}
+        rank_map = {r: rank_map.get(r, canonical_rank) for r in set(gpu_ids) | {rank}}
     if rank not in rank_map:
         refuse(f"rank {rank} is not in the manifest's rank map")
     devices = {int(c): int(d) for c, d in manifest["device_index"].items()}
