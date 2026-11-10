@@ -387,12 +387,16 @@ def classify(
     base = members[canonical]
     noise_keys = set()
     if controls:
-        for r, graphs in controls.items():
+        for r, saves in controls.items():
             if r not in members:
                 continue
-            for gf, g in graphs.items():
-                for key in param_diffs(members[r][gf], g):
-                    noise_keys.add((gf,) + key)
+            saves = [saves] if isinstance(saves, dict) else list(saves)
+            runs = [members[r]] + saves
+            for x in range(len(runs)):
+                for y in range(x + 1, len(runs)):
+                    for gf, g in runs[x].items():
+                        for key in param_diffs(g, runs[y][gf]):
+                            noise_keys.add((gf,) + key)
     # Per (graph, site): the value on every rank.
     values: dict[tuple, dict[int, int]] = {}
     for r, graphs in members.items():
@@ -443,7 +447,7 @@ def classify(
 
 def make_manifest(
     workspace: str,
-    control: str | None = None,
+    control: str | list[str] | None = None,
     assume_noise: bool = False,
     prune: bool = False,
     out=print,
@@ -475,18 +479,19 @@ def make_manifest(
     for r in sorted(ranks):
         classes.setdefault(sigs[r], []).append(r)
     controls = None
-    if control:
-        controls = {}
-        for r in ranks:
-            cdir = os.path.join(control, f"rank_{r}")
-            csig, cg = rank_signature(cdir)
-            if csig != sigs[r]:
-                out(
-                    f"[Foundry share] control rank_{r} differs from rank_{r} beyond params: "
-                    "not a control"
-                )
-                return 2
-            controls[r] = cg
+    control_list = [control] if isinstance(control, str) else list(control or [])
+    if control_list:
+        controls = {r: [] for r in ranks}
+        for ctl in control_list:
+            for r in ranks:
+                cdir = os.path.join(ctl, f"rank_{r}")
+                csig, cg = rank_signature(cdir)
+                if csig != sigs[r]:
+                    out(
+                        f"[Foundry share] {cdir} differs from rank_{r} beyond params: not a control"
+                    )
+                    return 2
+                controls[r].append(cg)
     rank_map, device_index, sites, report = {}, {}, set(), {}
     unexplained_all = []
     noise_total = 0
@@ -522,8 +527,12 @@ def make_manifest(
             f"[Foundry share] {len(unexplained_all)} differing words are neither the rank id nor "
             f"control noise{'' if controls else ' (no control given)'}:"
         )
-        for u in unexplained_all[:20]:
-            out(f"    {u}")
+        groups: dict = {}
+        for u in unexplained_all:
+            key = (u[2][:60], u[3], u[4], u[5])
+            groups.setdefault(key, []).append(u[6])
+        for (k, p, o, w), vals in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+            out(f"    {len(vals):5d} x {k} param {p} +{o} ({w} B), e.g. {vals[0]}")
         if controls or not assume_noise:
             out("[Foundry share] refused: no manifest written")
             return 1
@@ -551,7 +560,7 @@ def make_manifest(
             for g, k, p, o, w, a in sorted(sites)
         ],
         "verification": {
-            "control": os.path.abspath(control) if control else None,
+            "controls": [os.path.abspath(c) for c in control_list],
             "noise_words_ignored": noise_total,
             "assumed_noise_words": len(unexplained_all)
             if (unexplained_all and assume_noise)
@@ -576,7 +585,11 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     mk = sub.add_parser("make", help="write share_manifest.json for a SAVE workspace")
     mk.add_argument("workspace")
-    mk.add_argument("--control", help="a second SAVE workspace of the same configuration")
+    mk.add_argument(
+        "--control",
+        action="append",
+        help="another SAVE workspace of the same configuration (repeatable)",
+    )
     mk.add_argument(
         "--assume-noise",
         action="store_true",
