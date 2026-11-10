@@ -227,6 +227,8 @@ def reject_unsupported_features(server_args: Any) -> None:
         and max_ep is not None
         and max_ep > cfg.tp_size
         and _elastic_recapture_path_exists()
+        # DIAGNOSTIC ONLY (cross-N study): capacity launches that never scale
+        and os.environ.get("FOUNDRY_DIAG_ALLOW_MAX_EP") != "1"
     ):
         unsupported.append(
             f"elastic-EP CUDA-graph recapture (--elastic-ep-backend with --max-ep-size={max_ep} "

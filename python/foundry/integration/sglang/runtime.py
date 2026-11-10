@@ -299,6 +299,8 @@ def _diag_nixl_outside_region(mode, workspace_dir: str) -> None:
                 kind = "dispatch" if "8dispatch" in k else "combine"
                 delta = probe[kind][pi] - saved_probe[kind][pi]
                 patches.append((g, k, pi, off, 8, (v + delta) & 0xFFFFFFFFFFFFFFFF))
+            if _archive_share is not None:
+                patches += _archive_share[1]  # set_param_patches replaces, keep the rank sites
             cge.set_param_patches(patches)
             deltas = {
                 kind: [hex(a - b) for a, b in zip(probe[kind], saved_probe[kind]) if a != b]
@@ -323,9 +325,9 @@ def _diag_nixl_probe_params(state) -> dict:
     from nixl_ep import topk_idx_t
 
     buf = state.buffer
-    n_ranks = buf.group_size
+    n_ranks = state.max_ranks  # NIXL rank_bound = num_experts / num_local_experts, as the engine
     hidden, max_tok = state.hidden_size, state.num_max_dispatch_tokens_per_rank
-    n_exp = state.num_local_experts * state.dispatch_ep_size
+    n_exp = state.num_local_experts * n_ranks
     x = torch.zeros(1, hidden, dtype=torch.bfloat16, device="cuda")
     idx = torch.arange(8, dtype=topk_idx_t, device="cuda").view(1, 8)
     w = torch.ones(1, 8, dtype=torch.float32, device="cuda")
