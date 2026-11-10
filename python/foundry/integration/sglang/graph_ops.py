@@ -631,25 +631,35 @@ def bootstrap_collective_connections() -> None:
         if group is not None and group.world_size > 1 and group not in groups:
             groups.append(group)
     sizes = (16, 4 << 20)  # elements: LL-sized, and ring-sized (8 MB bf16)
+    # Gather/scatter buffers sized for the EP capacity (--max-ep-size), sliced to the
+    # group: the region layout then does not depend on the current world size.
+    from sglang.srt.runtime_context import get_parallel
+
+    capacity = max(dist.get_world_size(), get_parallel().max_ep_size or 0)
+
+    def wide(ws: int, n: int, fill: bool):
+        make = torch.ones if fill else torch.empty
+        return make(capacity * n, dtype=torch.bfloat16, device=device)[: ws * n]
+
     connected = []
     for group in groups:
         ws = group.world_size
         for n in sizes:
             group.all_reduce(torch.ones(n, dtype=torch.bfloat16, device=device))
             group.all_gather_into_tensor(
-                torch.empty(ws * n, dtype=torch.bfloat16, device=device),
+                wide(ws, n, fill=False),
                 torch.ones(n, dtype=torch.bfloat16, device=device),
             )
             group.reduce_scatter_tensor(
                 torch.empty(n, dtype=torch.bfloat16, device=device),
-                torch.ones(ws * n, dtype=torch.bfloat16, device=device),
+                wide(ws, n, fill=True),
             )
         connected.append(f"{group.unique_name}(ws={ws})")
     ws = dist.get_world_size()
     for n in sizes:
         dist.all_reduce(torch.ones(n, dtype=torch.bfloat16, device=device), group=dist.group.WORLD)
         dist.all_gather_into_tensor(
-            torch.empty(ws * n, dtype=torch.bfloat16, device=device),
+            wide(ws, n, fill=False),
             torch.ones(n, dtype=torch.bfloat16, device=device),
             group=dist.group.WORLD,
         )
