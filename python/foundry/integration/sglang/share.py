@@ -105,8 +105,20 @@ def expert_slots(fields: dict[str, Any], num_experts: int | None) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+def _server_args(fallback):
+    """The resolved ServerArgs of this scheduler (the call site passes the
+    parallel context, which lacks most fields)."""
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        return get_server_args()
+    except Exception:
+        return fallback
+
+
 def write_rank_config(workspace_dir: str, rank: int, server_args, gpu_id: int) -> None:
     """SAVE: what the manifest tool needs to know about this rank."""
+    server_args = _server_args(server_args)
     num_experts = None
     try:
         from transformers import AutoConfig
