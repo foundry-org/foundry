@@ -35,11 +35,18 @@ KNOWN_UNBOUND_IN_PYI = {
 }
 
 
+# Implemented in Python only: SAVE captures with torch.cuda.CUDAGraph and hands the
+# raw graph to ops.CUDAGraph.adopt_native_capture (no foundry.ops capture binding).
+PYTHON_ONLY = {"capture_begin", "capture_end"}
+
+
 def _wrapper_methods():
     return sorted(
         name
         for name, value in vars(graph.CUDAGraph).items()
-        if not name.startswith("__") and isinstance(value, (staticmethod, types.FunctionType))
+        if not name.startswith("__")
+        and isinstance(value, (staticmethod, types.FunctionType))
+        and name not in PYTHON_ONLY
     )
 
 

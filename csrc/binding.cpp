@@ -1,12 +1,13 @@
-#include <torch/extension.h>
-#include <c10/core/CachingDeviceAllocator.h>
-#include <c10/cuda/CUDAException.h>
+#include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <cstdio>
 #include <cstring>
 #include "CUDAGraph.h"
 #include "CUDAGraphInternal.h"
 #include "metadata.h"
 #include "hook.h"
+
+namespace py = pybind11;
 
 template <typename T>
 using shared_ptr_class_ = py::class_<T, std::shared_ptr<T>>;
@@ -19,7 +20,7 @@ void check_driver_call(CUresult rc, const char* call) {
   const char* name = nullptr;
   if (cuGetErrorName(rc, &name) != CUDA_SUCCESS || !name)
     name = "unknown CUresult";
-  TORCH_CHECK(false, call, " failed: ", name, " (", static_cast<int>(rc), ")");
+  FOUNDRY_CHECK(false, call, " failed: ", name, " (", static_cast<int>(rc), ")");
 }
 
 // Driver calls need a current context on the calling thread; cudaSetDevice makes the
@@ -29,15 +30,63 @@ void ensure_current_context() {
   check_driver_call(cuCtxGetCurrent(&ctx), "cuCtxGetCurrent");
   if (!ctx) {
     int device = 0;
-    C10_CUDA_CHECK(cudaGetDevice(&device));
-    C10_CUDA_CHECK(cudaSetDevice(device));
+    FOUNDRY_CUDA_CHECK(cudaGetDevice(&device));
+    FOUNDRY_CUDA_CHECK(cudaSetDevice(device));
   }
 }
 
+// Tensors cross the binding as PyObject* through the stable 2.14 shims
+// (torch_tensor_from_pyobject / torch_tensor_to_pyobject); requires_grad has no
+// stable getter, so it is read from the Python object here.
+::foundry::Tensor tensor_from_py(py::handle obj) {
+  AtenTensorHandle h = nullptr;
+  if (torch_tensor_from_pyobject(obj.ptr(), &h) != AOTI_TORCH_SUCCESS) {
+    const char* what = torch_exception_get_what_without_backtrace();
+    throw std::runtime_error(
+        std::string("output_tensors must be a Tensor, list[Tensor], or tuple[Tensor]: ") +
+        (what ? what : ""));
+  }
+  ::foundry::Tensor t;
+  t.handle = std::make_shared<::foundry::TensorHandle>(h);
+  t.requires_grad = obj.attr("requires_grad").cast<bool>();
+  return t;
+}
+
+py::object tensor_to_py(const ::foundry::Tensor& t) {
+  void* raw = nullptr;
+  FOUNDRY_SHIM_CHECK(torch_tensor_to_pyobject(t.handle->get(), nullptr, &raw));
+  return py::reinterpret_steal<py::object>(static_cast<PyObject*>(raw));
+}
+
+py::tuple load_result_to_py(const ::foundry::GraphLoadResult& load_result) {
+  py::object output_tensors = py::none();
+  if (load_result.output_type == ::foundry::OutputTensorType::Single) {
+    if (std::holds_alternative<::foundry::Tensor>(load_result.outputs)) {
+      output_tensors = tensor_to_py(std::get<::foundry::Tensor>(load_result.outputs));
+    }
+  } else if (load_result.output_type == ::foundry::OutputTensorType::List ||
+             load_result.output_type == ::foundry::OutputTensorType::Tuple) {
+    if (std::holds_alternative<std::vector<::foundry::Tensor>>(load_result.outputs)) {
+      const auto& tensors = std::get<std::vector<::foundry::Tensor>>(load_result.outputs);
+      py::list tensor_list;
+      for (const auto& t : tensors) {
+        tensor_list.append(tensor_to_py(t));
+      }
+      if (load_result.output_type == ::foundry::OutputTensorType::List) {
+        output_tensors = tensor_list;
+      } else {
+        output_tensors = py::tuple(tensor_list);
+      }
+    }
+  }
+  return py::make_tuple(load_result.graph, output_tensors);
+}
 }  // namespace
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("graph_pool_handle", &::foundry::graph_pool_handle);
+PYBIND11_MODULE(ops, m) {
+  // SAVE: hook record window around torch's own capture (foundry/graph.py)
+  m.def("native_record_begin", &::foundry::native_record_begin);
+  m.def("native_record_abort", &::foundry::native_record_abort);
 
   m.def(
       "get_graph_ptr",
@@ -123,8 +172,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("archive_dir"), "Load CUDA modules and libraries from archive directory");
 
   m.def(
-      "preallocate_cublas_workspaces", []() { ::foundry::preallocate_cublas_workspaces(); },
-      "Pre-allocate cuBLAS and cuBLASLt handles and workspaces for the current stream");
+      "preallocate_cublas_workspaces",
+      []() {
+        // Running torch's major.minor ("2.14.1+cu130", "2.16.0.dev20261102", "2.16.0a0+git").
+        const auto version = py::module_::import("torch").attr("__version__").cast<std::string>();
+        int major = 0, minor = 0;
+        FOUNDRY_CHECK(std::sscanf(version.c_str(), "%d.%d", &major, &minor) == 2,
+                      "preallocate_cublas_workspaces: cannot parse torch version ", version);
+        ::foundry::preallocate_cublas_workspaces(major > 2 || (major == 2 && minor >= 15));
+      },
+      "Pre-allocate the cuBLAS handle and workspace (= the unified cuBLASLt workspace) for "
+      "the current stream");
 
   // CUevent handles as integers (foundry.graph.RestoredEvent). Driver errors raise
   // RuntimeError with the error name; event_query maps CUDA_ERROR_NOT_READY to False.
@@ -215,37 +273,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   shared_ptr_class_<::foundry::CUDAGraph>(m, "CUDAGraph")
       .def(py::init<bool>(), py::arg("keep_graph") = false)
       .def(
-          "capture_begin",
-          [](::foundry::CUDAGraph& self, std::optional<c10::MempoolId_t> pool_opt,
-             const std::string& capture_error_mode) {
-            cudaStreamCaptureMode capture_mode{};
-            c10::MempoolId_t pool =
-                pool_opt.has_value() ? pool_opt.value() : c10::MempoolId_t{0, 0};
-            if (capture_error_mode == "global") {
-              capture_mode = cudaStreamCaptureModeGlobal;
-            } else if (capture_error_mode == "thread_local") {
-              capture_mode = cudaStreamCaptureModeThreadLocal;
-            } else if (capture_error_mode == "relaxed") {
-              capture_mode = cudaStreamCaptureModeRelaxed;
-            } else {
-              TORCH_CHECK(false,
-                          "Unknown capture error mode. Expected `global`, `thread_local`, or "
-                          "`relaxed`, got ",
-                          capture_error_mode);
-            }
-            return self.capture_begin(pool, capture_mode);
+          "adopt_native_capture",
+          [](::foundry::CUDAGraph& self, uintptr_t raw_graph, ::foundry::MempoolId_t pool,
+             const std::vector<std::tuple<uint64_t, uint64_t, uint64_t>>& generators) {
+            self.adopt_native_capture(raw_graph, pool, generators);
           },
-          py::arg("pool"), py::arg("capture_error_mode"), py::call_guard<py::gil_scoped_release>())
-      .def("capture_end", &foundry::CUDAGraph::capture_end,
-           py::call_guard<py::gil_scoped_release>())
-      .def(
-          "register_generator_state",
-          [](::foundry::CUDAGraph& self, py::handle raw_generator) {
-            auto generator = THPGenerator_Unwrap(raw_generator.ptr());
-            py::gil_scoped_release release;
-            return self.register_generator_state(generator);
-          },
-          py::arg("generator"))
+          py::arg("raw_graph"), py::arg("pool"), py::arg("generators"),
+          py::call_guard<py::gil_scoped_release>())
       .def("replay", &foundry::CUDAGraph::replay, py::call_guard<py::gil_scoped_release>())
       .def("exec_share_stats", &foundry::CUDAGraph::exec_share_stats)
       .def("loaded_events",
@@ -275,8 +309,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               if (py::isinstance<py::int_>(value)) {
                 handle = value.cast<uintptr_t>();
               } else {
-                TORCH_CHECK(py::hasattr(value, "cuda_event"),
-                            "bind_events: expected a torch.cuda.Event or an int handle");
+                FOUNDRY_CHECK(py::hasattr(value, "cuda_event"),
+                              "bind_events: expected a torch.cuda.Event or an int handle");
                 handle = value.attr("cuda_event").cast<uintptr_t>();
                 if (!handle) {  // torch.cuda.Event creates its CUDA event on first record
                   value.attr("record")();
@@ -291,7 +325,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("events"))
       .def("reset", &foundry::CUDAGraph::reset, py::call_guard<py::gil_scoped_release>())
       .def("pool", &foundry::CUDAGraph::pool, py::call_guard<py::gil_scoped_release>())
-      .def("debug_dump", &foundry::CUDAGraph::debug_dump, py::call_guard<py::gil_scoped_release>())
       .def("enable_debug_mode", &foundry::CUDAGraph::enable_debug_mode,
            py::call_guard<py::gil_scoped_release>())
       .def("debug_dump", &foundry::CUDAGraph::debug_dump, py::arg("debug_path"),
@@ -310,35 +343,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             ::foundry::OutputTensors outputs = std::monostate{};
             ::foundry::OutputTensorType output_type = ::foundry::OutputTensorType::None;
 
-            if (output_tensors_opt.has_value()) {
+            if (output_tensors_opt.has_value() && !output_tensors_opt->is_none()) {
               py::object output_tensors = output_tensors_opt.value();
-              if (py::isinstance<py::list>(output_tensors)) {
-                py::list tensor_list = output_tensors.cast<py::list>();
-                std::vector<at::Tensor> tensors;
-                tensors.reserve(tensor_list.size());
-                for (auto item : tensor_list) {
-                  tensors.push_back(item.cast<torch::Tensor>());
+              if (py::isinstance<py::list>(output_tensors) ||
+                  py::isinstance<py::tuple>(output_tensors)) {
+                std::vector<::foundry::Tensor> tensors;
+                for (auto item : output_tensors) {
+                  tensors.push_back(tensor_from_py(item));
                 }
                 outputs = std::move(tensors);
-                output_type = ::foundry::OutputTensorType::List;
-              } else if (py::isinstance<py::tuple>(output_tensors)) {
-                py::tuple tensor_tuple = output_tensors.cast<py::tuple>();
-                std::vector<at::Tensor> tensors;
-                tensors.reserve(tensor_tuple.size());
-                for (auto item : tensor_tuple) {
-                  tensors.push_back(item.cast<torch::Tensor>());
-                }
-                outputs = std::move(tensors);
-                output_type = ::foundry::OutputTensorType::Tuple;
+                output_type = py::isinstance<py::list>(output_tensors)
+                                  ? ::foundry::OutputTensorType::List
+                                  : ::foundry::OutputTensorType::Tuple;
               } else {
-                try {
-                  torch::Tensor t = output_tensors.cast<torch::Tensor>();
-                  outputs = t;
-                  output_type = ::foundry::OutputTensorType::Single;
-                } catch (const py::cast_error&) {
-                  throw std::runtime_error(
-                      "output_tensors must be a Tensor, list[Tensor], or tuple[Tensor]");
-                }
+                outputs = tensor_from_py(output_tensors);
+                output_type = ::foundry::OutputTensorType::Single;
               }
             }
 
@@ -348,41 +367,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("json_path"), py::arg("output_tensors") = py::none())
       .def_static(
           "load",
-          [](const std::string& json_path, std::optional<c10::MempoolId_t> pool_opt) {
-            c10::MempoolId_t pool =
-                pool_opt.has_value() ? pool_opt.value() : c10::MempoolId_t{0, 0};
-
+          [](const std::string& json_path, std::optional<::foundry::MempoolId_t> pool_opt) {
+            ::foundry::MempoolId_t pool = pool_opt.value_or(::foundry::MempoolId_t{0, 0});
             ::foundry::GraphLoadResult load_result;
             {
               py::gil_scoped_release release;
               load_result = ::foundry::CUDAGraph::load(json_path, pool);
             }
-
-            py::object output_tensors = py::none();
-            if (load_result.output_type == ::foundry::OutputTensorType::Single) {
-              if (std::holds_alternative<at::Tensor>(load_result.outputs)) {
-                output_tensors = py::cast(std::get<at::Tensor>(load_result.outputs));
-              }
-            } else if (load_result.output_type == ::foundry::OutputTensorType::List) {
-              if (std::holds_alternative<std::vector<at::Tensor>>(load_result.outputs)) {
-                py::list tensor_list;
-                for (const auto& t : std::get<std::vector<at::Tensor>>(load_result.outputs)) {
-                  tensor_list.append(py::cast(t));
-                }
-                output_tensors = tensor_list;
-              }
-            } else if (load_result.output_type == ::foundry::OutputTensorType::Tuple) {
-              if (std::holds_alternative<std::vector<at::Tensor>>(load_result.outputs)) {
-                const auto& tensors = std::get<std::vector<at::Tensor>>(load_result.outputs);
-                py::tuple tensor_tuple(tensors.size());
-                for (size_t i = 0; i < tensors.size(); ++i) {
-                  tensor_tuple[i] = py::cast(tensors[i]);
-                }
-                output_tensors = tensor_tuple;
-              }
-            }
-
-            return py::make_tuple(load_result.graph, output_tensors);
+            return load_result_to_py(load_result);
           },
           py::arg("json_path"), py::arg("pool") = py::none())
       .def_static(
@@ -394,11 +386,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("json_paths"))
       .def_static(
           "start_graph_builds",
-          [](const std::vector<std::string>& json_paths, std::optional<c10::MempoolId_t> pool_opt,
-             int num_threads) {
-            c10::MempoolId_t pool =
-                pool_opt.has_value() ? pool_opt.value() : c10::MempoolId_t{0, 0};
-
+          [](const std::vector<std::string>& json_paths,
+             std::optional<::foundry::MempoolId_t> pool_opt, int num_threads) {
+            ::foundry::MempoolId_t pool = pool_opt.value_or(::foundry::MempoolId_t{0, 0});
             std::shared_ptr<::foundry::PendingGraphLoads> pending;
             {
               py::gil_scoped_release release;
@@ -415,36 +405,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               py::gil_scoped_release release;
               load_results = ::foundry::CUDAGraph::finish_graph_loads(std::move(pending));
             }
-
             py::list result_list;
             for (auto& load_result : load_results) {
-              py::object output_tensors = py::none();
-              if (load_result.output_type == ::foundry::OutputTensorType::Single) {
-                if (std::holds_alternative<at::Tensor>(load_result.outputs)) {
-                  output_tensors = py::cast(std::get<at::Tensor>(load_result.outputs));
-                }
-              } else if (load_result.output_type == ::foundry::OutputTensorType::List) {
-                if (std::holds_alternative<std::vector<at::Tensor>>(load_result.outputs)) {
-                  py::list tensor_list;
-                  for (const auto& t : std::get<std::vector<at::Tensor>>(load_result.outputs)) {
-                    tensor_list.append(py::cast(t));
-                  }
-                  output_tensors = tensor_list;
-                }
-              } else if (load_result.output_type == ::foundry::OutputTensorType::Tuple) {
-                if (std::holds_alternative<std::vector<at::Tensor>>(load_result.outputs)) {
-                  const auto& tensors = std::get<std::vector<at::Tensor>>(load_result.outputs);
-                  py::tuple tensor_tuple(tensors.size());
-                  for (size_t i = 0; i < tensors.size(); ++i) {
-                    tensor_tuple[i] = py::cast(tensors[i]);
-                  }
-                  output_tensors = tensor_tuple;
-                }
-              }
-
-              result_list.append(py::make_tuple(load_result.graph, output_tensors));
+              result_list.append(load_result_to_py(load_result));
             }
-
             return result_list;
           },
           py::arg("pending"))
@@ -456,30 +420,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               py::gil_scoped_release release;
               load_result = ::foundry::CUDAGraph::finish_one_graph_load(std::move(pending), index);
             }
-            py::object output_tensors = py::none();
-            if (load_result.output_type == ::foundry::OutputTensorType::Single) {
-              if (std::holds_alternative<at::Tensor>(load_result.outputs)) {
-                output_tensors = py::cast(std::get<at::Tensor>(load_result.outputs));
-              }
-            } else if (load_result.output_type == ::foundry::OutputTensorType::List) {
-              if (std::holds_alternative<std::vector<at::Tensor>>(load_result.outputs)) {
-                py::list tensor_list;
-                for (const auto& t : std::get<std::vector<at::Tensor>>(load_result.outputs)) {
-                  tensor_list.append(py::cast(t));
-                }
-                output_tensors = tensor_list;
-              }
-            } else if (load_result.output_type == ::foundry::OutputTensorType::Tuple) {
-              if (std::holds_alternative<std::vector<at::Tensor>>(load_result.outputs)) {
-                const auto& tensors = std::get<std::vector<at::Tensor>>(load_result.outputs);
-                py::tuple tensor_tuple(tensors.size());
-                for (size_t i = 0; i < tensors.size(); ++i) {
-                  tensor_tuple[i] = py::cast(tensors[i]);
-                }
-                output_tensors = tensor_tuple;
-              }
-            }
-            return py::make_tuple(load_result.graph, output_tensors);
+            return load_result_to_py(load_result);
           },
           py::arg("pending"), py::arg("index"));
 }

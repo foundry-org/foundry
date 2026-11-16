@@ -1,14 +1,14 @@
-# foundry.ops is a torch C++/CUDA extension: it must be compiled against the torch
-# that will import it. Install with --no-build-isolation into an environment that
-# already has that torch (and cmake>=4.0, ninja); an isolated build would compile
-# against whatever torch pip resolves here, not the runtime one.
+# foundry.ops is compiled against the LibTorch Stable ABI headers of the installed
+# torch (>= 2.14) and loads on any torch >= 2.14. Install with --no-build-isolation
+# into an environment that has torch, pybind11, cmake>=4.0 and ninja.
 [build-system]
 requires = [
     "setuptools>=80",
     "wheel",
     "cmake>=4.0",
     "ninja",
-    "torch",
+    "pybind11>=2.12",
+    "torch>=2.14",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -27,8 +27,8 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Environment :: GPU :: NVIDIA CUDA",
 ]
-# setup.py sets install_requires: "torch" for a source build, "torch==X.Y.Z"
-# (the build torch) for a release wheel, since foundry.ops is bound to it.
+# setup.py sets install_requires: "torch>=2.14" (foundry.ops uses only the LibTorch
+# Stable ABI, so one build loads on any later torch).
 dynamic = ["dependencies"]
 
 [project.urls]

@@ -1,17 +1,5 @@
-#include <ATen/cuda/CUDAGeneratorImpl.h>
-#include <ATen/Functions.h>
-#include <ATen/cuda/Exceptions.h>
-#include <ATen/cuda/CUDAContext.h>
-#if __has_include(<ATen/cuda/MemPool.h>)
-#include <ATen/cuda/MemPool.h>
-#define FOUNDRY_HAS_ATEN_CUDA_MEMPOOL 1
-#endif
-#include <c10/cuda/CUDACachingAllocator.h>
-#include <c10/cuda/CUDAFunctions.h>
-#include <c10/cuda/driver_api.h>
 #include "CUDAGraph.h"
 #include "CUDAGraphInternal.h"
-#include <ATen/cuda/CUDAGraphsUtils.cuh>
 
 #include <cstddef>
 #include <cstring>
@@ -171,7 +159,7 @@ class SerialWorker {
 // File I/O + JSON parse - no shared state, safe to run on worker threads.
 boost::json::value read_and_parse_graph_json(const std::string& json_path) {
   std::ifstream file(json_path);
-  TORCH_CHECK(file.is_open(), "Failed to open file for reading: ", json_path);
+  FOUNDRY_CHECK(file.is_open(), "Failed to open file for reading: ", json_path);
 
   std::string json_str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
   file.close();
@@ -183,39 +171,24 @@ boost::json::value read_and_parse_graph_json(const std::string& json_path) {
 
 namespace foundry {
 
-namespace {
-
-MempoolId_t torch_graph_pool_handle(bool is_user_created = true) {
-#if FOUNDRY_HAS_ATEN_CUDA_MEMPOOL
-  return at::cuda::MemPool::graph_pool_handle(is_user_created);
-#else
-  return c10::cuda::MemPool::graph_pool_handle(is_user_created);
-#endif
-}
-
-}  // namespace
-
 // ============================================================================
 // Phase 1b: graph shell creation + generator registration
 // ============================================================================
 
 // Create graph shell and register generators, but do NOT replay allocator events.
 // Used by start_graph_builds to create shells early before weight loading.
-ParsedGraphData CUDAGraph::prepare_graph_shell(boost::json::value&& root_val, MempoolId_t pool,
-                                               CUDAGeneratorStateRegistry& registry) {
+ParsedGraphData CUDAGraph::prepare_graph_shell(boost::json::value&& root_val, MempoolId_t pool) {
   const boost::json::object& root = root_val.as_object();
 
   auto graph = std::make_shared<CUDAGraph>(true);
   graph->loaded_graph_resources_ = std::make_unique<LoadedGraphResources>();
 
-  graph->capture_dev_ = c10::cuda::current_device();
+  graph->capture_dev_ = current_device();
 
+  // Store-only (no allocator pool call on LOAD; pool() refuses a loaded graph).
   if (pool.first != 0 || pool.second != 0) {
-    TORCH_INTERNAL_ASSERT(!(pool.first && pool.second));
+    FOUNDRY_INTERNAL_ASSERT(!(pool.first && pool.second));
     graph->mempool_id_ = pool;
-  } else {
-    graph->mempool_id_ = torch_graph_pool_handle(false);
-    TORCH_INTERNAL_ASSERT(graph->mempool_id_.first > 0);
   }
 
   // Register generator states (not thread-safe, modifies global state).
@@ -230,8 +203,7 @@ ParsedGraphData CUDAGraph::prepare_graph_shell(boost::json::value&& root_val, Me
       uint64_t seed = gen_obj.at("seed").to_number<uint64_t>();
       uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
 
-      auto state = registry.get_state_from_id(state_id, seed);
-      graph->register_generator_state(state, wholegraph_increment);
+      graph->register_native_rng(state_id, seed, wholegraph_increment);
     }
   }
 
@@ -275,7 +247,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
   const json::object& root = parsed.root_val.as_object();
 
   CUgraph cuGraph;
-  C10_CUDA_DRIVER_CHECK(cuGraphCreate(&cuGraph, 0));
+  FOUNDRY_CU_CHECK(cuGraphCreate(&cuGraph, 0));
   graph->graph_ = reinterpret_cast<cudaGraph_t>(cuGraph);
   graph->has_graph_ = true;
   g_last_build_timing = BuildTiming{};
@@ -616,7 +588,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
                 node_params.gridDimX, node_params.gridDimY, node_params.gridDimZ,
                 node_params.blockDimX, node_params.blockDimY, node_params.blockDimZ,
                 node_params.sharedMemBytes);
-        C10_CUDA_DRIVER_CHECK(kernel_result);
+        FOUNDRY_CU_CHECK(kernel_result);
       }
 
       // Set kernel node attributes.
@@ -633,7 +605,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         clusterAttr.clusterDim.x = cluster_width > 0 ? cluster_width : 1;
         clusterAttr.clusterDim.y = cluster_height > 0 ? cluster_height : 1;
         clusterAttr.clusterDim.z = cluster_depth > 0 ? cluster_depth : 1;
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             cuNode, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &clusterAttr));
       }
       if (has_preferred_cluster_dim) {
@@ -642,7 +614,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         pref_attr.preferredClusterDim.x = preferred_cluster_x;
         pref_attr.preferredClusterDim.y = preferred_cluster_y;
         pref_attr.preferredClusterDim.z = preferred_cluster_z;
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             cuNode, CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION, &pref_attr));
       }
       if (has_cluster_scheduling) {
@@ -650,28 +622,28 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         memset(&sched_attr, 0, sizeof(sched_attr));
         sched_attr.clusterSchedulingPolicyPreference =
             static_cast<CUclusterSchedulingPolicy>(cluster_scheduling);
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             cuNode, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, &sched_attr));
       }
       if (has_cooperative) {
         CUkernelNodeAttrValue coop_attr;
         memset(&coop_attr, 0, sizeof(coop_attr));
         coop_attr.cooperative = cooperative;
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
-            cuNode, CU_KERNEL_NODE_ATTRIBUTE_COOPERATIVE, &coop_attr));
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(cuNode, CU_KERNEL_NODE_ATTRIBUTE_COOPERATIVE,
+                                                       &coop_attr));
       }
       if (has_priority) {
         CUkernelNodeAttrValue priority_attr;
         memset(&priority_attr, 0, sizeof(priority_attr));
         priority_attr.priority = priority;
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
-            cuNode, CU_KERNEL_NODE_ATTRIBUTE_PRIORITY, &priority_attr));
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(cuNode, CU_KERNEL_NODE_ATTRIBUTE_PRIORITY,
+                                                       &priority_attr));
       }
       if (has_mem_sync_domain) {
         CUkernelNodeAttrValue mem_domain_attr;
         memset(&mem_domain_attr, 0, sizeof(mem_domain_attr));
         mem_domain_attr.memSyncDomain = static_cast<CUlaunchMemSyncDomain>(mem_sync_domain);
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             cuNode, CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN, &mem_domain_attr));
       }
       if (has_mem_sync_domain_map) {
@@ -679,14 +651,14 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         memset(&mem_map_attr, 0, sizeof(mem_map_attr));
         mem_map_attr.memSyncDomainMap.default_ = mem_sync_domain_default;
         mem_map_attr.memSyncDomainMap.remote = mem_sync_domain_remote;
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             cuNode, CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN_MAP, &mem_map_attr));
       }
       if (has_preferred_shared_mem_carveout) {
         CUkernelNodeAttrValue carveout_attr;
         memset(&carveout_attr, 0, sizeof(carveout_attr));
         carveout_attr.sharedMemCarveout = preferred_shared_mem_carveout;
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             cuNode, CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, &carveout_attr));
       }
       if (has_access_policy_window) {
@@ -699,21 +671,21 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         apw_attr.accessPolicyWindow.hitProp = static_cast<CUaccessProperty>(access_policy_hit_prop);
         apw_attr.accessPolicyWindow.missProp =
             static_cast<CUaccessProperty>(access_policy_miss_prop);
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             cuNode, CU_KERNEL_NODE_ATTRIBUTE_ACCESS_POLICY_WINDOW, &apw_attr));
       }
       if (has_device_updatable) {
         CUkernelNodeAttrValue updatable_attr;
         memset(&updatable_attr, 0, sizeof(updatable_attr));
         updatable_attr.deviceUpdatableKernelNode.deviceUpdatable = device_updatable;
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             cuNode, CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE, &updatable_attr));
       }
       if (has_programmatic_stream_serialization) {
         CUkernelNodeAttrValue pss_attr;
         memset(&pss_attr, 0, sizeof(pss_attr));
         pss_attr.programmaticStreamSerializationAllowed = programmatic_stream_serialization;
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             cuNode,
             static_cast<CUkernelNodeAttrID>(CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION),
             &pss_attr));
@@ -750,7 +722,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         fprintf(stderr,
                 "[foundry LOAD ERROR] cuGraphAddMemcpyNode FAILED for node %d with error %d\n",
                 node_id, result);
-        C10_CUDA_DRIVER_CHECK(result);
+        FOUNDRY_CU_CHECK(result);
       }
 
     } else if (node_type == "MemsetNode") {
@@ -769,20 +741,20 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
         fprintf(stderr,
                 "[foundry LOAD ERROR] cuGraphAddMemsetNode FAILED for node %d with error %d\n",
                 node_id, result);
-        C10_CUDA_DRIVER_CHECK(result);
+        FOUNDRY_CU_CHECK(result);
       }
 
     } else if (node_type == "EventRecordNode") {
       int event_id = params.at("event_id").to_number<int>();
       CUevent event;
       if (event_id_to_event.find(event_id) == event_id_to_event.end()) {
-        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, saved_event_flags(params)));
+        FOUNDRY_CU_CHECK(cuEventCreate(&event, saved_event_flags(params)));
         event_id_to_event[event_id] = event;
         graph->loaded_graph_resources_->created_events.push_back(event);
       } else {
         event = event_id_to_event[event_id];
       }
-      C10_CUDA_DRIVER_CHECK(cuGraphAddEventRecordNode(&cuNode, cuGraph, nullptr, 0, event));
+      FOUNDRY_CU_CHECK(cuGraphAddEventRecordNode(&cuNode, cuGraph, nullptr, 0, event));
       graph->loaded_graph_resources_->note_event(
           event_id, event, saved_event_flags(params),
           static_cast<size_t>(&node_val - nodes_array.data()), true);
@@ -791,19 +763,19 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       int event_id = params.at("event_id").to_number<int>();
       CUevent event;
       if (event_id_to_event.find(event_id) == event_id_to_event.end()) {
-        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, saved_event_flags(params)));
+        FOUNDRY_CU_CHECK(cuEventCreate(&event, saved_event_flags(params)));
         event_id_to_event[event_id] = event;
         graph->loaded_graph_resources_->created_events.push_back(event);
       } else {
         event = event_id_to_event[event_id];
       }
-      C10_CUDA_DRIVER_CHECK(cuGraphAddEventWaitNode(&cuNode, cuGraph, nullptr, 0, event));
+      FOUNDRY_CU_CHECK(cuGraphAddEventWaitNode(&cuNode, cuGraph, nullptr, 0, event));
       graph->loaded_graph_resources_->note_event(
           event_id, event, saved_event_flags(params),
           static_cast<size_t>(&node_val - nodes_array.data()), false);
 
     } else if (node_type == "EmptyNode") {
-      C10_CUDA_DRIVER_CHECK(cuGraphAddEmptyNode(&cuNode, cuGraph, nullptr, 0));
+      FOUNDRY_CU_CHECK(cuGraphAddEmptyNode(&cuNode, cuGraph, nullptr, 0));
     }
 
     if (cuNode) {
@@ -828,7 +800,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       clusterAttr.clusterDim.y = common_cluster_height > 0 ? common_cluster_height : 1;
       clusterAttr.clusterDim.z = common_cluster_depth > 0 ? common_cluster_depth : 1;
       for (auto node : kernel_nodes_for_common_attrs) {
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             node, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &clusterAttr));
       }
     }
@@ -839,7 +811,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       pref_attr.preferredClusterDim.y = common_preferred_cluster_y;
       pref_attr.preferredClusterDim.z = common_preferred_cluster_z;
       for (auto node : kernel_nodes_for_common_attrs) {
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             node, CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION, &pref_attr));
       }
     }
@@ -849,7 +821,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       sched_attr.clusterSchedulingPolicyPreference =
           static_cast<CUclusterSchedulingPolicy>(common_cluster_scheduling);
       for (auto node : kernel_nodes_for_common_attrs) {
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             node, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, &sched_attr));
       }
     }
@@ -858,7 +830,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       memset(&coop_attr, 0, sizeof(coop_attr));
       coop_attr.cooperative = common_cooperative;
       for (auto node : kernel_nodes_for_common_attrs) {
-        C10_CUDA_DRIVER_CHECK(
+        FOUNDRY_CU_CHECK(
             cuGraphKernelNodeSetAttribute(node, CU_KERNEL_NODE_ATTRIBUTE_COOPERATIVE, &coop_attr));
       }
     }
@@ -867,7 +839,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       memset(&priority_attr, 0, sizeof(priority_attr));
       priority_attr.priority = common_priority;
       for (auto node : kernel_nodes_for_common_attrs) {
-        C10_CUDA_DRIVER_CHECK(
+        FOUNDRY_CU_CHECK(
             cuGraphKernelNodeSetAttribute(node, CU_KERNEL_NODE_ATTRIBUTE_PRIORITY, &priority_attr));
       }
     }
@@ -876,7 +848,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       memset(&mem_domain_attr, 0, sizeof(mem_domain_attr));
       mem_domain_attr.memSyncDomain = static_cast<CUlaunchMemSyncDomain>(common_mem_sync_domain);
       for (auto node : kernel_nodes_for_common_attrs) {
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             node, CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN, &mem_domain_attr));
       }
     }
@@ -886,7 +858,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       mem_map_attr.memSyncDomainMap.default_ = common_mem_sync_domain_default;
       mem_map_attr.memSyncDomainMap.remote = common_mem_sync_domain_remote;
       for (auto node : kernel_nodes_for_common_attrs) {
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             node, CU_KERNEL_NODE_ATTRIBUTE_MEM_SYNC_DOMAIN_MAP, &mem_map_attr));
       }
     }
@@ -895,7 +867,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       memset(&carveout_attr, 0, sizeof(carveout_attr));
       carveout_attr.sharedMemCarveout = common_preferred_shared_mem_carveout;
       for (auto node : kernel_nodes_for_common_attrs) {
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             node, CU_KERNEL_NODE_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, &carveout_attr));
       }
     }
@@ -904,7 +876,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       memset(&pss_attr, 0, sizeof(pss_attr));
       pss_attr.programmaticStreamSerializationAllowed = common_programmatic_stream_serialization;
       for (auto node : kernel_nodes_for_common_attrs) {
-        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(
+        FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(
             node,
             static_cast<CUkernelNodeAttrID>(CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION),
             &pss_attr));
@@ -947,7 +919,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
     if (dep_result != CUDA_SUCCESS) {
       fprintf(stderr, "[foundry LOAD ERROR] cuGraphAddDependencies FAILED with error %d\n",
               dep_result);
-      C10_CUDA_DRIVER_CHECK(dep_result);
+      FOUNDRY_CU_CHECK(dep_result);
     }
   }
 
@@ -976,7 +948,7 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
       load_result.outputs = reconstruct_fn(tensors_array[0].as_object());
     } else if (load_result.output_type == OutputTensorType::List ||
                load_result.output_type == OutputTensorType::Tuple) {
-      std::vector<at::Tensor> tensors;
+      std::vector<Tensor> tensors;
       tensors.reserve(tensors_array.size());
       for (const auto& t_val : tensors_array) {
         tensors.push_back(reconstruct_fn(t_val.as_object()));
@@ -1020,9 +992,9 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
   // shared_exec may be nullptr when on-demand prep runs in parallel with
   // template builds.  link_on_demand_shared_exec() sets it later.
   if (shared_exec) {
-    TORCH_CHECK(nodes_array.size() == shared_exec->ordered_nodes.size(),
-                "On-demand mismatch: JSON has ", nodes_array.size(), " nodes but template has ",
-                shared_exec->ordered_nodes.size());
+    FOUNDRY_CHECK(nodes_array.size() == shared_exec->ordered_nodes.size(),
+                  "On-demand mismatch: JSON has ", nodes_array.size(), " nodes but template has ",
+                  shared_exec->ordered_nodes.size());
     data->shared_exec = shared_exec;
   }
 
@@ -1288,7 +1260,7 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
       CUevent event;
       auto eit = event_id_to_event.find(event_id);
       if (eit == event_id_to_event.end()) {
-        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, saved_event_flags(params)));
+        FOUNDRY_CU_CHECK(cuEventCreate(&event, saved_event_flags(params)));
         event_id_to_event[event_id] = event;
         if (!graph->loaded_graph_resources_) {
           graph->loaded_graph_resources_ = std::make_unique<LoadedGraphResources>();
@@ -1310,7 +1282,7 @@ void CUDAGraph::prepare_on_demand_graph(ParsedGraphData& parsed, CUcontext ctx,
       CUevent event;
       auto eit = event_id_to_event.find(event_id);
       if (eit == event_id_to_event.end()) {
-        C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, saved_event_flags(params)));
+        FOUNDRY_CU_CHECK(cuEventCreate(&event, saved_event_flags(params)));
         event_id_to_event[event_id] = event;
         if (!graph->loaded_graph_resources_) {
           graph->loaded_graph_resources_ = std::make_unique<LoadedGraphResources>();
@@ -1358,8 +1330,8 @@ void CUDAGraph::prepare_on_demand_graph_binary(const BinaryGraphFile& bin_file,
   data->updates.resize(num_nodes);
 
   if (shared_exec) {
-    TORCH_CHECK(num_nodes == shared_exec->ordered_nodes.size(), "On-demand mismatch: binary has ",
-                num_nodes, " nodes but template has ", shared_exec->ordered_nodes.size());
+    FOUNDRY_CHECK(num_nodes == shared_exec->ordered_nodes.size(), "On-demand mismatch: binary has ",
+                  num_nodes, " nodes but template has ", shared_exec->ordered_nodes.size());
     data->shared_exec = shared_exec;
   }
 
@@ -1592,7 +1564,7 @@ void CUDAGraph::prepare_on_demand_graph_binary(const BinaryGraphFile& bin_file,
         auto eit = event_id_to_event.find(event_id);
         CUevent event;
         if (eit == event_id_to_event.end()) {
-          C10_CUDA_DRIVER_CHECK(cuEventCreate(&event, entry.event.flags));
+          FOUNDRY_CU_CHECK(cuEventCreate(&event, entry.event.flags));
           event_id_to_event[event_id] = event;
           if (!graph->loaded_graph_resources_) {
             graph->loaded_graph_resources_ = std::make_unique<LoadedGraphResources>();
@@ -1644,7 +1616,7 @@ void apply_binary_kernel_attrs(CUgraphNode n, uint32_t flags, const binary_forma
                                bool per_node) {
   namespace bf = binary_format;
   auto set_attr = [](CUgraphNode n, CUkernelNodeAttrID id, const CUkernelNodeAttrValue& v) {
-    C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeSetAttribute(n, id, &v));
+    FOUNDRY_CU_CHECK(cuGraphKernelNodeSetAttribute(n, id, &v));
   };
   CUkernelNodeAttrValue v;
   unsigned cx = 0, cy = 0, cz = 0;
@@ -1746,19 +1718,19 @@ void CUDAGraph::build_template_graph_binary(const BinaryGraphFile& bin_file, CUD
                                             CUcontext ctx, GraphTemplate* out_template,
                                             BuildTiming* timing) {
   namespace bf = binary_format;
-  TORCH_CHECK(graph.on_demand_data_ != nullptr,
-              "build_template_graph_binary: the template's on-demand data is not prepared");
-  TORCH_CHECK(bin_file.header.flags & bf::FLAG_COMPLETE_KERNEL_ATTRS,
-              "build_template_graph_binary: binary does not hold every kernel attribute");
+  FOUNDRY_CHECK(graph.on_demand_data_ != nullptr,
+                "build_template_graph_binary: the template's on-demand data is not prepared");
+  FOUNDRY_CHECK(bin_file.header.flags & bf::FLAG_COMPLETE_KERNEL_ATTRS,
+                "build_template_graph_binary: binary does not hold every kernel attribute");
   BuildTiming& bt = *timing;
   const bf::BinNodeEntry* nodes = bin_file.node_table();
   const uint32_t num_nodes = bin_file.header.num_nodes;
   auto& updates = graph.on_demand_data_->updates;
-  TORCH_CHECK(updates.size() == num_nodes, "build_template_graph_binary: ", updates.size(),
-              " prepared nodes vs ", num_nodes, " in the binary");
+  FOUNDRY_CHECK(updates.size() == num_nodes, "build_template_graph_binary: ", updates.size(),
+                " prepared nodes vs ", num_nodes, " in the binary");
 
   CUgraph cuGraph;
-  C10_CUDA_DRIVER_CHECK(cuGraphCreate(&cuGraph, 0));
+  FOUNDRY_CU_CHECK(cuGraphCreate(&cuGraph, 0));
   out_template->cuGraph = cuGraph;
   out_template->ordered_nodes.reserve(num_nodes);
 
@@ -1791,7 +1763,7 @@ void CUDAGraph::build_template_graph_binary(const BinaryGraphFile& bin_file, CUD
                   u.kernel_params.gridDimX, u.kernel_params.gridDimY, u.kernel_params.gridDimZ,
                   u.kernel_params.blockDimX, u.kernel_params.blockDimY, u.kernel_params.blockDimZ,
                   u.kernel_params.sharedMemBytes);
-          C10_CUDA_DRIVER_CHECK(r);
+          FOUNDRY_CU_CHECK(r);
         }
         bt.add_ms += bt_ms(t_add);
         auto t_attr = bt_clock::now();
@@ -1806,7 +1778,7 @@ void CUDAGraph::build_template_graph_binary(const BinaryGraphFile& bin_file, CUD
           fprintf(stderr,
                   "[foundry LOAD ERROR] cuGraphAddMemcpyNode FAILED for node %u with error %d\n",
                   entry.node_id, r);
-          C10_CUDA_DRIVER_CHECK(r);
+          FOUNDRY_CU_CHECK(r);
         }
         bt.add_ms += bt_ms(t_add);
         break;
@@ -1817,26 +1789,26 @@ void CUDAGraph::build_template_graph_binary(const BinaryGraphFile& bin_file, CUD
           fprintf(stderr,
                   "[foundry LOAD ERROR] cuGraphAddMemsetNode FAILED for node %u with error %d\n",
                   entry.node_id, r);
-          C10_CUDA_DRIVER_CHECK(r);
+          FOUNDRY_CU_CHECK(r);
         }
         bt.add_ms += bt_ms(t_add);
         break;
       }
       case bf::NODE_EVENT_RECORD:
-        C10_CUDA_DRIVER_CHECK(cuGraphAddEventRecordNode(&cuNode, cuGraph, nullptr, 0, u.event));
+        FOUNDRY_CU_CHECK(cuGraphAddEventRecordNode(&cuNode, cuGraph, nullptr, 0, u.event));
         bt.add_ms += bt_ms(t_add);
         break;
       case bf::NODE_EVENT_WAIT:
-        C10_CUDA_DRIVER_CHECK(cuGraphAddEventWaitNode(&cuNode, cuGraph, nullptr, 0, u.event));
+        FOUNDRY_CU_CHECK(cuGraphAddEventWaitNode(&cuNode, cuGraph, nullptr, 0, u.event));
         bt.add_ms += bt_ms(t_add);
         break;
       case bf::NODE_EMPTY:
-        C10_CUDA_DRIVER_CHECK(cuGraphAddEmptyNode(&cuNode, cuGraph, nullptr, 0));
+        FOUNDRY_CU_CHECK(cuGraphAddEmptyNode(&cuNode, cuGraph, nullptr, 0));
         bt.add_ms += bt_ms(t_add);
         break;
     }
-    TORCH_CHECK(cuNode != nullptr, "build_template_graph_binary: unknown node type ",
-                (int)entry.type, " at node ", idx);
+    FOUNDRY_CHECK(cuNode != nullptr, "build_template_graph_binary: unknown node type ",
+                  (int)entry.type, " at node ", idx);
     id_to_node[entry.node_id] = cuNode;
     out_template->ordered_nodes.push_back(cuNode);
   }
@@ -1861,8 +1833,8 @@ void CUDAGraph::build_template_graph_binary(const BinaryGraphFile& bin_file, CUD
     memset(edge_data.data(), 0, edge_data.size() * sizeof(CUgraphEdgeData));
     auto lookup = [&](uint32_t id) {
       auto it = id_to_node.find(id);
-      TORCH_CHECK(it != id_to_node.end(),
-                  "build_template_graph_binary: dependency on unknown node ", id);
+      FOUNDRY_CHECK(it != id_to_node.end(),
+                    "build_template_graph_binary: dependency on unknown node ", id);
       return it->second;
     };
     if (bin_file.header.version >= 2) {
@@ -1888,7 +1860,7 @@ void CUDAGraph::build_template_graph_binary(const BinaryGraphFile& bin_file, CUD
     if (dep_result != CUDA_SUCCESS) {
       fprintf(stderr, "[foundry LOAD ERROR] cuGraphAddDependencies FAILED with error %d\n",
               dep_result);
-      C10_CUDA_DRIVER_CHECK(dep_result);
+      FOUNDRY_CU_CHECK(dep_result);
     }
   }
   bt.deps_ms += bt_ms(t_deps);
@@ -1896,12 +1868,12 @@ void CUDAGraph::build_template_graph_binary(const BinaryGraphFile& bin_file, CUD
 
 void CUDAGraph::link_on_demand_shared_exec(CUDAGraph& graph,
                                            std::shared_ptr<SharedGraphExec> shared_exec) {
-  TORCH_CHECK(graph.on_demand_data_ != nullptr,
-              "link_on_demand_shared_exec: graph has no on_demand_data_");
-  TORCH_CHECK(shared_exec != nullptr, "link_on_demand_shared_exec: shared_exec is nullptr");
-  TORCH_CHECK(graph.on_demand_data_->updates.size() == shared_exec->ordered_nodes.size(),
-              "On-demand mismatch: graph has ", graph.on_demand_data_->updates.size(),
-              " updates but template has ", shared_exec->ordered_nodes.size());
+  FOUNDRY_CHECK(graph.on_demand_data_ != nullptr,
+                "link_on_demand_shared_exec: graph has no on_demand_data_");
+  FOUNDRY_CHECK(shared_exec != nullptr, "link_on_demand_shared_exec: shared_exec is nullptr");
+  FOUNDRY_CHECK(graph.on_demand_data_->updates.size() == shared_exec->ordered_nodes.size(),
+                "On-demand mismatch: graph has ", graph.on_demand_data_->updates.size(),
+                " updates but template has ", shared_exec->ordered_nodes.size());
 
   // Share mode: cuGraphExecUpdate does not carry node attributes, so a member
   // must launch the template's cluster shape.
@@ -1911,7 +1883,7 @@ void CUDAGraph::link_on_demand_shared_exec(CUDAGraph& graph,
       if (update.type != OnDemandNodeUpdate::Kernel)
         continue;
       CUkernelNodeAttrValue cluster{}, preferred{};
-      C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeGetAttribute(
+      FOUNDRY_CU_CHECK(cuGraphKernelNodeGetAttribute(
           shared_exec->ordered_nodes[i], CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &cluster));
       // Not every driver reports this attribute (580.105.08 returns INVALID_VALUE,
       // "Invalid kernel attribute: 11"); analyze_captured_graph ignores the same
@@ -1921,14 +1893,14 @@ void CUDAGraph::link_on_demand_shared_exec(CUDAGraph& graph,
                                         &preferred) != CUDA_SUCCESS)
         preferred = CUkernelNodeAttrValue{};
       const auto& attrs = update.kernel_attrs;
-      TORCH_CHECK(cluster.clusterDim.x == attrs.clusterDimX &&
-                      cluster.clusterDim.y == attrs.clusterDimY &&
-                      cluster.clusterDim.z == attrs.clusterDimZ &&
-                      preferred.preferredClusterDim.x == attrs.preferredClusterDimX &&
-                      preferred.preferredClusterDim.y == attrs.preferredClusterDimY &&
-                      preferred.preferredClusterDim.z == attrs.preferredClusterDimZ,
-                  "exec share: cluster dimensions differ from the template for graph ",
-                  graph.on_demand_data_->graph_name, " node ", i);
+      FOUNDRY_CHECK(cluster.clusterDim.x == attrs.clusterDimX &&
+                        cluster.clusterDim.y == attrs.clusterDimY &&
+                        cluster.clusterDim.z == attrs.clusterDimZ &&
+                        preferred.preferredClusterDim.x == attrs.preferredClusterDimX &&
+                        preferred.preferredClusterDim.y == attrs.preferredClusterDimY &&
+                        preferred.preferredClusterDim.z == attrs.preferredClusterDimZ,
+                    "exec share: cluster dimensions differ from the template for graph ",
+                    graph.on_demand_data_->graph_name, " node ", i);
     }
   }
 
@@ -1955,7 +1927,7 @@ static GraphLoadResult make_load_result_from_extracted(
       result.outputs = reconstruct_fn(tensors_array[0].as_object());
     } else if (result.output_type == OutputTensorType::List ||
                result.output_type == OutputTensorType::Tuple) {
-      std::vector<at::Tensor> tensors;
+      std::vector<Tensor> tensors;
       tensors.reserve(tensors_array.size());
       for (const auto& t_val : tensors_array) {
         tensors.push_back(reconstruct_fn(t_val.as_object()));
@@ -2008,7 +1980,7 @@ CUgraph build_prewarm_graph(const BinaryGraphFile& b, CUcontext ctx, CUdevice de
   const uint8_t* pd = b.param_data();
   const uint8_t* abd = b.arg_buffer_data();
   CUgraph g;
-  C10_CUDA_DRIVER_CHECK(cuGraphCreate(&g, 0));
+  FOUNDRY_CU_CHECK(cuGraphCreate(&g, 0));
   std::unordered_map<uint32_t, CUgraphNode> id_to_node;
   std::vector<void*> ptrs;
   for (uint32_t idx = 0; idx < b.header.num_nodes; ++idx) {
@@ -2106,11 +2078,11 @@ void run_exec_pool_prewarm(const std::vector<std::string>& json_paths, CUcontext
   auto ms_since = [](clk::time_point a) {
     return std::chrono::duration<double, std::milli>(clk::now() - a).count();
   };
-  C10_CUDA_DRIVER_CHECK(cuCtxSetCurrent(ctx));
+  FOUNDRY_CU_CHECK(cuCtxSetCurrent(ctx));
   auto t0 = clk::now();
   const double start_epoch = epoch_s();
   size_t free0 = 0, free_peak = 0, free_end = 0, total = 0;
-  C10_CUDA_DRIVER_CHECK(cuMemGetInfo(&free0, &total));
+  FOUNDRY_CU_CHECK(cuMemGetInfo(&free0, &total));
   const double rss0 = rss_mb();
   std::vector<cudaGraphExec_t> execs;
   size_t nodes = 0;
@@ -2135,14 +2107,14 @@ void run_exec_pool_prewarm(const std::vector<std::string>& json_paths, CUcontext
     auto t_i = clk::now();
     execs.push_back(CUDAGraph::instantiate_graph_exec(reinterpret_cast<cudaGraph_t>(g)));
     inst_ms += ms_since(t_i);
-    C10_CUDA_DRIVER_CHECK(cuGraphDestroy(g));
+    FOUNDRY_CU_CHECK(cuGraphDestroy(g));
     nodes += n;
   }
-  C10_CUDA_DRIVER_CHECK(cuMemGetInfo(&free_peak, &total));
+  FOUNDRY_CU_CHECK(cuMemGetInfo(&free_peak, &total));
   const double rss_peak = rss_mb();
   for (auto e : execs)
-    C10_CUDA_CHECK(cudaGraphExecDestroy(e));
-  C10_CUDA_DRIVER_CHECK(cuMemGetInfo(&free_end, &total));
+    FOUNDRY_CUDA_CHECK(cudaGraphExecDestroy(e));
+  FOUNDRY_CU_CHECK(cuMemGetInfo(&free_end, &total));
   const double rss_end = rss_mb();
   // Device-memory and RSS deltas include whatever the engine allocated concurrently.
   fprintf(stderr,
@@ -2195,10 +2167,10 @@ void CUDAGraph::start_exec_pool_prewarm(const std::vector<std::string>& json_pat
     return;
   }
   CUcontext ctx = nullptr;
-  C10_CUDA_DRIVER_CHECK(cuCtxGetCurrent(&ctx));
-  TORCH_CHECK(ctx != nullptr, "start_exec_pool_prewarm: no CUDA context on this thread");
+  FOUNDRY_CU_CHECK(cuCtxGetCurrent(&ctx));
+  FOUNDRY_CHECK(ctx != nullptr, "start_exec_pool_prewarm: no CUDA context on this thread");
   CUdevice dev;
-  C10_CUDA_DRIVER_CHECK(cuCtxGetDevice(&dev));
+  FOUNDRY_CU_CHECK(cuCtxGetDevice(&dev));
   auto promise = std::make_shared<std::promise<void>>();
   {
     std::lock_guard<std::mutex> lock(g_prewarm_mutex);
@@ -2233,8 +2205,7 @@ void CUDAGraph::start_exec_pool_prewarm(const std::vector<std::string>& json_pat
 // ============================================================================
 
 std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
-    const std::vector<std::string>& json_paths, MempoolId_t pool, int num_threads,
-    CUDAGeneratorStateRegistry& registry) {
+    const std::vector<std::string>& json_paths, MempoolId_t pool, int num_threads) {
   auto pending = std::make_shared<PendingGraphLoads>();
   size_t num_graphs = json_paths.size();
 
@@ -2245,20 +2216,16 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
   int actual_threads = std::min(num_threads, static_cast<int>(num_graphs));
 
   CUcontext main_ctx;
-  C10_CUDA_DRIVER_CHECK(cuCtxGetCurrent(&main_ctx));
-  TORCH_CHECK(main_ctx != nullptr, "No CUDA context on main thread");
+  FOUNDRY_CU_CHECK(cuCtxGetCurrent(&main_ctx));
+  FOUNDRY_CHECK(main_ctx != nullptr, "No CUDA context on main thread");
 
-  c10::DeviceIndex dev = c10::cuda::current_device();
+  DeviceIndex dev = current_device();
 
+  // Store-only on LOAD (pending->pool and the shells' mempool_id_).
   MempoolId_t resolved_pool = pool;
-  if (resolved_pool.first == 0 && resolved_pool.second == 0) {
-    resolved_pool = torch_graph_pool_handle(false);
-    TORCH_INTERNAL_ASSERT(resolved_pool.first > 0);
-  }
 
   pending->pool = resolved_pool;
   pending->dev = dev;
-  pending->registry = &registry;
   pending->entries.resize(num_graphs);
 
   using Clock = std::chrono::steady_clock;
@@ -2358,8 +2325,8 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
 
       // Create graph shell via prepare_graph_shell (handles mempool, capture_dev, etc.)
       // Generators already extracted above, so shell_root has no generators key.
-      ParsedGraphData parsed = CUDAGraph::prepare_graph_shell(
-          boost::json::value(std::move(shell_root)), resolved_pool, registry);
+      ParsedGraphData parsed =
+          CUDAGraph::prepare_graph_shell(boost::json::value(std::move(shell_root)), resolved_pool);
 
       // Allocator events (embedded JSON, ~0.5KB)
       if (bf_data.header.flags & bf::FLAG_HAS_ALLOCATOR_EVENTS) {
@@ -2390,12 +2357,12 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       }
 
       ParsedGraphData parsed =
-          CUDAGraph::prepare_graph_shell(std::move(parsed_jsons[i]), resolved_pool, registry);
+          CUDAGraph::prepare_graph_shell(std::move(parsed_jsons[i]), resolved_pool);
 
       boost::json::object& root = parsed.root_val.as_object();
 
       auto alloc_it = root.find("allocator_events");
-      TORCH_CHECK(alloc_it != root.end(), "Missing allocator_events in graph JSON");
+      FOUNDRY_CHECK(alloc_it != root.end(), "Missing allocator_events in graph JSON");
       pending->entries[i].allocator_events = std::move(alloc_it->value());
       root.erase(alloc_it);
 
@@ -2580,7 +2547,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
     size_t num = all_parsed.size();
 
     try {
-      C10_CUDA_DRIVER_CHECK(cuCtxSetCurrent(main_ctx));
+      FOUNDRY_CU_CHECK(cuCtxSetCurrent(main_ctx));
 
       // Shared execs, indexed by template graph index (written by this thread only).
       std::unordered_map<size_t, std::shared_ptr<CUDAGraph::SharedGraphExec>> shared_execs;
@@ -2628,15 +2595,15 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         // JSON is not needed). Eager mode keeps the saved groups.
         auto dag = [&](size_t idx) {
           const auto& bin = bin_files[idx];
-          TORCH_CHECK(binary_template(idx) && bin.header.version >= 2,
-                      "exec share needs complete binary archives (.cugraph v2+); re-SAVE graph ",
-                      idx);
+          FOUNDRY_CHECK(binary_template(idx) && bin.header.version >= 2,
+                        "exec share needs complete binary archives (.cugraph v2+); re-SAVE graph ",
+                        idx);
           std::unordered_map<uint32_t, uint32_t> ids;
           for (uint32_t n = 0; n < bin.header.num_nodes; ++n)
             ids.emplace(bin.node_table()[n].node_id, n);
-          TORCH_CHECK(bin.header.num_dependencies == 0 ||
-                          (bin.header.flags & binary_format::FLAG_HAS_DEPENDENCIES),
-                      "exec share: graph ", idx, " has no dependency table; re-SAVE");
+          FOUNDRY_CHECK(bin.header.num_dependencies == 0 ||
+                            (bin.header.flags & binary_format::FLAG_HAS_DEPENDENCIES),
+                        "exec share: graph ", idx, " has no dependency table; re-SAVE");
           std::vector<std::array<uint32_t, 5>> result;
           const auto* deps = bin.section_ptr<binary_format::BinDependency>(
               binary_format::SECTION_DEPENDENCY_TABLE);
@@ -2692,7 +2659,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
         return [&all_parsed, &graph_names, &bin_files, &prep_ms, main_ctx, i]() {
           // Bind the captured context on this pool worker thread: prep creates events
           // (cross-stream graphs) and sets function attributes.
-          C10_CUDA_DRIVER_CHECK(cuCtxSetCurrent(main_ctx));
+          FOUNDRY_CU_CHECK(cuCtxSetCurrent(main_ctx));
           auto t0 = std::chrono::steady_clock::now();
           if (bin_files[i].valid()) {
             CUDAGraph::prepare_on_demand_graph_binary(bin_files[i], all_parsed[i].graph, main_ctx,
@@ -2759,7 +2726,7 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
       size_t free_before = 0, free_after = 0, mem_total = 0;
       submit([&prewarm_done, &free_before, &mem_total] {
         prewarm_done = join_exec_pool_prewarm();
-        C10_CUDA_DRIVER_CHECK(cuMemGetInfo(&free_before, &mem_total));
+        FOUNDRY_CU_CHECK(cuMemGetInfo(&free_before, &mem_total));
       });
       for (size_t tmpl_idx : tmpl_order) {
         auto shared = std::make_shared<CUDAGraph::SharedGraphExec>();
@@ -2922,9 +2889,8 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
           set_free(g);
         });
       }
-      submit([&free_after, &mem_total] {
-        C10_CUDA_DRIVER_CHECK(cuMemGetInfo(&free_after, &mem_total));
-      });
+      submit(
+          [&free_after, &mem_total] { FOUNDRY_CU_CHECK(cuMemGetInfo(&free_after, &mem_total)); });
       inst.finish();
       inst.rethrow();
 
@@ -3000,7 +2966,7 @@ GraphLoadResult finish_one_graph_load_impl(std::shared_ptr<PendingGraphLoads> pe
   // below would abort ("Memory offset mismatch during replay", observed
   // as a 2 MB drift on A100). Suspend the region so any segment growth
   // lands outside the tracked cursor.
-  if (pending->registry && !entry.generators_meta.is_null()) {
+  if (!entry.generators_meta.is_null()) {
     foundry::SuspendAllocationRegion suspend_region;
     const boost::json::array& gen_array = entry.generators_meta.as_array();
     for (const auto& gen_val : gen_array) {
@@ -3008,9 +2974,7 @@ GraphLoadResult finish_one_graph_load_impl(std::shared_ptr<PendingGraphLoads> pe
       uint64_t state_id = gen_obj.at("id").to_number<uint64_t>();
       uint64_t seed = gen_obj.at("seed").to_number<uint64_t>();
       uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
-
-      auto state = pending->registry->get_state_from_id(state_id, seed);
-      entry.graph->register_generator_state(state, wholegraph_increment);
+      entry.graph->register_native_rng(state_id, seed, wholegraph_increment);
     }
   }
 

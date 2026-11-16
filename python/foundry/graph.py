@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -96,25 +97,126 @@ class LoadedEvent(NamedTuple):
     event: RestoredEvent  # the handle as a torch.cuda.Event
 
 
+def _check_rng_buffers_loadable(rng: dict) -> None:
+    """SAVE, graphs with RNG only: LOAD re-creates the seed/offset buffers the kernels read
+    by repeating torch 2.14's allocation (CUDAGeneratorCaptureState::initialize: two int64[1]
+    on the default stream, default pool), so their addresses match only if SAVE's came from
+    there. torch builds that allocate them elsewhere (e.g. per-graph RNG state created in
+    CUDAGraph::capture_begin on the capture stream) are refused here instead of loading
+    silently wrong random numbers."""
+    segments = torch.cuda.memory_snapshot()
+    for name in ("seed_ptr", "offset_ptr"):
+        addr = rng[name]
+        seg = next(
+            (s for s in segments if s["address"] <= addr < s["address"] + s["total_size"]), None
+        )
+        if seg is None:
+            where = "not in a caching-allocator segment"
+        else:
+            stream, pool = seg.get("stream"), tuple(seg.get("segment_pool_id", (None, None)))
+            if stream == 0 and pool == (0, 0):
+                continue
+            where = f"in a segment of stream {stream:#x}, pool {pool}"
+        raise RuntimeError(
+            f"foundry capture: unsupported: RNG in a graph on torch {torch.__version__}: the "
+            f"default generator's capture {name[:-4]} buffer {addr:#x} is {where}, not in the "
+            "default stream's default pool, so LOAD cannot reproduce its address"
+        )
+
+
 class CUDAGraph(ops.CUDAGraph):
     def __new__(cls, keep_graph: bool = False):
         return super().__new__(cls, keep_graph)
 
+    # SAVE captures with torch's own torch.cuda.CUDAGraph(keep_graph=True) inside
+    # foundry's hook record and hands the raw cudaGraph_t to foundry for analysis and
+    # save. The torch graph owning the capture, and its RNG probe:
+    _native_graph = None
+    _native_rng = None
+
     def capture_begin(
         self, pool: _POOL_HANDLE | None = None, capture_error_mode: str = "global"
     ) -> None:
-        super().capture_begin(pool=pool, capture_error_mode=capture_error_mode)
+        if self._native_graph is not None:
+            raise RuntimeError("This CUDAGraph instance already owns a captured graph.")
+        gen = torch.cuda.default_generators[torch.cuda.current_device()]
+        if not hasattr(gen, "philox_state"):
+            raise RuntimeError(
+                "foundry native capture: unsupported torch "
+                f"{torch.__version__} (needs Generator.philox_state, torch >= 2.14)"
+            )
+        native = torch.cuda.CUDAGraph(keep_graph=True)
+        # Hook record window: opened before torch's beginAllocateToPool, closed by
+        # adopt_native_capture after torch's endAllocateToPool (same as capture_begin/_end).
+        ops.native_record_begin()
+        try:
+            native.capture_begin(pool=pool, capture_error_mode=capture_error_mode)
+        except BaseException:
+            ops.native_record_abort()
+            raise
+        self._native_graph = native
 
     def capture_end(self) -> None:
-        super().capture_end()
+        native = self._native_graph
+        if native is None:
+            raise RuntimeError("capture_end() without capture_begin()")
+        device = torch.cuda.current_device()
+        gen = torch.cuda.default_generators[device]
+        try:
+            # Still capturing: returns aliases of this capture's seed/offset buffers of the
+            # default generator (creating them, like foundry's own capture_begin always does)
+            # and the offset consumed so far = torch's wholegraph_increment for it.
+            # v2.14.1 aten/src/ATen/cuda/CUDAGeneratorImpl.cpp:516-536.
+            seed_buf, offset_buf, intragraph = gen.philox_state(0)
+            native.capture_end()
+        except BaseException:
+            ops.native_record_abort()
+            raise
+        increment = int(intragraph.item())
+        seed = gen.initial_seed()
+        self._native_rng = {
+            "seed_ptr": seed_buf.data_ptr(),
+            "offset_ptr": offset_buf.data_ptr(),
+            "increment": increment,
+            "seed": seed,
+        }
+        del seed_buf, offset_buf
+        if os.environ.get("FOUNDRY_E5_DEBUG") == "1":
+            print(
+                f"[foundry E2] native capture: rng seed_buf={self._native_rng['seed_ptr']:#x} "
+                f"offset_buf={self._native_rng['offset_ptr']:#x} increment={increment} "
+                f"seed={seed}",
+                file=sys.stderr,
+            )
+        if increment:
+            try:
+                _check_rng_buffers_loadable(self._native_rng)
+            except BaseException:
+                ops.native_record_abort()
+                raise
+        # Default generator of the capture device; id as foundry's registry gives the first
+        # generator it sees (CUDAGeneratorStateRegistry::id_counter starts at 0).
+        # NOT covered: RNG from any other generator (no public API lists the generators the
+        # torch graph registered on 2.14.1); such a graph is saved without its RNG state.
+        generators = [(device, seed, increment)]
+        super().adopt_native_capture(native.raw_cuda_graph(), native.pool(), generators)
 
     def replay(self) -> None:
+        if self._native_graph is not None:
+            # torch's replay runs its own RNG prologue (fills the seed/offset buffers)
+            self._native_graph.replay()
+            return
         super().replay()
 
     def reset(self) -> None:
+        if self._native_graph is not None:
+            self._native_graph.reset()
+            self._native_graph = None
         super().reset()
 
     def pool(self) -> _POOL_HANDLE:
+        if self._native_graph is not None:
+            return self._native_graph.pool()
         return super().pool()
 
     def enable_debug_mode(self) -> None:
