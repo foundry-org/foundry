@@ -319,7 +319,9 @@ void CUDAGraph::save_binary(const std::string& bin_path, const boost::json::obje
   for (const auto& gen_val : generators_array) {
     const json::object& g = gen_val.as_object();
     gens.push_back({g.at("id").to_number<uint64_t>(), g.at("seed").to_number<uint64_t>(),
-                    g.at("wholegraph_increment").to_number<uint64_t>()});
+                    g.at("wholegraph_increment").to_number<uint64_t>(),
+                    g.at("placement").to_number<uint64_t>(), g.at("seed_ptr").to_number<uint64_t>(),
+                    g.at("offset_ptr").to_number<uint64_t>()});
   }
 
   // ---- JSON sections (allocator_events, output_tensors) ----
@@ -751,6 +753,9 @@ boost::json::value read_and_parse_binary_graph(const std::string& bin_path) {
       g["id"] = gens[i].id;
       g["seed"] = gens[i].seed;
       g["wholegraph_increment"] = gens[i].wholegraph_increment;
+      g["placement"] = gens[i].placement;
+      g["seed_ptr"] = gens[i].seed_ptr;
+      g["offset_ptr"] = gens[i].offset_ptr;
       gens_array.push_back(g);
     }
     root["generators"] = std::move(gens_array);

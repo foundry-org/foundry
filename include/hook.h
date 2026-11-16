@@ -72,6 +72,9 @@ void end_hook_record();
 void clear_hook_events();
 boost::json::object save_hook_events_to_json();
 void replay_hook_events_from_json(const boost::json::object& events_obj);
+// [addr, addr+len) lies inside one driver allocation that a closed record window
+// recorded (SAVE) or replay_hook_events_from_json made (LOAD), not freed since.
+bool recorded_allocation_contains(uint64_t addr, size_t len);
 
 std::variant<CUfunction, CUkernel> query_function_handle(uint64_t binary_hash,
                                                          const std::string& function_name);

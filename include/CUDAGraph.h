@@ -63,18 +63,24 @@ struct FoundryRngState {
 };
 std::shared_ptr<FoundryRngState> foundry_rng_state_from_id(uint64_t id, uint64_t seed);
 
-// Per (loaded graph, generator id) seed/offset buffers whose addresses the archived
-// kernels read (torch's CUDAGeneratorCaptureState::rng_state_{seed,offset}_extragraph_
-// at SAVE). Allocated from torch's caching allocator through the stable shim.
+// Where SAVE found the default generator's capture seed/offset buffers (archive
+// "placement"). The only placement: inside a driver allocation Foundry recorded in a
+// record window (torch created them in Foundry's RNG pool, foundry/graph.py _rng_pool);
+// the archive carries the addresses, LOAD allocates nothing and writes there.
+enum class RngPlacement : uint64_t {
+  Recorded = 1,
+};
+// (id, seed, wholegraph_increment, placement, seed_ptr, offset_ptr) as SAVE passes them.
+using NativeGenerator = std::tuple<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t>;
+
+// Per (loaded graph, generator id) seed/offset buffer addresses the archived kernels read
+// (torch's CUDAGeneratorCaptureState::rng_state_{seed,offset}_extragraph_ at SAVE).
 struct LoadedRngBuffers {
   uint64_t id = 0;
   std::shared_ptr<FoundryRngState> state;
   uint64_t wholegraph_increment = 0;
-  TensorHandle seed_buf;  // declared before offset_buf: destroyed after it, as upstream
-  TensorHandle offset_buf;
-  // Streams a replay wrote/read the buffers on; synchronized before the buffers are
-  // freed (replaces torch's recordStream, which has no stable shim).
-  std::vector<cudaStream_t> replay_streams;
+  uint64_t seed_ptr = 0;  // device addresses the replay prologue writes
+  uint64_t offset_ptr = 0;
 };
 
 struct CUDAGraph {
@@ -86,9 +92,12 @@ struct CUDAGraph {
   CUDAGraph(bool keep_graph = false);
   ~CUDAGraph();
 
-  // LOAD: allocate this graph's seed/offset buffers for archived generator `id`
-  // (same allocations as torch's CUDAGeneratorCaptureState::initialize).
-  void register_native_rng(uint64_t id, uint64_t seed, uint64_t wholegraph_increment);
+  // LOAD: register one archived generator entry (its archived seed/offset buffer
+  // addresses; no allocation).
+  void register_native_rng(const boost::json::object& gen);
+  // LOAD, after this graph's allocator events were replayed: every archived RNG address
+  // must lie in a live allocation Foundry replayed; raises otherwise.
+  void verify_native_rng() const;
   void instantiate();
   void replay();
   std::string exec_share_stats() const;
@@ -125,10 +134,10 @@ struct CUDAGraph {
   // Adopt the cudaGraph_t of a torch.cuda.CUDAGraph(keep_graph=True) whose
   // capture ran inside native_record_begin(): closes the hook record, analyzes the graph.
   // torch keeps owning the cudaGraph_t and the pool (never destroyed or released here);
-  // the caller keeps the torch graph alive. generators: (id, seed, wholegraph_increment).
-  void adopt_native_capture(
-      uintptr_t raw_graph, MempoolId_t pool,
-      const std::vector<std::tuple<uint64_t, uint64_t, uint64_t>>& generators);
+  // the caller keeps the torch graph alive. generators: NativeGenerator entries.
+  void adopt_native_capture(uintptr_t raw_graph, MempoolId_t pool,
+                            const std::vector<NativeGenerator>& generators,
+                            const std::vector<uint64_t>& rng_candidates = {});
   void save(const std::string& json_path, const OutputTensors& output_tensors = std::monostate{},
             OutputTensorType output_type = OutputTensorType::None);
   void save_binary(const std::string& bin_path, const boost::json::object& json_root);
@@ -325,7 +334,7 @@ struct CUDAGraph {
 
   // graph_ belongs to a torch CUDAGraph (adopt_native_capture).
   bool adopted_native_ = false;
-  std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> native_generators_;
+  std::vector<NativeGenerator> native_generators_;
   // Loaded graph's Foundry-owned RNG buffers.
   std::vector<LoadedRngBuffers> native_rng_;
   void native_rng_replay_prologue(cudaStream_t stream);

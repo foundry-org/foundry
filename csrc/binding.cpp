@@ -87,6 +87,11 @@ PYBIND11_MODULE(ops, m) {
   // SAVE: hook record window around torch's own capture (foundry/graph.py)
   m.def("native_record_begin", &::foundry::native_record_begin);
   m.def("native_record_abort", &::foundry::native_record_abort);
+  m.def(
+      "recorded_allocation_contains",
+      [](uint64_t addr, size_t len) { return ::foundry::recorded_allocation_contains(addr, len); },
+      py::arg("addr"), py::arg("len"),
+      "SAVE/LOAD: [addr, addr+len) lies in a live driver allocation Foundry recorded / replayed");
 
   m.def(
       "get_graph_ptr",
@@ -275,10 +280,12 @@ PYBIND11_MODULE(ops, m) {
       .def(
           "adopt_native_capture",
           [](::foundry::CUDAGraph& self, uintptr_t raw_graph, ::foundry::MempoolId_t pool,
-             const std::vector<std::tuple<uint64_t, uint64_t, uint64_t>>& generators) {
-            self.adopt_native_capture(raw_graph, pool, generators);
+             const std::vector<::foundry::NativeGenerator>& generators,
+             const std::vector<uint64_t>& rng_candidates) {
+            self.adopt_native_capture(raw_graph, pool, generators, rng_candidates);
           },
           py::arg("raw_graph"), py::arg("pool"), py::arg("generators"),
+          py::arg("rng_candidates") = std::vector<uint64_t>{},
           py::call_guard<py::gil_scoped_release>())
       .def("replay", &foundry::CUDAGraph::replay, py::call_guard<py::gil_scoped_release>())
       .def("exec_share_stats", &foundry::CUDAGraph::exec_share_stats)

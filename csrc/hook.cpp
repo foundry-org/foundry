@@ -4383,6 +4383,31 @@ void clear_hook_events() {
   hook_alloc_events.clear();
 }
 
+// Driver allocations Foundry recorded in a closed record window (SAVE) or made by
+// replaying recorded events (LOAD), not freed by a recorded/replayed free since:
+// ptr -> size. Same update rule on both sides, so a SAVE-time and a LOAD-time
+// recorded_allocation_contains() answer the same question.
+static std::mutex recorded_allocs_mutex;
+static std::map<CUdeviceptr, size_t> recorded_allocs;
+
+static void note_recorded_event(const std::string_view type, CUdeviceptr ptr, size_t size) {
+  std::lock_guard<std::mutex> lock(recorded_allocs_mutex);
+  if (type == "alloc") {
+    recorded_allocs[ptr] = size;
+  } else if (type == "free") {
+    recorded_allocs.erase(ptr);
+  }
+}
+
+bool recorded_allocation_contains(uint64_t addr, size_t len) {
+  std::lock_guard<std::mutex> lock(recorded_allocs_mutex);
+  auto it = recorded_allocs.upper_bound(static_cast<CUdeviceptr>(addr));
+  if (it == recorded_allocs.begin())
+    return false;
+  --it;
+  return addr >= it->first && addr + len <= it->first + it->second;
+}
+
 boost::json::object save_hook_events_to_json() {
   std::lock_guard<std::mutex> lock(hook_events_mutex);
 
@@ -4395,9 +4420,11 @@ boost::json::object save_hook_events_to_json() {
       event_obj["type"] = "alloc";
       event_obj["size"] = event.size;
       event_obj["ptr"] = static_cast<uint64_t>(event.ptr);
+      note_recorded_event("alloc", event.ptr, event.size);
     } else if (event.type == HookAllocationEvent::Type::Free) {
       event_obj["type"] = "free";
       event_obj["ptr"] = static_cast<uint64_t>(event.ptr);
+      note_recorded_event("free", event.ptr, 0);
     } else if (event.type == HookAllocationEvent::Type::Reserve) {
       event_obj["type"] = "reserve";
       event_obj["size"] = event.size;
@@ -4478,6 +4505,7 @@ void replay_hook_events_from_json(const boost::json::object& events_obj) {
       fprintf(stderr, "[REPLAY] OK: Allocated %zu bytes at expected address 0x%llx\n", size,
               (unsigned long long)actual_ptr);
 #endif
+      note_recorded_event("alloc", actual_ptr, size);
 
     } else if (type == "reserve") {
       // Just advance the pointer without physical mapping.
@@ -4509,6 +4537,7 @@ void replay_hook_events_from_json(const boost::json::object& events_obj) {
         fprintf(stderr, "[REPLAY] ERROR: cuMemFree_v2 failed for ptr=0x%llx\n",
                 (unsigned long long)ptr);
       }
+      note_recorded_event("free", static_cast<CUdeviceptr>(ptr), 0);
     }
   }
 }
