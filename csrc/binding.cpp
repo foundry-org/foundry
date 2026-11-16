@@ -47,7 +47,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "set_allocation_region",
       [](uintptr_t base, size_t size) {
-        ::foundry::set_allocation_region(reinterpret_cast<void*>(base), size);
+        return ::foundry::set_allocation_region(reinterpret_cast<void*>(base), size);
       },
       py::arg("base"), py::arg("size"), "Set allocation region for CUDA VMM hooks");
 

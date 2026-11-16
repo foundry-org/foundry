@@ -24,7 +24,7 @@ CUresult cuGetProcAddress(const char* symbol, void** pfn, int cudaVersion, cuuin
 
 namespace foundry {
 
-void set_allocation_region(void* base, size_t size);
+bool set_allocation_region(void* base, size_t size);
 void stop_allocation_region();
 void resume_allocation_region();
 bool allocation_region_enabled();
