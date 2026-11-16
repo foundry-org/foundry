@@ -8,7 +8,7 @@
 
 ```toml
 base_addr          = 0x600000000000          # start of VMM region (default)
-region_size        = "64GB"                  # total VMM reservation (default; the recipe uses 256GB)
+region_size        = "512GB"                 # VMM address reservation (default; the recipe uses 256GB)
 workspace_root     = "foundry_archive"       # on-disk workspace (default)
 graph_templates    = true                    # SAVE: group same-topology graphs under one template (default)
 
@@ -21,7 +21,7 @@ Every key is optional; `mode` comes from `--cuda-graph-persistence` (a `mode` ke
 `scratch_space_size` is ignored with an INFO line.
 
 - `base_addr` must be high enough not to collide with model weights or PyTorch's default heap. `0x600000000000` is a safe pick on x86_64.
-- `region_size` must exceed `final_alloc_offset` for the model + KV pool + graphs. 256 GiB is generous for a 14 B model.
+- `region_size` must exceed `final_alloc_offset` for the model + KV pool + graphs. It reserves address space only (physical memory is mapped per allocation), so the 512 GiB default costs nothing and covers a GPU of up to ~288 GB at the default memory fraction; the old 64 GiB default was smaller than an 80 GB GPU's weights + KV pool.
 - `workspace_root` is shared across ranks; per-rank artifacts go in `workspace_root/rank_{N}/`. Delete `workspace_root` before any SAVE.
 
 ## Lifecycle
