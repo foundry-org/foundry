@@ -18,9 +18,12 @@ if not SDIST:
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# foundry.ops is compiled against the LibTorch Stable ABI only, targeting this torch.
-MIN_TORCH = "2.14"
-TORCH_TARGET_VERSION = "0x020e000000000000"  # 2.14.0
+# foundry.ops is compiled against the LibTorch Stable ABI only, targeting this torch:
+# one build loads on every torch >= MIN_TORCH (no upper bound; newer-torch behaviour
+# Foundry depends on is checked at run time, see foundry/_loader.py).
+MIN_TORCH = (2, 14)
+# TORCH_TARGET_VERSION encoding of torch/headeronly/version.h: one byte per major/minor.
+TORCH_TARGET_VERSION = f"0x{MIN_TORCH[0]:02x}{MIN_TORCH[1]:02x}000000000000"
 # The only torch header trees foundry.ops may include (copied into build/ so
 # nothing else of torch/include is on the include path).
 STABLE_HEADER_TREES = (
@@ -110,18 +113,24 @@ def get_compile_flags():
 
 
 def torch_requirement():
-    """foundry.ops uses only the LibTorch Stable ABI (target 2.14): one build
-    loads on any torch >= 2.14."""
-    return f"torch>={MIN_TORCH}"
+    """foundry.ops uses only the LibTorch Stable ABI (target MIN_TORCH): one build
+    loads on any torch >= MIN_TORCH. Never pinned to the build torch."""
+    return f"torch>={MIN_TORCH[0]}.{MIN_TORCH[1]}"
 
 
 def write_build_info(boost_version):
-    """Record the build-time torch/CUDA for foundry._loader's runtime check."""
+    """Record the build torch/CUDA and the stable-ABI target for foundry._loader."""
+    if tuple(int(x) for x in torch.__version__.split(".")[:2]) < MIN_TORCH:
+        raise RuntimeError(
+            f"building foundry.ops needs torch >= {MIN_TORCH[0]}.{MIN_TORCH[1]} (its stable-ABI "
+            f"headers), found {torch.__version__}"
+        )
     pkg = Path(ROOT_DIR) / "python" / "foundry"
     text = (pkg / "_build_info.py.in").read_text()
     for key, value in {
         "@TORCH_VERSION@": torch.__version__,
         "@TORCH_CUDA_VERSION@": torch.version.cuda or "",
+        "@STABLE_ABI_TARGET@": f"{MIN_TORCH[0]}.{MIN_TORCH[1]}",
         "@BOOST_VERSION@": boost_version,
     }.items():
         text = text.replace(key, value)

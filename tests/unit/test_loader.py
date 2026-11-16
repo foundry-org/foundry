@@ -26,6 +26,21 @@ def test_installed_torch_is_supported_by_the_build():
     )
     assert _loader._major_minor(torch.__version__) >= _loader.MIN_TORCH
     assert _loader._cuda_major(info.TORCH_CUDA_VERSION) == _loader._cuda_major(torch.version.cuda)
+    # The build records its stable-ABI target, which is the loader's lower bound.
+    assert _loader._major_minor(info.STABLE_ABI_TARGET) == _loader.MIN_TORCH
+
+
+def test_installed_metadata_does_not_pin_torch():
+    """An installed foundry-core requires torch >= the stable-ABI target, never ==."""
+    from importlib.metadata import PackageNotFoundError, requires
+
+    try:
+        reqs = requires("foundry-core") or []
+    except PackageNotFoundError:
+        pytest.skip("foundry-core is not installed (source tree on sys.path)")
+    torch_reqs = [r for r in reqs if r.replace(" ", "").startswith("torch")]
+    print("\nRequires-Dist:", reqs)
+    assert torch_reqs == [f"torch>={_loader.MIN_TORCH[0]}.{_loader.MIN_TORCH[1]}"]
 
 
 @pytest.mark.parametrize(

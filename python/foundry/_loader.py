@@ -10,7 +10,10 @@ failure with the build-time torch/CUDA.
 
 ``foundry.ops`` uses only the LibTorch Stable ABI (C shims, target torch 2.14),
 so one build loads on any torch >= 2.14 with the same CUDA major (its CUDA
-runtime). ``FOUNDRY_SKIP_TORCH_CHECK=1`` skips the check.
+runtime). There is no upper bound: torch behaviour Foundry relies on beyond the
+C shims (capture / RNG / allocator Python APIs) is checked where it is used and
+fails there with an "unsupported" error. ``FOUNDRY_SKIP_TORCH_CHECK=1`` skips
+the check.
 """
 
 from __future__ import annotations
@@ -58,14 +61,16 @@ def check_torch_build() -> None:
         return
     import torch
 
+    info = _build_info()
     have_mm = _major_minor(torch.__version__)
     if have_mm is not None and have_mm < MIN_TORCH:
+        built = f", compiled with torch {info.TORCH_VERSION}" if info is not None else ""
         raise ImportError(
-            f"foundry.ops needs torch >= {MIN_TORCH[0]}.{MIN_TORCH[1]} (LibTorch Stable ABI "
-            f"target), but torch {torch.__version__} is installed. Upgrade torch. "
+            f"foundry.ops needs torch >= {MIN_TORCH[0]}.{MIN_TORCH[1]} (its LibTorch Stable ABI "
+            f"target{built}), but torch {torch.__version__} is installed. Upgrade torch, or "
+            f"use a foundry-core release built for this torch. "
             f"Set {SKIP_ENV}=1 to skip this check."
         )
-    info = _build_info()
     if info is None:
         return
     built_cuda = _cuda_major(info.TORCH_CUDA_VERSION)
@@ -75,7 +80,8 @@ def check_torch_build() -> None:
     raise ImportError(
         f"foundry.ops was built for CUDA {info.TORCH_CUDA_VERSION or 'none'} but torch "
         f"{torch.__version__} uses CUDA {torch.version.cuda or 'none'}; the extension needs "
-        f"the same CUDA major. Rebuild foundry against this torch, or set {SKIP_ENV}=1."
+        f"the same CUDA major. Install the foundry-core wheel for CUDA "
+        f"{_cuda_major(torch.version.cuda)}, build foundry from source, or set {SKIP_ENV}=1."
     )
 
 
