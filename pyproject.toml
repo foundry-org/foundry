@@ -1,13 +1,13 @@
-# foundry.ops is compiled against the LibTorch Stable ABI headers of the installed
-# torch (>= 2.14) and loads on any torch >= 2.14. Install with --no-build-isolation
-# into an environment that has torch, pybind11, cmake>=4.0 and ninja.
+# foundry.ops' native library is compiled against the LibTorch Stable ABI headers of
+# the installed torch (>= 2.14), uses no Python C API, and loads on any CPython >= 3.10
+# and any torch >= 2.14. Install with --no-build-isolation into an environment that has
+# torch, cmake>=4.0 and ninja.
 [build-system]
 requires = [
     "setuptools>=80",
     "wheel",
     "cmake>=4.0",
     "ninja",
-    "pybind11>=2.12",
     "torch>=2.14",
 ]
 build-backend = "setuptools.build_meta"
@@ -28,7 +28,7 @@ classifiers = [
     "Environment :: GPU :: NVIDIA CUDA",
 ]
 # setup.py sets install_requires: "torch>=2.14" (foundry.ops uses only the LibTorch
-# Stable ABI, so one build loads on any later torch).
+# Stable ABI, so one build loads on any later torch) and tomli on Python 3.10.
 dynamic = ["dependencies"]
 
 [project.urls]
