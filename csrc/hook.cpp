@@ -2516,6 +2516,21 @@ CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, cu
   return real_func(symbol, pfn, cudaVersion, flags, symbolStatus);
 }
 
+// The deterministic region is full. A driver-placed fallback would give SAVE and
+// LOAD different layouts, so the allocation fails, named in region_size terms.
+static bool region_exhausted(CUdeviceptr start, size_t size, const char* who) {
+  const CUdeviceptr base = (CUdeviceptr)tls_storage.region.base;
+  if (start + size <= base + tls_storage.region.size) {
+    return false;
+  }
+  fprintf(stderr,
+          "[HOOK] ERROR: Foundry allocation region exhausted (%s of %zu bytes at offset %llu, "
+          "region_size %zu bytes = %.1f GiB); raise region_size in the Foundry TOML\n",
+          who, size, (unsigned long long)(start - base), tls_storage.region.size,
+          tls_storage.region.size / (double)(1ULL << 30));
+  return true;
+}
+
 CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
   typedef CUresult (*cuMemAlloc_t)(CUdeviceptr*, size_t);
   auto real_func =
@@ -2547,6 +2562,9 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
   CUdeviceptr target_addr = align_to(tls_storage.current_alloc_base_addr, kAllocAlignment);
   CUdeviceptr region_base_addr = (CUdeviceptr)tls_storage.region.base;
   CUdeviceptr region_end_addr = region_base_addr + tls_storage.region.size;
+  if (region_exhausted(target_addr, aligned_size, "cuMemAlloc")) {
+    return CUDA_ERROR_OUT_OF_MEMORY;
+  }
 
   // Fast path: check if we can serve from preallocated memory
   if (tls_storage.has_preallocation &&
@@ -2758,6 +2776,9 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
   CUdeviceptr target_addr = align_to(tls_storage.current_alloc_base_addr, kAllocAlignment);
   CUdeviceptr region_base_addr = (CUdeviceptr)tls_storage.region.base;
   CUdeviceptr region_end_addr = region_base_addr + tls_storage.region.size;
+  if (region_exhausted(target_addr, aligned_size, "cuMemAllocPitch")) {
+    return CUDA_ERROR_OUT_OF_MEMORY;
+  }
 
   // Fast path: check if we can serve from preallocated memory
   if (tls_storage.has_preallocation &&
@@ -2972,14 +2993,7 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
   if (size < kSmallAllocThreshold) {
     CUdeviceptr aligned_addr = align_to(tls_storage.current_alloc_base_addr, alignment);
 
-    size_t region_base = (size_t)tls_storage.region.base;
-    size_t region_end = region_base + tls_storage.region.size;
-
-    if (aligned_addr + size > region_end) {
-      fprintf(stderr,
-              "[HOOK] ERROR: Not enough space in reserved region for allocation (size=0x%zx, "
-              "available=0x%llx)\n",
-              size, region_end - aligned_addr);
+    if (region_exhausted(aligned_addr, size, "cuMemAddressReserve")) {
       return CUDA_ERROR_OUT_OF_MEMORY;
     }
 
