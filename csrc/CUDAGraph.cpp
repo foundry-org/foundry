@@ -50,14 +50,6 @@ void native_record_abort() {
 // CUDA driver only.
 // ---------------------------------------------------------------------------
 
-static bool rng_debug_enabled() {
-  static const bool enabled = [] {
-    const char* v = std::getenv("FOUNDRY_E5_DEBUG");
-    return v != nullptr && std::strcmp(v, "1") == 0;
-  }();
-  return enabled;
-}
-
 namespace {
 std::mutex foundry_rng_mutex;
 std::unordered_map<uint64_t, std::shared_ptr<FoundryRngState>> foundry_rng_states;
@@ -108,11 +100,6 @@ void CUDAGraph::register_native_rng(const boost::json::object& gen) {
   // record window; LOAD's allocator-event replay maps it (checked in verify_native_rng).
   r.seed_ptr = gen.at("seed_ptr").to_number<uint64_t>();
   r.offset_ptr = gen.at("offset_ptr").to_number<uint64_t>();
-  if (rng_debug_enabled()) {
-    fprintf(stderr, "[foundry E5] rng buffers id=%lu seed_buf=0x%lx offset_buf=0x%lx inc=%lu\n",
-            (unsigned long)id, (unsigned long)r.seed_ptr, (unsigned long)r.offset_ptr,
-            (unsigned long)wholegraph_increment);
-  }
   native_rng_.push_back(std::move(r));
 }
 
@@ -294,8 +281,8 @@ int torch_bool_env(const char* name) {
 }
 }  // namespace
 
-// The old (ATen) version called getCurrentCUDABlasHandle(), getCurrentCUDABlasLtHandle()
-// and getCUDABlasLtWorkspace() on the current stream. On CUDA the Lt handle is the cuBLAS
+// Preallocates what getCurrentCUDABlasHandle(), getCurrentCUDABlasLtHandle() and
+// getCUDABlasLtWorkspace() allocate on the current stream. On CUDA the Lt handle is the cuBLAS
 // handle (CublasHandlePool.cpp getCurrentCUDABlasLtHandle), so the Lt calls allocate only
 // when torch caches a separate Lt workspace per (handle, stream): workspace caching on
 // (always on 2.14; TORCH_CUBLAS_WORKSPACE_CACHE=1 on 2.15+) and
@@ -2518,7 +2505,7 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
     }
   }
   // No allocator pool registration around instantiate: Foundry's instantiate is
-  // cudaGraphInstantiate[WithFlags] and never calls the torch allocator (E5 run 16).
+  // cudaGraphInstantiate[WithFlags] and never calls the torch allocator.
   graph->capture_ended_ = true;
   graph->instantiate();
 

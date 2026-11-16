@@ -255,13 +255,6 @@ class CUDAGraph(ops.CUDAGraph):
                     self._native_rng["offset_ptr"],
                 )
             )
-            if os.environ.get("FOUNDRY_E5_DEBUG") == "1":
-                print(
-                    f"[foundry E2] native capture: rng seed_buf={self._native_rng['seed_ptr']:#x} "
-                    f"offset_buf={self._native_rng['offset_ptr']:#x} increment={increment} "
-                    f"seed={seed}",
-                    file=sys.stderr,
-                )
         # Candidates = every int64[1] block torch created for this capture and kept (any
         # pool: an RNG state that escaped the RNG pool, e.g. created on another thread, is
         # caught too). adopt scans every kernel parameter of the raw graph for their
@@ -541,7 +534,6 @@ def save_graph_manifest(
 
     num_templates = len(groups)
     num_on_demand = sum(len(g["members"]) - 1 for g in groups)
-    import sys
 
     print(
         f"[foundry] Saved graph_manifest.json (templates={'on' if enable_templates else 'off'}): "
