@@ -181,13 +181,6 @@ class CUDAGraph(ops.CUDAGraph):
             "seed": seed,
         }
         del seed_buf, offset_buf
-        if os.environ.get("FOUNDRY_E5_DEBUG") == "1":
-            print(
-                f"[foundry E2] native capture: rng seed_buf={self._native_rng['seed_ptr']:#x} "
-                f"offset_buf={self._native_rng['offset_ptr']:#x} increment={increment} "
-                f"seed={seed}",
-                file=sys.stderr,
-            )
         if increment:
             try:
                 _check_rng_buffers_loadable(self._native_rng)
@@ -440,7 +433,6 @@ def save_graph_manifest(
 
     num_templates = len(groups)
     num_on_demand = sum(len(g["members"]) - 1 for g in groups)
-    import sys
 
     print(
         f"[foundry] Saved graph_manifest.json (templates={'on' if enable_templates else 'off'}): "
