@@ -38,10 +38,7 @@ failures above provoked, each with its message and a scheduler exit.
 ## Upgrading
 
 - A TOML without `region_size` now reserves 512GB of address space per
-  scheduler; an explicit `region_size` is unchanged. SAVE and LOAD must use
-  the same `region_size` (reservations outside the region are placed after its
-  end): re-SAVE an archive that was saved with the old 64GB default, or set
-  `region_size = "64GB"` to keep loading it.
+  scheduler; an explicit `region_size` is unchanged.
 - An engine that rc4 kept running after the region overflowed or could not be
   reserved now exits with the messages above.
 - The integration API stays (2, 4); the archive layout is unchanged.
