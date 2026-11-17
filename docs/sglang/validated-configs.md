@@ -9,6 +9,21 @@ Every model and configuration that passed Foundry SAVE + LOAD with SGLang, with 
 
 "Dummy text" parity means the greedy completion was identical under dummy weights. It shows that the same kernels ran, not model quality.
 
+## foundry-core 0.1.0rc5, torch 2.14.1, 2x H100 (2026-11-17)
+
+Driver 580.126.20, SGLang `foundry-dep` (0c37a23905), real weights, default `region_size` (512GB), `TORCHDYNAMO_DISABLE=1` on every engine, warm JIT caches. Times are launch to the first `/health` 200. Output check: LOAD selected and top-3 logprobs of 20 greedy requests equal to native graph (sequential).
+
+| model | layout | weights | graphs per rank | native graph -> LOAD (s) | restore (s) |
+|---|---|---|---|---|---|
+| Qwen3-1.7B | 1 GPU | real | 0 + 256 | 30.3 -> **20.5** | 0.34 |
+| Qwen3-1.7B | TP2 | real | 0 + 256 | 35.3 -> **22.1** | 0.46 |
+| Qwen3-30B-A3B-FP8 | EP2, DeepEP | real | 0 + 256 | 65.8 -> **28.7** | 0.91 |
+| Qwen3-30B-A3B-FP8 | TP2 + EP2, DeepEP | real | 0 + 256 | 73.0 -> **26.9** | 1.09 |
+| Qwen3-30B-A3B-FP8 | EP2, DeepEP v2 | real | 0 + 256 | 76.4 -> **28.4** | 0.98 |
+| Qwen3-30B-A3B-FP8 + EAGLE3 | EP2, DeepEP v2, decode bs 1..32 | real | 32 x 3 kinds | 35.9 -> **29.8** | 0.16 |
+
+Records: `claude-doc/merge_plan/pr42254_final_validation_20261117.md`.
+
 ## foundry-core 0.1.0rc4, torch 2.14.1, 2x / 1x H200 (2026-11-08)
 
 Driver 595.71.05, SGLang `foundry-dep` (9fccf82eda), real weights unless noted. Times are launch to the first `/health` 200; the 1-GPU rows run with `--skip-server-warmup` on every engine (256 decode graphs per set, no padding). Output check: LOAD greedy tokens, selected and top-3 logprobs identical to native over 20 sequential requests (TP2 also batched); EAGLE3 accept length identical to native.
