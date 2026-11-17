@@ -41,7 +41,7 @@ failures above provoked, each with its message and a scheduler exit.
   scheduler; an explicit `region_size` is unchanged.
 - An engine that rc4 kept running after the region overflowed or could not be
   reserved now exits with the messages above.
-- The integration API stays (2, 4); the archive layout is unchanged.
+- The integration API stays (2, 4).
 
 ## Previous Releases
 
