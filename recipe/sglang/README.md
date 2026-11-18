@@ -14,7 +14,7 @@ once the Foundry adapter lands there.
 | Component | Version | Notes |
 |---|---|---|
 | SGLang | branch `foundry-dep` (adapter `sglang.srt.utils.foundry_adapter`) | Requires Foundry integration API **2.x** with minor >= 4 (`FOUNDRY_INTEGRATION_API_MIN_MINOR`); without `--cuda-graph-persistence` every Foundry call site is a no-op. |
-| Foundry | `foundry-core 0.1.0rc4` (this branch, `INTEGRATION_API_VERSION = (2, 4)`) | `pip install "sglang[foundry]"`, or `pip install -e .` from this repo. The wheel must match the torch/CUDA pair SGLang pins (torch 2.14.1 / cu130 for 0.1.0rc4; use the per-pair index in the top-level README for other pairs). |
+| Foundry | `foundry-core 0.1.0rc5` (this branch, `INTEGRATION_API_VERSION = (2, 4)`) | `pip install "sglang[foundry]"`, or `pip install -e .` from this repo. The wheel must match the torch/CUDA pair SGLang pins (torch 2.14.1 / cu130 for 0.1.0rc5; use the per-pair index in the top-level README for other pairs). |
 
 All scripts share one `foundry.toml` (`workspace_root = "foundry_archive"`); its `mode`
 key, if present, is ignored — the flag's mode wins. Pick a script for your model +

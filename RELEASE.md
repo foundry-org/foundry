@@ -1,8 +1,52 @@
-# Foundry 0.1.0rc4
+# Foundry 0.1.0rc5
+
+Fourth release candidate of 0.1.0 (same wheel pairs and index layout as rc2).
+A small release for the SGLang `--cuda-graph-persistence` review round.
+
+## Highlights
+
+- **Default `region_size` is 512GB** (was 64GB). The region is an address-space
+  reservation; memory is mapped per allocation, so the larger default costs
+  nothing (64GB to 16TiB reserve in 3-20 us) and covers what one GPU allocates.
+- **Region and memory failures are fatal and say which one it is.** An
+  allocation that does not fit the region (including address reservations
+  carved from it, such as torch symmetric memory) fails with `Foundry
+  allocation region exhausted ...; raise region_size in the Foundry TOML`
+  instead of taking a driver-placed address that SAVE and LOAD would not share.
+  A device that is out of physical memory while the region still has room
+  reports `GPU out of physical memory ...; this is not region_size`. A region
+  that cannot be reserved raises in the SGLang integration, naming `base_addr`
+  and `region_size`, instead of running without the deterministic region.
+- **DFLASH, NGRAM and DSPARK speculative graphs are persisted** (their target
+  and draft run the decode runner in target-verify mode). DSPARK's sampling
+  draft needs `SGLANG_DSPARK_USE_GREEDY_DRAFT=1`.
+
+## Validation
+
+2x H100 (driver 580.126.20, torch 2.14.1 / cu130), 2026-11-16/17, SGLang
+`foundry-dep` (0c37a23905) and its rebase onto upstream main (df5a1178aa),
+every engine with `TORCHDYNAMO_DISABLE=1`: unit + `tests/sgl` suites and
+SGLang's adapter and e2e tests (1-GPU, EAGLE3, multi-GPU) green; Qwen3-1.7B
+1 GPU and TP2, Qwen3-30B-A3B-FP8 EP2, TP2 + EP2, EP2 DeepEP v2 and EP2 DeepEP
+v2 + EAGLE3: SAVE and LOAD allocation offsets equal on every rank and equal to
+rc4's, LOAD logprobs identical to native (sequential check); the three
+failures above provoked, each with its message and a scheduler exit.
+
+## Upgrading
+
+- A TOML without `region_size` now reserves 512GB of address space per
+  scheduler; an explicit `region_size` is unchanged.
+- An engine that rc4 kept running after the region overflowed or could not be
+  reserved now exits with the messages above.
+- The integration API stays (2, 4).
+
+## Previous Releases
+
+## Foundry 0.1.0rc4
 
 Third release candidate of 0.1.0 (same wheel pairs and index layout as rc2).
 
-## Highlights
+### Highlights
 
 - **Native fallback outside the supported configurations** (SGLang integration
   API 2.4). Before any graph is restored, Foundry raises `Unsupported(step,
@@ -56,7 +100,7 @@ Third release candidate of 0.1.0 (same wheel pairs and index layout as rc2).
   again by default (`FOUNDRY_FLASHINFER_GDN_CUTE_CACHE=0` turns it off): 10 s
   of JIT per Qwen3.5 start.
 
-## Removed
+### Removed
 
 - The plugin route (`FOUNDRY_GRAPH_EXTENSION_CONFIG`, `plugin.py`): SGLang's
   own call sites (`--cuda-graph-persistence`) are the only route; the API
@@ -71,7 +115,7 @@ Third release candidate of 0.1.0 (same wheel pairs and index layout as rc2).
 - LOAD of archives saved before API 2.1 (no `decode_graphs.json` record, or no
   output structure): refused with a message; re-SAVE.
 
-## Validation
+### Validation
 
 2x H200 (driver 595.71.05, torch 2.14.1 / cu130), 2026-11-07/08, SGLang
 `foundry-dep` (9fccf82eda): unit + `tests/sgl` suites and SGLang's adapter
@@ -89,7 +133,7 @@ Qwen3-1.7B (FlashInfer, 4 prefill graphs) 40.5 -> 28.8 s, Qwen3-30B-A3B-FP8 +
 EAGLE3 (768 graphs) 109.4 -> 31.4 s; restore 0.35 / 0.65 / 1.3 s; the first
 request after LOAD costs the same as after a native start.
 
-## Upgrading
+### Upgrading
 
 - Re-SAVE every archive: the archive layout (per-kind graph sets,
   `decode_graphs.json`, tactics in `warmup_state.json`) and the pre-layout
@@ -103,8 +147,6 @@ request after LOAD costs the same as after a native start.
 - Archives saved with a DeepEP v3 / NIXL / Mori / Pplx dispatcher, LoRA, PD
   multiplexing or a non-EAGLE speculative algorithm were never valid; such
   servers now start natively with the `unsupported at` line instead.
-
-## Previous Releases
 
 ## Foundry 0.1.0rc3
 
