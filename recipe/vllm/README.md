@@ -11,6 +11,7 @@ recipe/vllm/
 ├── foundry_load.toml                 # shared LOAD config (same workspace_root)
 ├── serve_qwen3-mini.sh               # Qwen3-1.7B           single GPU
 ├── serve_qwen3-1.7b_tp.sh            # Qwen3-1.7B           tensor parallel (symm-mem allreduce)
+├── serve_qwen3-32b_tp.sh             # Qwen3-32B BF16       tensor parallel (symm-mem allreduce)
 ├── serve_qwen3-14b_dp.sh             # Qwen3-14B            data parallel
 ├── serve_qwen3-30ba3b_ep.sh          # Qwen3-30B-A3B (MoE)  expert parallel (DeepEP)
 └── serve_qwen3-30ba3bfp8_ep.sh       # Qwen3-30B-A3B FP8    expert parallel (DeepGEMM)
@@ -21,6 +22,7 @@ Every script accepts the same trailing `--save` / `--load` flag. Scripts that sc
 ```bash
 bash serve_qwen3-mini.sh              [--save|--load]
 bash serve_qwen3-1.7b_tp.sh       <tp_size> [--save|--load]
+bash serve_qwen3-32b_tp.sh        <tp_size> [--save|--load]
 bash serve_qwen3-14b_dp.sh        <dp_size> [--save|--load]
 bash serve_qwen3-30ba3b_ep.sh     <ep_size> [--save|--load]
 bash serve_qwen3-30ba3bfp8_ep.sh  <ep_size> [--save|--load]
@@ -162,7 +164,7 @@ All scripts, when invoked with `--save` or `--load`, export one env-var override
 
 - `VLLM_USE_V2_MODEL_RUNNER=0` — pin the V1 model runner. Foundry's monkey-patches are on `vllm.v1.worker.gpu_model_runner.GPUModelRunner`; vLLM's `VllmConfig.use_v2_model_runner` property silently routes architectures in `DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES` (currently `Qwen3ForCausalLM`) to `vllm.v1.worker.gpu.model_runner` (V2), which our patches don't touch. Without this pin, `capture_model` runs unhooked, no archive is written, and SAVE silently produces an empty workspace.
 
-The TP script (`serve_qwen3-1.7b_tp.sh`) on top of the basic flags also sets:
+The TP scripts (`serve_qwen3-1.7b_tp.sh` and `serve_qwen3-32b_tp.sh`) on top of the basic flags also set:
 
 - `--disable-custom-all-reduce` — custom all-reduce registers IPC buffers per
   captured graph, a replay path foundry does not support yet. With it off,
@@ -176,6 +178,36 @@ The TP script (`serve_qwen3-1.7b_tp.sh`) on top of the basic flags also sets:
   `symm_mem.two_shot_all_reduce_` kernels (TP=2 on Hopper).
 - `NCCL_CUMEM_ENABLE=0` / `NCCL_NVLS_ENABLE=0` — same NCCL fast-path pins as
   the EP scripts (prefill / non-graph collectives still go through pynccl).
+
+### Experimental Qwen3-32B TP=2 run
+
+`serve_qwen3-32b_tp.sh` uses BF16 and defaults to `Qwen/Qwen3-32B`. Set
+`MODEL_NAME=/absolute/path/to/Qwen3-32B` to use local weights. It otherwise
+shares the 1.7B TP script's decode-graph and symmetric-memory settings.
+Use a fresh working directory for each archive; `foundry_archive` and the
+vLLM compile cache must remain available to both SAVE passes and LOAD.
+From the Foundry repository root, run SAVE twice, then LOAD from that same
+directory. Stop each server after it becomes healthy and answers a query:
+
+```bash
+export TP_RECIPE="$PWD/recipe/vllm/serve_qwen3-32b_tp.sh"
+export RUN_DIR="$(mktemp -d -p "$HOME" foundry-tp2-XXXXXX)"
+cd "$RUN_DIR"
+export VLLM_CACHE_ROOT="$RUN_DIR/vllm-cache"
+bash "$TP_RECIPE" 2 --save
+bash "$TP_RECIPE" 2 --save
+export FOUNDRY_LOAD_ALLOW_COMPILE=1  # requires the companion foundry-org/vllm change
+bash "$TP_RECIPE" 2 --load
+```
+
+Each rank should have 256 captured graphs and a `graph_manifest.json` in
+`foundry_archive/rank_<N>/`; rank 0 also writes `warmup_state.json`.
+The companion vLLM opt-in keeps `torch.compile` available for uncaptured
+prefill and mixed batches on LOAD. The restored graphs cover decode only.
+This configuration has been exercised with Qwen3-32B on two H20 GPUs;
+other models, TP sizes and collective paths need separate validation. See
+[the scoped validation record](../../docs/vllm/tp2-qwen3-32b-validation.md)
+for the environment, correctness checks, startup and TPOT measurements.
 
 The two EP scripts (`*_ep.sh`) on top of the basic flags also set:
 
