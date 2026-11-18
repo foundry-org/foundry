@@ -10,7 +10,7 @@ Public API consumed by ``vllm/compilation/foundry_shim.py``:
   when ``graph_extension_config_path`` is set. Loads the TOML and installs
   every runtime monkey-patch.
 
-See ``foundry/docs/vllm/`` and ``claude-doc/`` for the full architecture.
+See ``foundry/docs/vllm/`` for the full architecture.
 """
 
 from foundry.integration.vllm.config import (

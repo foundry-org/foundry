@@ -57,7 +57,7 @@ Since `_patch_capture_model` calls `fops.stop_allocation_region()` before return
 
 Failure mode if `_dummy_sampler_run` is skipped entirely: sampler workspace not allocated at all, first real inference crashes when the sampler kernels are launched.
 
-Failure mode if the `_dummy_run` patch is too broad — i.e. swallows other call sites that also lack `is_profile`/`is_graph_capturing`/`force_attention`: the DP empty-shard phantom at `gpu_worker.py:909` (`_dummy_run(num_tokens, uniform_decode=True)`) silently no-ops, the empty shard skips `coordinate_batch_across_dp`'s all-reduce, and the peer shard hangs forever on the CPU collective. See `claude-doc/invariants.md` §5.
+Failure mode if the `_dummy_run` patch is too broad — i.e. swallows other call sites that also lack `is_profile`/`is_graph_capturing`/`force_attention`: the DP empty-shard phantom at `gpu_worker.py:909` (`_dummy_run(num_tokens, uniform_decode=True)`) silently no-ops, the empty shard skips `coordinate_batch_across_dp`'s all-reduce, and the peer shard hangs forever on the CPU collective.
 
 ### 5. Memory-history snapshotting / capture profiling
 
@@ -90,7 +90,7 @@ raised from `_get_sfdp_patterns` inside the first in-capture compile. The cache 
 
 NVSHMEM modules are loaded on LOAD via `init_nvshmem_for_loaded_modules`, called from `_patch_prepare_comm_buffer`'s **post-orig hook** — immediately after `prepare_communication_buffer_for_model` bootstraps the NVSHMEM runtime via DeepEP `Buffer` construction. For dense models the pending list is empty and the call is a no-op.
 
-Doing it earlier (inside `load_cuda_modules_and_libraries` or at the end of `start_graph_builds`) would be too early — the NVSHMEM runtime isn't bootstrapped yet, `nvshmemx_cumodule_init` silently returns 0, and replayed graphs later fail with `cuLaunchKernel` errors. See `claude-doc/invariants.md` §3.
+Doing it earlier (inside `load_cuda_modules_and_libraries` or at the end of `start_graph_builds`) would be too early — the NVSHMEM runtime isn't bootstrapped yet, `nvshmemx_cumodule_init` silently returns 0, and replayed graphs later fail with `cuLaunchKernel` errors.
 
 ## Silent mismatches
 
