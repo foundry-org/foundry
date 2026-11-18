@@ -1,6 +1,6 @@
 # Foundry 0.1.0rc5
 
-Fourth release candidate of 0.1.0 (same wheel pairs and index layout as rc2).
+Fifth release candidate of 0.1.0 (same wheel pairs and index layout as rc2).
 A small release for the SGLang `--cuda-graph-persistence` review round.
 
 ## Highlights
