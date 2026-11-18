@@ -209,54 +209,6 @@ def _check_archive_valid(parallel) -> None:
         )
 
 
-_gdn_cache_logged = False
-
-
-def _install_gdn_cute_cache() -> None:
-    """Route the FlashInfer SM90 GDN prefill CuTe-DSL compile through
-    FlashInfer's .o cache instead of compiling 8-10 s in every scheduler
-    (host-side patch, see flashinfer_cute_cache). Idempotent."""
-    from foundry.integration.sglang import flashinfer_cute_cache
-
-    global _gdn_cache_logged
-    if _gdn_cache_logged or not flashinfer_cute_cache.gdn_flashinfer_in_use():
-        return
-    _gdn_cache_logged = True
-    if flashinfer_cute_cache.enabled():
-        status = flashinfer_cute_cache.install()
-        if status:
-            logger.info("[Foundry] FlashInfer CuTe-DSL cache: %s", status)
-    else:
-        logger.info(
-            "[Foundry] FlashInfer CuTe-DSL cache: off (%s=0)", flashinfer_cute_cache.OPT_OUT_ENV
-        )
-
-
-_warmup_wrapped = False
-
-
-def _wrap_runner_warmup() -> None:
-    """Both modes: install the GDN CuTe-DSL cache at the head of the runner
-    warmup, which can prewarm the GDN prefill kernels (SGLang's
-    prewarm_gdn_prefill_kernels) before the first capture scope."""
-    global _warmup_wrapped
-    if _warmup_wrapped:
-        return
-    import functools
-
-    from sglang.srt.model_executor.runner.base_runner import BaseRunner
-
-    orig = BaseRunner._warmup
-
-    @functools.wraps(orig)
-    def _warmup(self) -> None:
-        _install_gdn_cute_cache()
-        orig(self)
-
-    BaseRunner._warmup = _warmup
-    _warmup_wrapped = True
-
-
 def before_parallel_init(device: str) -> None:
     """Head of ``bootstrap.init_parallel_runtime``: bind this
     rank's VMM region before any communicator exists."""
@@ -268,7 +220,6 @@ def before_parallel_init(device: str) -> None:
     parallel = get_parallel()
     if mode == CUDAGraphExtensionMode.LOAD:
         _check_archive_valid(parallel)
-    _wrap_runner_warmup()
     _disable_dynamo()
     _wait_on_barrier_works()
     rt.hold_cyclic_gc()
@@ -428,9 +379,20 @@ def _begin_graph_layout(model, mode, flashinfer_tactics: str | None = None) -> N
             bootstrap_lazy_runtimes()
         rt.log_alloc_offset("after_lazy_runtimes")
     # 3. Both modes, before the first eager extend: the FlashInfer SM90 GDN
-    #    prefill kernels load from FlashInfer's .o cache (normally already
-    #    installed at the head of the runner warmup, _install_gdn_cute_cache).
-    _install_gdn_cute_cache()
+    #    prefill kernels load from FlashInfer's .o cache instead of compiling
+    #    8-10 s in every scheduler (host-side patch, see flashinfer_cute_cache).
+    from foundry.integration.sglang import flashinfer_cute_cache
+
+    if flashinfer_cute_cache.gdn_flashinfer_in_use():
+        if flashinfer_cute_cache.enabled():
+            status = flashinfer_cute_cache.install()
+            if status:
+                logger.info("[Foundry] FlashInfer CuTe-DSL cache: %s", status)
+        else:
+            logger.info(
+                "[Foundry] FlashInfer CuTe-DSL cache: off (%s=0)",
+                flashinfer_cute_cache.OPT_OUT_ENV,
+            )
 
     # The deterministic layout begins here on both modes: same sequence
     # point, same (empty) caching-allocator state; LOAD's
