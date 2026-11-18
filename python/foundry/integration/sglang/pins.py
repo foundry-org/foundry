@@ -227,10 +227,21 @@ def reject_unsupported_features(server_args: Any) -> None:
         and max_ep is not None
         and max_ep > cfg.tp_size
         and _elastic_recapture_path_exists()
+        # DIAGNOSTIC ONLY (cross-N study): capacity launches that never scale
+        and os.environ.get("FOUNDRY_DIAG_ALLOW_MAX_EP") != "1"
     ):
         unsupported.append(
             f"elastic-EP CUDA-graph recapture (--elastic-ep-backend with --max-ep-size={max_ep} "
             f"> tp size {cfg.tp_size}): graphs recaptured after a scale event cannot be restored"
+        )
+    if (
+        getattr(cfg, "moe_a2a_backend", None) == "nixl"
+        and os.environ.get("FOUNDRY_DIAG_NIXL_OUTSIDE_REGION") != "1"
+    ):
+        unsupported.append(
+            "NIXL EP (--moe-a2a-backend nixl): its buffers come from cuMemAlloc (no fabric "
+            "handles), which UCX cuda_ipc cannot map inside the region, and outside it they "
+            "are driver-placed, so the restored dispatch/combine params would be stale"
         )
     if os.environ.get("SGLANG_ENABLE_POST_CAPTURE_KV_SIZING", "").lower() in ("1", "true"):
         unsupported.append(
@@ -442,6 +453,32 @@ def _contrary(pin: FieldPin, raw: Any) -> bool:
     return raw != pin.value and raw != pin.default
 
 
+def no_in_graph_all_reduce(server_args: Any) -> bool:
+    """Whether no captured forward contains an all-reduce, so the torch
+    symmetric-memory pin (which only selects the all-reduce backend,
+    sglang parallel_state.py:546, 1012-1105) has nothing to apply to:
+    attention DP over the whole TP world (attention TP size 1, so the attention
+    o_proj and the dense layers reduce over a group of one), experts reached by
+    an all-to-all dispatcher over the whole TP world (no MoE TP reduce), the
+    LM head on the attention-TP group (--enable-dp-lm-head: no vocab gather over
+    the TP world), and no speculative draft model. A TorchSymmMemCommunicator is
+    otherwise built at group creation and its rendezvous needs distinct device
+    ordinals, which the one-visible-device-per-process launch does not have."""
+    from foundry.integration.sglang.config import _attn_dp_size
+
+    tp = int(getattr(server_args, "tp_size", 1) or 1)
+    if tp <= 1:
+        return False
+    a2a = getattr(server_args, "moe_a2a_backend", None)
+    return (
+        _attn_dp_size(server_args) == tp
+        and bool(getattr(server_args, "enable_dp_lm_head", False))
+        and a2a not in (None, "none")
+        and int(getattr(server_args, "ep_size", 1) or 1) == tp
+        and getattr(server_args, "speculative_algorithm", None) is None
+    )
+
+
 def _unreplayable_plan(server_args: Any) -> tuple[list[str], dict[str, Any], list[str]]:
     """(conflicts, fields to declare, pin log lines) of :data:`FIELD_PINS` and
     the DeepSeek-V4 attention backend. Raw (user) values are read from
@@ -452,6 +489,19 @@ def _unreplayable_plan(server_args: Any) -> tuple[list[str], dict[str, Any], lis
     lines = []
     for pin in FIELD_PINS:
         if not hasattr(server_args, pin.field):
+            continue
+        # DIAGNOSTIC ONLY (eep-archive-share study): two ranks per GPU / one GPU per
+        # process, where torch symmetric memory's rendezvous rejects shared ordinals.
+        if (
+            pin.field == "enable_torch_symm_mem"
+            and os.environ.get("FOUNDRY_DIAG_SKIP_SYMM_MEM_PIN") == "1"
+        ):
+            continue
+        if pin.field == "enable_torch_symm_mem" and no_in_graph_all_reduce(server_args):
+            lines.append(
+                "enable_torch_symm_mem not pinned: no captured forward all-reduces (attention "
+                "TP 1, expert all-to-all, --enable-dp-lm-head)"
+            )
             continue
         raw = getattr(server_args, pin.field)
         if _contrary(pin, raw):
