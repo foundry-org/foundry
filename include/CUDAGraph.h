@@ -30,6 +30,12 @@ struct CUDAGeneratorState;
 
 namespace foundry {
 
+namespace rng_slab {
+// Allocate the chunk that backs every capture's RNG capture-state tensors
+// (CUDAGraph.cpp); called at the layout start on SAVE and LOAD.
+void reserve();
+}  // namespace rng_slab
+
 struct BinaryGraphFile;  // forward declaration, defined in BinaryGraphFormat.h
 struct BuildTiming;      // LOAD template-build breakdown, defined in CUDAGraphParallel.cpp
 
