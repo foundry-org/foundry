@@ -74,8 +74,7 @@ section: NCCL's 127 MB linked library as 5.95 GB, a 6200-byte cuBLASLt image as 
 the pack wrote the tails into `fatbin_image_packed.img`. Fixed by sizing a fatbin by its own header
 (`header_size + size`). Qwen3-30B-A3B ep4, MAXBS=16, 4xH200: dist init 32 -> 1.6-2.7 s, weight load 4.1 -> 0.26 s,
 SAVE health 106 -> 45 s (= native graph), archive 16.7 GB -> 329 MB; parity and every kernel lookup unchanged.
-Archives saved before the fix still load (LOAD does not recompute hashes). Details:
-`claude-doc/report_coldstart/h200_8gpu_venv/fatbin_overread_fix.md`.
+Archives saved before the fix still load (LOAD does not recompute hashes).
 
 ## Bare-host DeepEP engines start ~40 s late: rdma-core's udev wait on blocked verbs devices (FIXED with a shim, 2026-09-25)
 

@@ -22,8 +22,6 @@ Driver 580.126.20, SGLang `foundry-dep` (0c37a23905), real weights, default `reg
 | Qwen3-30B-A3B-FP8 | EP2, DeepEP v2 | real | 0 + 256 | 76.4 -> **28.4** | 0.98 |
 | Qwen3-30B-A3B-FP8 + EAGLE3 | EP2, DeepEP v2, decode bs 1..32 | real | 32 x 3 kinds | 35.9 -> **29.8** | 0.16 |
 
-Records: `claude-doc/merge_plan/pr42254_final_validation_20261117.md`.
-
 ## foundry-core 0.1.0rc4, torch 2.14.1, 2x / 1x H200 (2026-11-08)
 
 Driver 595.71.05, SGLang `foundry-dep` (9fccf82eda), real weights unless noted. Times are launch to the first `/health` 200; the 1-GPU rows run with `--skip-server-warmup` on every engine (256 decode graphs per set, no padding). Output check: LOAD greedy tokens, selected and top-3 logprobs identical to native over 20 sequential requests (TP2 also batched); EAGLE3 accept length identical to native.
@@ -37,7 +35,7 @@ Driver 595.71.05, SGLang `foundry-dep` (9fccf82eda), real weights unless noted. 
 | Qwen3-1.7B | 1 GPU, flashinfer, prefill full bs 8/16/32/64 | real | 4 + 256 | 40.5 -> **28.8** | 0.01 + 0.64 |
 | Qwen3-30B-A3B-FP8 + EAGLE3 | 1 GPU, flashinfer, decode bs 1..256 | dummy | 256 x 3 kinds | 109.4 -> **31.4** | 1.35 |
 
-Records: `claude-doc/merge_plan/rng_state_fix/RESULTS.md` (2-GPU rows), `claude-doc/report/sgl_tests_timing_256/README.md` (1-GPU rows, medians of 3).
+The 1-GPU rows are medians of 3.
 
 ## Dependency route, torch 2.14.1, 4xH200 (2026-10-11)
 
