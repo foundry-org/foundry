@@ -136,6 +136,7 @@ def install_hooks(compilation_config: CompilationConfig) -> None:
         # in their ``--save`` / ``--load`` branches to pin V1.
 
     _patch_init_worker_distributed_environment()
+    _patch_triton_autotune()
     _patch_kernel_warmup()
     _patch_dummy_runs()
     _patch_load_model()
@@ -182,6 +183,65 @@ def _patch_init_worker_distributed_environment() -> None:
 # ---------------------------------------------------------------------------
 # Skip-with-dummy patches for non-deterministic functions.
 # ---------------------------------------------------------------------------
+
+
+def _patch_triton_autotune() -> None:
+    """Restore the measured Triton config from pass 1 during SAVE capture.
+
+    AOT loading can restore several precompiled launchers without restoring
+    the process-local winner. Benchmarking them inside CUDA capture would
+    synchronize the device, so use the validated on-disk autotune result.
+    """
+    from torch._inductor.runtime.triton_heuristics import (
+        CachingAutotuner,
+        triton_config_to_hashable,
+    )
+
+    orig = CachingAutotuner.autotune_to_one_config
+
+    @functools.wraps(orig)
+    def patched(self, *args, **kwargs):
+        if (
+            get_graph_extension_mode() == CUDAGraphExtensionMode.SAVE
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            cache = getattr(getattr(self, "save_cache_hook", None), "__self__", None)
+            if cache is None or not hasattr(cache, "read_best"):
+                raise RuntimeError(f"Foundry SAVE: no Triton autotune cache for {self.fn.__name__}")
+            if self.inductor_meta.get("coordinate_descent_tuning", False):
+                raise RuntimeError(
+                    "Foundry SAVE: coordinate-descent autotune needs a "
+                    f"pre-capture selection path for {self.fn.__name__}"
+                )
+            configs = [result.config for result in self.compile_results]
+            best = cache.read_best(self.inductor_meta, configs)
+            if best is None:
+                raise RuntimeError(
+                    "Foundry SAVE: Triton best_config missing or incompatible for "
+                    f"{self.fn.__name__} ({self.filename})"
+                )
+            best_key = triton_config_to_hashable(best)
+            matches = [
+                launcher
+                for launcher in self.launchers
+                if triton_config_to_hashable(launcher.config) == best_key
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "Foundry SAVE: cached Triton best_config does not match "
+                    f"one compiled launcher for {self.fn.__name__} "
+                    f"({len(matches)} matches, {self.filename})"
+                )
+            self.launchers = matches
+            log.info(
+                "[foundry] restored cached Triton best_config during capture: %s config=%s",
+                self.fn.__name__,
+                best_key,
+            )
+            return
+        return orig(self, *args, **kwargs)
+
+    CachingAutotuner.autotune_to_one_config = patched
 
 
 def _patch_kernel_warmup() -> None:
