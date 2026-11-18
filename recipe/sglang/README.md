@@ -175,7 +175,7 @@ python3.12 -m venv venv && source venv/bin/activate
 # SGLang with the Foundry adapter (foundry-org/sglang branch foundry-dep), editable;
 # this also pulls the kernel stack as wheels (sglang-kernel, sgl-deep-ep, sgl-deep-gemm).
 pip install -e sglang/python
-pip install "sglang[foundry]"        # foundry-core >=0.1.0rc4,<0.2, API 2.4
+pip install "sglang[foundry]"        # foundry-core >=0.1.0rc5,<0.2, API 2.4
 # ...or Foundry from this repo instead of the wheel:
 # pip install "cmake>=4.0" ninja wheel pytest
 # pushd foundry && pip install -e . --no-build-isolation && popd
