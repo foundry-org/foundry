@@ -20,9 +20,6 @@ A small release for the SGLang `--cuda-graph-persistence` review round.
 - **DFLASH, NGRAM and DSPARK speculative graphs are persisted** (their target
   and draft run the decode runner in target-verify mode). DSPARK's sampling
   draft needs `SGLANG_DSPARK_USE_GREEDY_DRAFT=1`.
-- **The GDN CuTe-DSL cache is installed at the head of the runner warmup**, so
-  an SGLang that prewarms its GDN kernels there loads them from the cache on
-  LOAD (Qwen3.5-2B: 8.4 s -> 0.1 s).
 
 ## Validation
 
