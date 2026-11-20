@@ -230,6 +230,7 @@ class CUDAGraph(ops.CUDAGraph):
     # save. The torch graph owning the capture, and its RNG probe:
     _native_graph = None
     _native_rng = None
+    _rng_route = None
 
     def capture_begin(
         self, pool: _POOL_HANDLE | None = None, capture_error_mode: str = "global"
@@ -397,6 +398,25 @@ class CUDAGraph(ops.CUDAGraph):
                 f"state of another generator: {_stray_message(strays)}"
             )
 
+    def _abort_capture(self) -> None:
+        """End a capture whose body raised without adopting it: torch's capture is ended
+        (its errors are dropped, the body's exception is the one that propagates) and the
+        hook record window is discarded. Memory the capture allocated stays allocated on
+        SAVE but is in no archive, so later graphs that use it (an RNG-pool segment
+        allocated in this window) are refused at SAVE."""
+        native = self._native_graph
+        if native is None:
+            return
+        try:
+            native.capture_end()
+        except Exception:
+            pass
+        finally:
+            if self._rng_route is not None:
+                self._rng_route.__exit__(None, None, None)
+                self._rng_route = None
+            ops.native_record_abort()
+
     def replay(self) -> None:
         if self._native_graph is not None:
             # torch's replay runs its own RNG prologue (fills the seed/offset buffers)
@@ -542,9 +562,15 @@ class graph:
             capture_error_mode=self.capture_error_mode,
         )
 
-    def __exit__(self, *args) -> None:
-        self.cuda_graph.capture_end()
-        self.stream_ctx.__exit__(*args)
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            if exc_type is None:
+                self.cuda_graph.capture_end()
+            else:
+                # The body raised: nothing of this capture is adopted or archived.
+                self.cuda_graph._abort_capture()
+        finally:
+            self.stream_ctx.__exit__(exc_type, exc, tb)
 
 
 def save_graph_manifest(
