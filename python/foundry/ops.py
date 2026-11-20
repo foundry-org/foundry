@@ -138,9 +138,10 @@ def get_graph_ptr(graph: CUDAGraph) -> int:
     return _C.graph_ptr(graph._graph_handle)
 
 
-def set_allocation_region(base: int, size: int) -> None:
-    """Set the allocation region for the CUDA VMM hooks."""
-    _C.set_allocation_region(base, size)
+def set_allocation_region(base: int, size: int) -> bool:
+    """Set the allocation region for the CUDA VMM hooks; False when the region
+    could not be reserved at ``base``."""
+    return _C.set_allocation_region(base, size)
 
 
 def stop_allocation_region() -> None:

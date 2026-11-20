@@ -36,7 +36,7 @@ class CUDAGraphExtensionConfig:
     # leaves LD_PRELOAD as the launcher exported it.
     verbs_udev_wait_shim_path: str | None = None
     base_addr: int = 0x600000000000
-    region_size: str = "64GB"
+    region_size: str = "512GB"
     workspace_root: str = "foundry_archive"
     workspace_dir: str | None = None
     # SAVE: group same-topology graphs under one template with on-demand

@@ -203,8 +203,8 @@ void native_record_abort() {
 bool recorded_allocation_contains(int64_t addr, int64_t len) {
   return ::foundry::recorded_allocation_contains(static_cast<uint64_t>(addr), as_size(len, "len"));
 }
-void set_allocation_region(int64_t base, int64_t size) {
-  ::foundry::set_allocation_region(as_ptr<void*>(base), as_size(size, "size"));
+bool set_allocation_region(int64_t base, int64_t size) {
+  return ::foundry::set_allocation_region(as_ptr<void*>(base), as_size(size, "size"));
 }
 void stop_allocation_region() {
   ::foundry::stop_allocation_region();
@@ -462,7 +462,7 @@ STABLE_TORCH_LIBRARY(foundry, m) {
   m.def("native_record_begin() -> ()");
   m.def("native_record_abort() -> ()");
   m.def("recorded_allocation_contains(int addr, int len) -> bool");
-  m.def("set_allocation_region(int base, int size) -> ()");
+  m.def("set_allocation_region(int base, int size) -> bool");
   m.def("stop_allocation_region() -> ()");
   m.def("resume_allocation_region() -> ()");
   m.def("preallocate_region(int size) -> bool");
