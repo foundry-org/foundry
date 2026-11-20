@@ -181,12 +181,12 @@ pip install "sglang[foundry]"        # foundry-core >=0.1.0rc5,<0.2, API 2.4
 # pushd foundry && pip install -e . --no-build-isolation && popd
 ```
 
-For a torch/CUDA pair other than the one the PyPI wheel was built for, add that pair's
-index, e.g. `--extra-index-url https://foundry-org.github.io/foundry/whl/cu130/torch2.14/`.
+The wheel requires `torch>=2.14` and loads on any later torch of its CUDA major. For
+another CUDA major, add its index, e.g. `--extra-index-url https://foundry-org.github.io/foundry/whl/cu128/`.
 
 Foundry uses Boost header-only, so neither install needs a Boost runtime library or an
-`LD_LIBRARY_PATH` entry. `foundry.ops` refuses to import under a torch whose major.minor or
-CUDA major differs from the one it was built with.
+`LD_LIBRARY_PATH` entry. `foundry.ops` refuses to import under a torch older than 2.14 or
+with another CUDA major than the one it was built with.
 
 ## Run (single GPU / DP)
 

@@ -330,8 +330,13 @@ def test_cuda_graph_config_json_is_validated(model_dir, persistence, json_cfg, m
 
 
 @pytest.mark.parametrize("field", ["disable_cuda_graph", "disable_decode_cuda_graph"])
-def test_disable_cuda_graph_falls_back_not_overridden(model_dir, persistence, field):
-    sa = _resolve_unsupported(model_dir, persistence, "disable-cuda-graph", **{field: True})
+def test_disabled_decode_graphs_resolve_without_foundry(model_dir, persistence, field):
+    """SGLang resolves the flag away before it activates Foundry (nothing to
+    persist): Foundry is never called and declares nothing."""
+    sa = _resolve(model_dir, **{field: True})
+    assert not persistence.get_foundry_adapter().enabled
+    assert api._unsupported is None
+    assert resolution_result(sa, "cuda_graph_persistence") is None
     assert pins.RESOLUTION_SOURCE not in dict(sa._resolved_overrides)
 
 

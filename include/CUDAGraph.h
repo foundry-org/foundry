@@ -1,17 +1,14 @@
 #pragma once
 
-#include <ATen/Tensor.h>
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
 #include <boost/unordered/concurrent_flat_map.hpp>
 #include <boost/json.hpp>
-#include <c10/core/Device.h>
-#include <c10/core/CachingDeviceAllocator.h>
-#include <c10/cuda/CUDAStream.h>
-#include <c10/util/flat_hash_map.h>
-#include <c10/util/intrusive_ptr.h>
+#include "StableTorch.h"
 #include "metadata.h"
 
 #include <map>
+#include <string>
+#include <tuple>
 #include <vector>
 #include <map>
 #include <utility>
@@ -20,30 +17,19 @@
 #include <variant>
 #include <mutex>
 
-namespace at {
-
-struct Generator;
-struct CUDAGeneratorImpl;
-struct CUDAGeneratorState;
-
-}  // namespace at
-
 namespace foundry {
 
 struct BinaryGraphFile;  // forward declaration, defined in BinaryGraphFormat.h
 struct BuildTiming;      // LOAD template-build breakdown, defined in CUDAGraphParallel.cpp
 
-using MempoolId_t = c10::MempoolId_t;
-using CaptureId_t = c10::CaptureId_t;
-
 enum class OutputTensorType { None, Single, List, Tuple };
 
-using OutputTensors = std::variant<std::monostate, at::Tensor, std::vector<at::Tensor>>;
+using OutputTensors = std::variant<std::monostate, Tensor, std::vector<Tensor>>;
 
 struct CUDAGraph;
 struct PendingGraphLoads;
 
-using ReconstructTensorFn = at::Tensor (*)(const boost::json::object&);
+using ReconstructTensorFn = Tensor (*)(const boost::json::object&);
 
 struct GraphLoadResult {
   std::shared_ptr<CUDAGraph> graph;
@@ -57,18 +43,38 @@ struct ParsedGraphData {
   MempoolId_t pool;
 };
 
-MempoolId_t graph_pool_handle();
+// cuBLAS handle and workspace of the current stream (stable shim); the cuBLASLt
+// handle is that handle. Raises when torch would cache a separate cuBLASLt
+// workspace, which no stable shim allocates. torch_has_workspace_cache_flag:
+// torch >= 2.15 (TORCH_CUBLAS_WORKSPACE_CACHE exists, default off).
+void preallocate_cublas_workspaces(bool torch_has_workspace_cache_flag);
 
-void preallocate_cublas_workspaces();
+// SAVE captures with torch's own torch.cuda.CUDAGraph; foundry only opens/closes
+// its hook record around it (foundry/graph.py).
+void native_record_begin();
+void native_record_abort();
 
-struct CUDAGeneratorStateRegistry {
-  uint64_t query_state_id(at::CUDAGeneratorState* state);
-  c10::intrusive_ptr<at::CUDAGeneratorState> get_state_from_id(uint64_t id, uint64_t seed);
+// Process-wide philox (seed, offset) per archived generator id (first
+// registration fixes the seed, offset starts at 0, shared by every loaded graph
+// with that id).
+struct FoundryRngState {
+  uint64_t seed = 0;
+  uint64_t offset = 0;
+};
+std::shared_ptr<FoundryRngState> foundry_rng_state_from_id(uint64_t id, uint64_t seed);
 
- protected:
-  std::atomic<uint64_t> id_counter{0};
-  boost::concurrent_flat_map<at::CUDAGeneratorState*, uint64_t> id_map_;
-  boost::concurrent_flat_map<uint64_t, c10::intrusive_ptr<at::CUDAGeneratorState>> state_pool_;
+// Per (loaded graph, generator id) seed/offset buffers whose addresses the archived
+// kernels read (torch's CUDAGeneratorCaptureState::rng_state_{seed,offset}_extragraph_
+// at SAVE). Allocated from torch's caching allocator through the stable shim.
+struct LoadedRngBuffers {
+  uint64_t id = 0;
+  std::shared_ptr<FoundryRngState> state;
+  uint64_t wholegraph_increment = 0;
+  TensorHandle seed_buf;  // declared before offset_buf: destroyed after it, as upstream
+  TensorHandle offset_buf;
+  // Streams a replay wrote/read the buffers on; synchronized before the buffers are
+  // freed (replaces torch's recordStream, which has no stable shim).
+  std::vector<cudaStream_t> replay_streams;
 };
 
 struct CUDAGraph {
@@ -80,13 +86,9 @@ struct CUDAGraph {
   CUDAGraph(bool keep_graph = false);
   ~CUDAGraph();
 
-  void register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorState> state);
-  void register_generator_state(const at::Generator& generator);
-  void register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorState> state,
-                                uint64_t wholegraph_increment);
-  void capture_begin(MempoolId_t pool = {0, 0},
-                     cudaStreamCaptureMode capture_mode = cudaStreamCaptureModeGlobal);
-  void capture_end();
+  // LOAD: allocate this graph's seed/offset buffers for archived generator `id`
+  // (same allocations as torch's CUDAGeneratorCaptureState::initialize).
+  void register_native_rng(uint64_t id, uint64_t seed, uint64_t wholegraph_increment);
   void instantiate();
   void replay();
   std::string exec_share_stats() const;
@@ -120,6 +122,13 @@ struct CUDAGraph {
   cudaGraphExec_t raw_cuda_graph_exec();
 
   void analyze_captured_graph();
+  // Adopt the cudaGraph_t of a torch.cuda.CUDAGraph(keep_graph=True) whose
+  // capture ran inside native_record_begin(): closes the hook record, analyzes the graph.
+  // torch keeps owning the cudaGraph_t and the pool (never destroyed or released here);
+  // the caller keeps the torch graph alive. generators: (id, seed, wholegraph_increment).
+  void adopt_native_capture(
+      uintptr_t raw_graph, MempoolId_t pool,
+      const std::vector<std::tuple<uint64_t, uint64_t, uint64_t>>& generators);
   void save(const std::string& json_path, const OutputTensors& output_tensors = std::monostate{},
             OutputTensorType output_type = OutputTensorType::None);
   void save_binary(const std::string& bin_path, const boost::json::object& json_root);
@@ -127,8 +136,7 @@ struct CUDAGraph {
 
   // Create graph shell and register generators, but do NOT replay allocator events.
   // Used by start_graph_builds to create shells early before weight loading.
-  static ParsedGraphData prepare_graph_shell(boost::json::value&& root_val, MempoolId_t pool,
-                                             CUDAGeneratorStateRegistry& registry);
+  static ParsedGraphData prepare_graph_shell(boost::json::value&& root_val, MempoolId_t pool);
   // Template for topology-grouped graph building
   struct GraphTemplate {
     CUgraph cuGraph;                         // the template CUgraph
@@ -308,19 +316,20 @@ struct CUDAGraph {
   bool capture_ended_ = false;
   bool has_graph_exec_ = false;
 
-  CaptureId_t capture_id_ = -1;
+  MempoolId_t mempool_id_{0, 0};
 
-  MempoolId_t mempool_id_;
-
-  at::cuda::CUDAStream capture_stream_;
-
-  ska::flat_hash_map<c10::intrusive_ptr<at::CUDAGeneratorState>, uint64_t>
-      captured_generator_states_;
-
-  static constexpr c10::DeviceIndex UNDEFINED_DEVICE = -1;
-  c10::DeviceIndex capture_dev_{UNDEFINED_DEVICE};
+  static constexpr DeviceIndex UNDEFINED_DEVICE = -1;
+  DeviceIndex capture_dev_{UNDEFINED_DEVICE};
 
   bool keep_graph_ = false;
+
+  // graph_ belongs to a torch CUDAGraph (adopt_native_capture).
+  bool adopted_native_ = false;
+  std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> native_generators_;
+  // Loaded graph's Foundry-owned RNG buffers.
+  std::vector<LoadedRngBuffers> native_rng_;
+  void native_rng_replay_prologue(cudaStream_t stream);
+  void release_native_rng();
 
   std::vector<GraphNode> graph_nodes;
   std::vector<GraphDependency> graph_dependencies;

@@ -13,20 +13,28 @@ from setuptools import setup
 # imported and no extension module is declared.
 SDIST = os.getenv("FOUNDRY_SDIST") == "1"
 if not SDIST:
-    from torch.utils.cpp_extension import (
-        CUDA_HOME,
-        BuildExtension,
-        CUDAExtension,
-        include_paths,
-        library_paths,
-    )
+    from setuptools import Extension
+    from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, library_paths
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# foundry.ops is compiled against the LibTorch Stable ABI only, targeting this torch:
+# one build loads on every torch >= MIN_TORCH (no upper bound; newer-torch behaviour
+# Foundry depends on is checked at run time, see foundry/_loader.py).
+MIN_TORCH = (2, 14)
+# TORCH_TARGET_VERSION encoding of torch/headeronly/version.h: one byte per major/minor.
+TORCH_TARGET_VERSION = f"0x{MIN_TORCH[0]:02x}{MIN_TORCH[1]:02x}000000000000"
+# The only torch header trees foundry.ops may include (copied into build/ so
+# nothing else of torch/include is on the include path).
+STABLE_HEADER_TREES = (
+    "torch/headeronly",
+    "torch/csrc/stable",
+    "torch/csrc/inductor/aoti_torch/c",
+)
+
 # FOUNDRY_WHEEL_BUILD=1 (set by tools/release/build_wheel.sh and the release
-# workflow): build a relocatable wheel. No absolute RPATHs into the build
-# machine's torch/CUDA, and the torch requirement pinned to the build torch's
-# major.minor. Source/editable installs keep the previous behavior.
+# workflow): build a relocatable wheel: no absolute RPATH into the build machine's
+# CUDA toolkit. foundry.ops never has an RPATH into torch (stable ABI, torch >= 2.14).
 WHEEL_BUILD = bool(os.getenv("FOUNDRY_WHEEL_BUILD"))
 
 
@@ -105,21 +113,24 @@ def get_compile_flags():
 
 
 def torch_requirement():
-    """Release wheels pin the exact torch they were built against (foundry.ops
-    uses ATen/c10 internals; SGLang pins torch the same way). Source builds
-    accept the installed torch."""
-    if not WHEEL_BUILD:
-        return "torch"
-    return f"torch=={torch.__version__.split('+')[0]}"
+    """foundry.ops uses only the LibTorch Stable ABI (target MIN_TORCH): one build
+    loads on any torch >= MIN_TORCH. Never pinned to the build torch."""
+    return f"torch>={MIN_TORCH[0]}.{MIN_TORCH[1]}"
 
 
 def write_build_info(boost_version):
-    """Record the build-time torch/CUDA for foundry._loader's runtime check."""
+    """Record the build torch/CUDA and the stable-ABI target for foundry._loader."""
+    if tuple(int(x) for x in torch.__version__.split(".")[:2]) < MIN_TORCH:
+        raise RuntimeError(
+            f"building foundry.ops needs torch >= {MIN_TORCH[0]}.{MIN_TORCH[1]} (its stable-ABI "
+            f"headers), found {torch.__version__}"
+        )
     pkg = Path(ROOT_DIR) / "python" / "foundry"
     text = (pkg / "_build_info.py.in").read_text()
     for key, value in {
         "@TORCH_VERSION@": torch.__version__,
         "@TORCH_CUDA_VERSION@": torch.version.cuda or "",
+        "@STABLE_ABI_TARGET@": f"{MIN_TORCH[0]}.{MIN_TORCH[1]}",
         "@BOOST_VERSION@": boost_version,
     }.items():
         text = text.replace(key, value)
@@ -136,7 +147,24 @@ if SDIST:
     ext_modules = []
     cmdclass = {}
 else:
-    common_include_dirs = include_paths(device_type="cuda") + [os.path.join(ROOT_DIR, "include")]
+    import pybind11
+
+    # Restricted torch include tree: only the stable-ABI headers (see STABLE_HEADER_TREES).
+    torch_include = os.path.join(os.path.dirname(torch.__file__), "include")
+    stable_include = os.path.join(ROOT_DIR, "build", "stable_include")
+    import shutil
+
+    shutil.rmtree(stable_include, ignore_errors=True)
+    for tree in STABLE_HEADER_TREES:
+        shutil.copytree(os.path.join(torch_include, tree), os.path.join(stable_include, tree))
+    cuda_include = os.path.join(CUDA_HOME, "include") if CUDA_HOME else None
+    common_include_dirs = [
+        stable_include,
+        os.path.join(ROOT_DIR, "include"),
+        pybind11.get_include(),
+    ]
+    if cuda_include:
+        common_include_dirs.append(cuda_include)
     if boost_include_dir not in _IMPLICIT_INCLUDE_DIRS:
         common_include_dirs.append(boost_include_dir)
     common_library_dirs = library_paths(device_type="cuda")
@@ -145,11 +173,14 @@ else:
     if CUDA_HOME and os.path.isfile(os.path.join(CUDA_HOME, "lib64", "stubs", "libcuda.so")):
         common_library_dirs.append(os.path.join(CUDA_HOME, "lib64", "stubs"))
 
-    # libcuda_hook.so sits next to foundry.ops ($ORIGIN). A source build also bakes
-    # the torch/CUDA library dirs; a wheel must not (foundry imports torch first).
+    # libcuda_hook.so sits next to foundry.ops ($ORIGIN). A source build also bakes the
+    # CUDA toolkit library dir (cudart). Never torch's lib dir: foundry imports torch first,
+    # so libtorch_cpu / libtorch_cuda resolve to whichever torch is installed.
     ops_rpaths = ["$ORIGIN"]
     if not WHEEL_BUILD:
-        ops_rpaths += library_paths(device_type="cuda")
+        ops_rpaths += [
+            p for p in library_paths(device_type="cuda") if CUDA_HOME and p.startswith(CUDA_HOME)
+        ]
 
     class CustomBuildExt(BuildExtension):
         def build_extensions(self):
@@ -198,7 +229,7 @@ else:
                 shutil.copy2(str(hook_lib), str(src_dir))
 
     ext_modules = [
-        CUDAExtension(
+        Extension(
             name="foundry.ops",
             sources=[
                 "csrc/binding.cpp",
@@ -210,10 +241,10 @@ else:
             include_dirs=common_include_dirs,
             library_dirs=common_library_dirs,
             language="c++",
-            extra_compile_args={
-                "cxx": ["-O3"] + get_compile_flags(),
-                "nvcc": ["-O3"] + get_compile_flags(),
-            },
+            define_macros=[("USE_CUDA", "1"), ("TORCH_TARGET_VERSION", TORCH_TARGET_VERSION)],
+            extra_compile_args={"cxx": ["-O3"] + get_compile_flags()},
+            # Stable C shims: aoti_torch_*/torch_* in libtorch_cpu, the CUDA ones in libtorch_cuda.
+            libraries=["torch_cpu", "torch_cuda", "cudart"],
             extra_link_args=["-lcuda"] + [f"-Wl,-rpath,{p}" for p in ops_rpaths],
         ),
     ]

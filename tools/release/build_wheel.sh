@@ -13,10 +13,11 @@
 #
 # Options:
 #   --python X.Y        CPython version (manylinux /opt/python/cpXY-cpXY)   [3.12]
-#   --torch  X.Y.Z      torch build to compile against                        [2.14.1]
+#   --torch  X.Y.Z      torch to compile against (the stable-ABI target, 2.14.x; the
+#                       wheel requires torch>=2.14 and loads on any later torch)  [2.14.1]
 #   --cuda   cuXYZ      torch CUDA flavor (index https://download.pytorch.org/whl/cuXYZ) [cu130]
 #   --local-version S   append "+S" to the wheel version (GitHub-Release-only builds
-#                       for a non-default torch/CUDA pair; PyPI rejects local versions)
+#                       for a non-default CUDA major, e.g. cu128; PyPI rejects local versions)
 #   --out DIR           output directory for the repaired wheel             [wheelhouse]
 #   --no-smoke          skip the install + import check
 #   --docker            re-run this script inside pytorch/manylinux2_28-builder:<cuda>
@@ -108,7 +109,8 @@ BPY="$WORK/build-venv/bin/python"
 "$BPY" -m pip install -q -U pip
 "$BPY" -m pip download -q -d "$WORK/torch-wheels" --index-url "$TORCH_INDEX" "torch==${TORCH_VER}"
 "$BPY" -m pip install -q --no-index --find-links "$WORK/torch-wheels" "torch==${TORCH_VER}"
-"$BPY" -m pip install -q "cmake>=4.0" ninja "setuptools>=80" wheel
+# pybind11: headers only, at build time (foundry.ops has no runtime dependency on it).
+"$BPY" -m pip install -q "cmake>=4.0" ninja "setuptools>=80" wheel "pybind11>=2.12"
 "$BPY" -c "import torch; print('build torch', torch.__version__, 'cuda', torch.version.cuda)"
 
 # Build from a clean copy of the tree: no stale CMake cache, editable-install
@@ -196,6 +198,11 @@ grep -qi boost "$WORK/ops.dyn" && die "foundry.ops has a Boost DT_NEEDED"
 grep -q 'Shared library: \[libcuda_hook.so\]' "$WORK/ops.dyn" || die "foundry.ops does not need libcuda_hook.so by that name"
 grep -qE 'R(UN)?PATH.*\$ORIGIN' "$WORK/ops.dyn" || die "foundry.ops lost its \$ORIGIN RPATH"
 cat "$WORK/x"/foundry_core-*.dist-info/METADATA | grep -E '^(Name|Version|Requires-Dist):'
+# One wheel serves every torch >= the stable-ABI target: never pin the build torch.
+grep -E '^Requires-Dist: torch' "$WORK/x"/foundry_core-*.dist-info/METADATA | grep -q '==' \
+    && die "the wheel pins torch (Requires-Dist torch==...): expected torch>=<stable-ABI target>"
+grep -q '^STABLE_ABI_TARGET = "[0-9]' "$WORK/x/foundry/_build_info.py" \
+    || die "foundry/_build_info.py has no STABLE_ABI_TARGET"
 
 if [[ "$SMOKE" == 1 ]]; then
     log "smoke test in a clean venv"

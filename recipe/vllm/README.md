@@ -84,8 +84,9 @@ cd ..
 ```
 
 Foundry uses Boost header-only (since 0.1.0), so no Boost shared library has to be on
-`LD_LIBRARY_PATH`. This torch 2.11 env needs the source build: the `foundry-core` PyPI wheels
-are built for torch 2.13 / cu130 and refuse to import under another torch.
+`LD_LIBRARY_PATH`. This torch 2.11 env needs the source build of an older Foundry: the
+`foundry-core` wheels require torch >= 2.14 (stable-ABI target) and refuse to import under an
+older torch.
 
 ### 4. (EP scripts only) Build NVSHMEM for DeepEP
 

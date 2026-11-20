@@ -1,8 +1,10 @@
 # Build foundry-core wheels and the sdist; on a v* tag (or a manual run with
-# publish=yes) upload the PyPI-pair wheels + sdist to PyPI through trusted
+# publish=yes) upload the PyPI-CUDA wheels + sdist to PyPI through trusted
 # publishing, attach every wheel to a GitHub Release and list them in the
-# per-pair package index on the gh-pages branch (whl/<cuda>/torch<A.B>/,
-# pip --extra-index-url). See docs/release.md.
+# per-CUDA package index on the gh-pages branch (whl/<cuda>/,
+# pip --extra-index-url). foundry.ops uses only the LibTorch Stable ABI, so one
+# wheel per (CPython, CUDA major) serves every torch >= the stable-ABI target.
+# See docs/release.md.
 name: release
 
 on:
@@ -10,12 +12,12 @@ on:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
-      torch:
-        description: "torch version to build against, e.g. 2.14.1 (empty: every pair in BUILD_PAIRS)"
+      cuda:
+        description: "torch CUDA tag to build, e.g. cu128 (empty: every entry in BUILD_CUDAS)"
         required: false
         default: ""
-      cuda:
-        description: "torch CUDA tag, e.g. cu130 (required with torch)"
+      torch:
+        description: "build torch for that CUDA tag, e.g. 2.14.1 (required with cuda; its major.minor must be the stable-ABI target)"
         required: false
         default: ""
       publish:
@@ -28,16 +30,19 @@ permissions:
   contents: read
 
 env:
-  # Release matrix: PYTHONS x BUILD_PAIRS. The FIRST pair is the PyPI pair:
-  # its wheels carry the plain version (foundry-core X.Y.Z, Requires-Dist
-  # torch==A.B.C) and are uploaded to PyPI. Every other pair is built with a
-  # local version (X.Y.Z+cuNNN.torchA.B), since PyPI rejects local versions.
-  # Every wheel is attached to the GitHub Release and listed in the package
-  # index of its pair, whl/<cuda>/torch<A.B>/ on the gh-pages branch, which
-  # users select with pip --extra-index-url. "image" is optional; the default
-  # is pytorch/manylinux2_28-builder:cuda<major.minor of the cuda tag>.
+  # Release matrix: PYTHONS x BUILD_CUDAS, one wheel per (CPython, CUDA major).
+  # "torch" is the torch the wheel is COMPILED with: its major.minor must be the
+  # stable-ABI target (setup.py MIN_TORCH); every wheel requires torch>=<target>
+  # and loads on any later torch with the same CUDA major. The FIRST entry is the
+  # PyPI CUDA: its wheels carry the plain version (foundry-core X.Y.Z) and are
+  # uploaded to PyPI. Every other entry is built with a local version
+  # (X.Y.Z+cuNNN), since PyPI rejects local versions. Every wheel is attached to
+  # the GitHub Release and listed in the package index of its CUDA, whl/<cuda>/
+  # on the gh-pages branch, which users select with pip --extra-index-url.
+  # "image" is optional; the default is
+  # pytorch/manylinux2_28-builder:cuda<major.minor of the cuda tag>.
   PYTHONS: '["3.10", "3.11", "3.12", "3.13"]'
-  BUILD_PAIRS: '[{"torch": "2.14.1", "cuda": "cu130"}, {"torch": "2.13.0", "cuda": "cu130"}]'
+  BUILD_CUDAS: '[{"cuda": "cu130", "torch": "2.14.1"}]'
 
 jobs:
   plan:
@@ -67,38 +72,45 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           python3 - <<'PY'
-          import json, os, sys, tomllib
+          import json, os, re, sys, tomllib
 
           version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          m = re.search(r"^MIN_TORCH = \((\d+), (\d+)\)", open("setup.py").read(), re.MULTILINE)
+          target = f"{m[1]}.{m[2]}"
           is_tag = os.environ["EVENT"] == "push" and os.environ["REF"].startswith("refs/tags/v")
           if is_tag and os.environ["REF_NAME"] != f"v{version}":
               print(f"::error::tag {os.environ['REF_NAME']} does not match pyproject version {version}")
               sys.exit(1)
 
           pythons = json.loads(os.environ["PYTHONS"])
-          pairs = json.loads(os.environ["BUILD_PAIRS"])
-          pypi_pair = (pairs[0]["torch"], pairs[0]["cuda"])
+          cudas = json.loads(os.environ["BUILD_CUDAS"])
+          pypi_cuda = cudas[0]["cuda"]
           torch, cuda = os.environ.get("IN_TORCH", ""), os.environ.get("IN_CUDA", "")
           if torch or cuda:
               if not (torch and cuda):
                   print("::error::give both torch and cuda, or neither")
                   sys.exit(1)
-              pairs = [{"torch": torch, "cuda": cuda}]
+              cudas = [{"torch": torch, "cuda": cuda}]
+          if len({c["cuda"] for c in cudas}) != len(cudas):
+              print("::error::one BUILD_CUDAS entry per CUDA tag")
+              sys.exit(1)
 
           include = []
-          for pair in pairs:
-              digits = pair["cuda"].removeprefix("cu")
-              image = pair.get("image") or f"pytorch/manylinux2_28-builder:cuda{digits[:-1]}.{digits[-1]}"
-              pypi = (pair["torch"], pair["cuda"]) == pypi_pair
-              major_minor = ".".join(pair["torch"].split(".")[:2])
-              local = "" if pypi else f"{pair['cuda']}.torch{major_minor}"
+          for entry in cudas:
+              if ".".join(entry["torch"].split(".")[:2]) != target:
+                  print(f"::error::build torch {entry['torch']} is not the stable-ABI target {target} (setup.py MIN_TORCH)")
+                  sys.exit(1)
+              digits = entry["cuda"].removeprefix("cu")
+              image = entry.get("image") or f"pytorch/manylinux2_28-builder:cuda{digits[:-1]}.{digits[-1]}"
+              pypi = entry["cuda"] == pypi_cuda
+              local = "" if pypi else entry["cuda"]
               for py in pythons:
-                  include.append(dict(python=py, torch=pair["torch"], cuda=pair["cuda"],
+                  include.append(dict(python=py, torch=entry["torch"], cuda=entry["cuda"],
                                       image=image, pypi=pypi, local_version=local))
 
           publish = is_tag or os.environ.get("IN_PUBLISH") == "yes"
-          # PyPI gets the plain-version pair only; a manual build of another
-          # pair publishes to the GitHub Release alone.
+          # PyPI gets the plain-version CUDA only; a manual build of another
+          # CUDA publishes to the GitHub Release alone.
           pypi_publish = publish and any(e["pypi"] for e in include)
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"matrix={json.dumps({'include': include})}\n")
@@ -144,7 +156,7 @@ jobs:
 
   wheels:
     needs: plan
-    name: wheel py${{ matrix.python }} torch${{ matrix.torch }} ${{ matrix.cuda }}
+    name: wheel py${{ matrix.python }} ${{ matrix.cuda }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -173,7 +185,7 @@ jobs:
           ls -l wheelhouse
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.pypi && 'pypi' || 'ghrelease' }}-py${{ matrix.python }}-torch${{ matrix.torch }}-${{ matrix.cuda }}
+          name: wheel-${{ matrix.pypi && 'pypi' || 'ghrelease' }}-py${{ matrix.python }}-${{ matrix.cuda }}
           path: wheelhouse/*.whl
           if-no-files-found: error
 
@@ -206,7 +218,7 @@ jobs:
 
   release:
     needs: [plan, sdist, wheels, publish]
-    # Runs after the PyPI upload, or without it when only a non-PyPI pair was built.
+    # Runs after the PyPI upload, or without it when only a non-PyPI CUDA was built.
     if: >-
       always() && needs.plan.outputs.publish == 'true'
       && needs.sdist.result == 'success' && needs.wheels.result == 'success'
@@ -231,12 +243,13 @@ jobs:
           cat > notes.md <<NOTES
           foundry-core $VERSION. Release notes: RELEASE.md in this tag.
 
-          PyPI wheels (\`pip install foundry-core==$VERSION\`) are built for the first pair of
-          \`$BUILD_PAIRS\` (CPython 3.10-3.13, manylinux_2_28 x86_64). Wheels with a local version
-          (\`+cuNNN.torchA.B\`) target other torch/CUDA pairs. Every pair has a package index:
-          \`pip install foundry-core==$VERSION --extra-index-url $INDEX_URL/<cuda>/torch<A.B>/\`
-          (for example \`$INDEX_URL/cu130/torch2.13/\`), or install the wheel by URL from this page.
-          foundry.ops only loads with the torch major.minor and CUDA major it was built for.
+          PyPI wheels (\`pip install foundry-core==$VERSION\`) are built for the first CUDA of
+          \`$BUILD_CUDAS\` (CPython 3.10-3.13, manylinux_2_28 x86_64). One wheel per CPython serves
+          every torch >= the LibTorch Stable ABI target (Requires-Dist torch>=A.B, no upper bound)
+          with that CUDA major. Wheels with a local version (\`+cuNNN\`) target other CUDA majors and
+          have a package index each:
+          \`pip install foundry-core==$VERSION --extra-index-url $INDEX_URL/<cuda>/\`,
+          or install the wheel by URL from this page.
           NOTES
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" dist/* --clobber
@@ -246,11 +259,13 @@ jobs:
           fi
 
   index:
-    # Per-pair package indexes (PEP 503) on the gh-pages branch:
-    # whl/<cuda>/torch<A.B>/foundry-core/ lists every released wheel of that
-    # pair, linking to the GitHub Release assets with their sha256. The
-    # manifest whl/manifest.json accumulates across releases; the HTML is
-    # regenerated from it on every run.
+    # Per-CUDA package indexes (PEP 503) on the gh-pages branch:
+    # whl/<cuda>/foundry-core/ lists every released stable-ABI wheel of that
+    # CUDA, linking to the GitHub Release assets with their sha256. Wheels of
+    # releases up to 0.1.0rc4 (one per torch pair, manifest "torch" = A.B) stay
+    # in their old whl/<cuda>/torch<A.B>/ indexes. The manifest
+    # whl/manifest.json accumulates across releases; the HTML is regenerated
+    # from it on every run.
     needs: [plan, release]
     if: always() && needs.release.result == 'success'
     runs-on: ubuntu-latest
@@ -291,20 +306,20 @@ jobs:
           manifest_path = root / "manifest.json"
           manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
 
-          def pair_of(name):
-              """(cuda, torch major.minor) of a wheel from this run's matrix."""
+          def cuda_of(name):
+              """CUDA tag of a wheel from this run's matrix."""
               m = re.match(r"foundry_core-(?P<ver>[^-]+)-cp(?P<py>\d+)-", name)
               ver, py = m["ver"], m["py"]
               local = ver.split("+", 1)[1] if "+" in ver else ""
               for e in entries:
                   if e["python"].replace(".", "") == py and e["local_version"] == local:
-                      return e["cuda"], ".".join(e["torch"].split(".")[:2])
+                      return e["cuda"]
               raise SystemExit(f"no matrix entry for {name}")
 
           for wheel in sorted(Path("dist").glob("*.whl")):
-              cuda, torch_mm = pair_of(wheel.name)
+              # "torch": "" = one wheel for every torch >= the stable-ABI target.
               manifest[wheel.name] = {
-                  "version": version, "cuda": cuda, "torch": torch_mm,
+                  "version": version, "cuda": cuda_of(wheel.name), "torch": "",
                   "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
                   "url": f"https://github.com/{repo}/releases/download/v{version}/"
                          + urllib.parse.quote(wheel.name),
@@ -313,25 +328,30 @@ jobs:
 
           head = ('<!DOCTYPE html><html><head><meta charset="utf-8">'
                   '<meta name="pypi:repository-version" content="1.0"><title>{}</title></head><body>')
-          pairs = sorted({(m["cuda"], m["torch"]) for m in manifest.values()})
-          for cuda, torch_mm in pairs:
-              d = root / cuda / f"torch{torch_mm}"
+          # (cuda, "") = stable-ABI wheels, index whl/<cuda>/; (cuda, "A.B") = per-torch wheels
+          # of releases up to 0.1.0rc4, index whl/<cuda>/torch<A.B>/ (kept, no longer extended).
+          groups = sorted({(m["cuda"], m["torch"]) for m in manifest.values()})
+          def rel(cuda, torch_mm):
+              return f"{cuda}/torch{torch_mm}" if torch_mm else cuda
+          for cuda, torch_mm in groups:
+              d = root / rel(cuda, torch_mm)
               (d / "foundry-core").mkdir(parents=True, exist_ok=True)
               files = sorted(n for n, m in manifest.items() if (m["cuda"], m["torch"]) == (cuda, torch_mm))
               links = "".join(
                   f'<a href="{html.escape(manifest[n]["url"])}#sha256={manifest[n]["sha256"]}">{html.escape(n)}</a><br>\n'
                   for n in files)
+              title = f"foundry-core {rel(cuda, torch_mm)}"
               (d / "foundry-core" / "index.html").write_text(
-                  head.format(f"foundry-core {cuda} torch{torch_mm}") + f"<h1>foundry-core ({cuda}, torch {torch_mm})</h1>\n{links}</body></html>\n")
+                  head.format(title) + f"<h1>{title}</h1>\n{links}</body></html>\n")
               (d / "index.html").write_text(
-                  head.format(f"foundry-core index {cuda} torch{torch_mm}") + '<a href="foundry-core/">foundry-core</a><br>\n</body></html>\n')
-          listing = "".join(f'<a href="{c}/torch{t}/">{c}/torch{t}/</a><br>\n' for c, t in pairs)
+                  head.format(f"{title} index") + '<a href="foundry-core/">foundry-core</a><br>\n</body></html>\n')
+          listing = "".join(f'<a href="{rel(c, t)}/">{rel(c, t)}/</a><br>\n' for c, t in groups)
           (root / "index.html").write_text(
               head.format("foundry-core wheel indexes") + "<h1>foundry-core wheel indexes</h1>\n"
-              "<p>pip install foundry-core --extra-index-url &lt;this page&gt;/&lt;cuda&gt;/torch&lt;A.B&gt;/</p>\n"
+              "<p>pip install foundry-core --extra-index-url &lt;this page&gt;/&lt;cuda&gt;/</p>\n"
               + listing + "</body></html>\n")
           (Path("pages") / ".nojekyll").touch()
-          print("\n".join(f"{c}/torch{t}: " + ", ".join(n for n, m in manifest.items() if (m['cuda'], m['torch']) == (c, t)) for c, t in pairs))
+          print("\n".join(f"{rel(c, t)}: " + ", ".join(n for n, m in manifest.items() if (m['cuda'], m['torch']) == (c, t)) for c, t in groups))
           PY
       - name: Push gh-pages
         run: |

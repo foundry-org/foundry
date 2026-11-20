@@ -58,8 +58,7 @@ struct PendingGraphLoads {
   };
   std::vector<Entry> entries;
   MempoolId_t pool;
-  c10::DeviceIndex dev;
-  CUDAGeneratorStateRegistry* registry = nullptr;  // for deferred generator registration
+  DeviceIndex dev;
 
   // Signaled when background graph building (Phase 2) completes.
   // finish_graph_loads_impl waits on this before allocator replay.
@@ -83,8 +82,7 @@ inline unsigned int saved_event_flags(const boost::json::object& params) {
 // Split load: JSON parse + template build + on-demand prep (synchronous).
 // Called by CUDAGraph::start_graph_builds.
 std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
-    const std::vector<std::string>& json_paths, MempoolId_t pool, int num_threads,
-    CUDAGeneratorStateRegistry& registry);
+    const std::vector<std::string>& json_paths, MempoolId_t pool, int num_threads);
 
 // Split load: finish with allocator replay + output tensor reconstruction.
 // Called by CUDAGraph::finish_graph_loads.

@@ -119,31 +119,27 @@ See [ROADMAP.md](ROADMAP.md) for the full development plan and progress.
 ## Requirements
 
 - Linux x86_64, NVIDIA driver with CUDA 12.0+ (the driver's `libcuda.so.1` is loaded at runtime)
-- PyTorch: `foundry.ops` is a torch C++ extension bound to the torch it was built
-  with (major.minor and CUDA major), like sglang-kernel or flashinfer. Importing
-  it under another torch raises a readable error.
+- PyTorch >= 2.14 with the wheel's CUDA major: `foundry.ops` uses only the
+  LibTorch Stable ABI (target 2.14), so one build loads on torch 2.14 and every
+  later release. Importing it under an older torch or another CUDA major raises
+  a readable error.
 
 ## Installation
 
 Prebuilt wheels are published as **`foundry-core`** (the import name is
-`foundry`). A wheel works only with the torch major.minor and CUDA major it was
-built for, so, like torch itself, the pairs live in separate package indexes
-selected with `--extra-index-url` (`whl/<cuda>/torch<A.B>/`); PyPI carries the
-pair SGLang pins:
+`foundry`): one wheel per CPython version and CUDA major, requiring
+`torch>=2.14`. Install torch first (pip would otherwise resolve `torch>=2.14`
+from PyPI's default build):
 
-| foundry-core | torch pair | index | CPython | Platform |
+| foundry-core | torch | index | CPython | Platform |
 |---|---|---|---|---|
-| 0.1.x (0.1.0rc2 on) | 2.14 (`torch==2.14.1`), cu130 | PyPI, `whl/cu130/torch2.14/` | 3.10-3.13 | manylinux_2_28 x86_64 |
-| 0.1.x | 2.13 (`torch==2.13.0`), cu130 | `whl/cu130/torch2.13/` | 3.10-3.13 | manylinux_2_28 x86_64 |
+| next release | >= 2.14, cu13x | PyPI, `whl/cu130/` | 3.10-3.13 | manylinux_2_28 x86_64 |
+| 0.1.0rc2-0.1.0rc4 | `==2.14.1` (cu130) / `==2.13.0` (cu130) | PyPI / `whl/cu130/torch2.13/` | 3.10-3.13 | manylinux_2_28 x86_64 |
 
 ```bash
-pip install "torch==2.14.1" --index-url https://download.pytorch.org/whl/cu130
-pip install "foundry-core>=0.1.0rc2,<0.2"
+pip install "torch==2.14.1" --index-url https://download.pytorch.org/whl/cu130   # or any later cu13x torch
+pip install "foundry-core>=0.1.0rc5,<0.2"
 python -c "import foundry; print(foundry.__version__)"
-
-# another pair: add its index (the wheel there carries a local version, +cu130.torch2.13)
-pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
-pip install "foundry-core>=0.1.0rc2,<0.2" --extra-index-url https://foundry-org.github.io/foundry/whl/cu130/torch2.13/
 ```
 
 The wheel ships `foundry/ops.*.so` and `foundry/libcuda_hook.so` (the hook
@@ -153,10 +149,10 @@ other C++ runtime dependency is needed. Every wheel is also attached to the
 
 ### From source
 
-Needed for any other torch, or for development. Requirements:
+Needed for another CUDA major, or for development. Requirements:
 
-- CMake 4.0+ and ninja (`pip install "cmake>=4.0" ninja` if the system ones are older)
-- the torch you will run with, already installed (Foundry compiles against it; rebuild after changing torch)
+- CMake 4.0+, ninja and pybind11 (`pip install "cmake>=4.0" ninja pybind11`)
+- torch >= 2.14, already installed (Foundry compiles against its stable-ABI headers; the build loads on any later torch with the same CUDA major)
 - CUDA Toolkit with `nvcc` (CUDA 12+; CUDA 13 with torch cu130)
 - Boost headers, header-only (nothing is linked): the vendored copy in
   `third_party/boost` (populated by `tools/release/vendor_boost.sh`), or a
@@ -165,7 +161,7 @@ Needed for any other torch, or for development. Requirements:
   at the directory that contains `boost/version.hpp`)
 
 ```bash
-pip install "cmake>=4.0" ninja
+pip install "cmake>=4.0" ninja pybind11
 # Torch 2.14 with CUDA 13.0
 pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
 pip install -e . --no-build-isolation
