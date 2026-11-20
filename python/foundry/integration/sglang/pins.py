@@ -182,9 +182,8 @@ def _elastic_recapture_path_exists() -> bool:
 # Speculative decoding persisted by Foundry: the EAGLE worker's target-verify,
 # draft-decode and draft-extend graphs (one decode-type capture scope each,
 # hooks._decode_capture_scope). NEXTN resolves to EAGLE before this check.
-# The other algorithms (STANDALONE, NGRAM, DFLASH, DSPARK, UNO, FROZEN_KV_MTP
-# and plugin-registered ones) run other workers and runners and stay
-# rejected.
+# The other algorithms (STANDALONE, UNO, FROZEN_KV_MTP and plugin-registered
+# ones) run other workers and runners and stay rejected.
 # EAGLE-family (target-verify + draft-decode + draft-extend graph sets) and the
 # verify-only algorithms whose target and draft run the plain decode runner in
 # TARGET_VERIFY mode (kinds target_verify / draft_verify).
