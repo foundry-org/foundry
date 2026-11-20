@@ -14,18 +14,23 @@ from setuptools import setup
 SDIST = os.getenv("FOUNDRY_SDIST") == "1"
 if not SDIST:
     from setuptools import Extension
+    from setuptools.command.bdist_wheel import bdist_wheel
     from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, library_paths
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# foundry.ops is compiled against the LibTorch Stable ABI only, targeting this torch:
-# one build loads on every torch >= MIN_TORCH (no upper bound; newer-torch behaviour
+# foundry/libfoundry_ops.so (the native part of foundry.ops) is compiled against the
+# LibTorch Stable ABI only, targeting this torch, and has no Python C API: it registers
+# torch custom ops and foundry/ops.py loads it with torch.ops.load_library. One build
+# loads on every CPython and every torch >= MIN_TORCH (no upper bound; newer-torch behaviour
 # Foundry depends on is checked at run time, see foundry/_loader.py).
 MIN_TORCH = (2, 14)
 # TORCH_TARGET_VERSION encoding of torch/headeronly/version.h: one byte per major/minor.
 TORCH_TARGET_VERSION = f"0x{MIN_TORCH[0]:02x}{MIN_TORCH[1]:02x}000000000000"
 # The only torch header trees foundry.ops may include (copied into build/ so
 # nothing else of torch/include is on the include path).
+# The native library's dotted name: built to foundry/libfoundry_ops.so.
+OPS_LIBRARY = "foundry.libfoundry_ops"
 STABLE_HEADER_TREES = (
     "torch/headeronly",
     "torch/csrc/stable",
@@ -34,7 +39,7 @@ STABLE_HEADER_TREES = (
 
 # FOUNDRY_WHEEL_BUILD=1 (set by tools/release/build_wheel.sh and the release
 # workflow): build a relocatable wheel: no absolute RPATH into the build machine's
-# CUDA toolkit. foundry.ops never has an RPATH into torch (stable ABI, torch >= 2.14).
+# CUDA toolkit. libfoundry_ops.so never has an RPATH into torch (stable ABI, torch >= 2.14).
 WHEEL_BUILD = bool(os.getenv("FOUNDRY_WHEEL_BUILD"))
 
 
@@ -147,8 +152,6 @@ if SDIST:
     ext_modules = []
     cmdclass = {}
 else:
-    import pybind11
-
     # Restricted torch include tree: only the stable-ABI headers (see STABLE_HEADER_TREES).
     torch_include = os.path.join(os.path.dirname(torch.__file__), "include")
     stable_include = os.path.join(ROOT_DIR, "build", "stable_include")
@@ -161,7 +164,6 @@ else:
     common_include_dirs = [
         stable_include,
         os.path.join(ROOT_DIR, "include"),
-        pybind11.get_include(),
     ]
     if cuda_include:
         common_include_dirs.append(cuda_include)
@@ -173,7 +175,7 @@ else:
     if CUDA_HOME and os.path.isfile(os.path.join(CUDA_HOME, "lib64", "stubs", "libcuda.so")):
         common_library_dirs.append(os.path.join(CUDA_HOME, "lib64", "stubs"))
 
-    # libcuda_hook.so sits next to foundry.ops ($ORIGIN). A source build also bakes the
+    # libcuda_hook.so sits next to libfoundry_ops.so ($ORIGIN). A source build also bakes the
     # CUDA toolkit library dir (cudart). Never torch's lib dir: foundry imports torch first,
     # so libtorch_cpu / libtorch_cuda resolve to whichever torch is installed.
     ops_rpaths = ["$ORIGIN"]
@@ -212,10 +214,18 @@ else:
             # Update ext_modules to link against the built hook library
             hook_lib_path = build_dir / "libcuda_hook.so"
             for ext in self.extensions:
-                if ext.name == "foundry.ops":
+                if ext.name == OPS_LIBRARY:
                     ext.extra_link_args.append(str(hook_lib_path))
 
             super().build_extensions()
+
+        def get_ext_filename(self, fullname):
+            # A plain shared library (no Python module init, no ABI suffix):
+            # foundry/libfoundry_ops.so, loaded by torch.ops.load_library.
+            # (called with the dotted name and with its last component alone)
+            if fullname.split(".")[-1] == OPS_LIBRARY.split(".")[-1]:
+                return os.path.join(*fullname.split(".")) + ".so"
+            return super().get_ext_filename(fullname)
 
         def copy_extensions_to_source(self):
             super().copy_extensions_to_source()
@@ -228,9 +238,21 @@ else:
 
                 shutil.copy2(str(hook_lib), str(src_dir))
 
+    class PlatformWheel(bdist_wheel):
+        """py3-none-<platform>: the wheel's native code uses no Python ABI (torch custom
+        ops through the LibTorch Stable ABI), so one wheel serves every CPython."""
+
+        def finalize_options(self):
+            super().finalize_options()
+            self.root_is_pure = False
+
+        def get_tag(self):
+            _, _, plat = super().get_tag()
+            return "py3", "none", plat
+
     ext_modules = [
         Extension(
-            name="foundry.ops",
+            name=OPS_LIBRARY,
             sources=[
                 "csrc/binding.cpp",
                 "csrc/CUDAGraph.cpp",
@@ -249,10 +271,11 @@ else:
         ),
     ]
 
-    cmdclass = {"build_ext": CustomBuildExt}
+    cmdclass = {"build_ext": CustomBuildExt, "bdist_wheel": PlatformWheel}
 
 setup(
-    install_requires=[torch_requirement()],
+    # tomli: the integrations read their TOML config with tomllib, stdlib from 3.11.
+    install_requires=[torch_requirement(), 'tomli>=1.1; python_version < "3.11"'],
     cmdclass=cmdclass,
     ext_modules=ext_modules,
 )

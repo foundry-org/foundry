@@ -3,7 +3,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 #
 # Build, repair, check and smoke-test one foundry-core wheel, exactly as the
-# release workflow (.github/workflows/release.yml) does.
+# release workflow (.github/workflows/release.yml) does. The wheel is
+# py3-none-manylinux: its native library has no Python C API (torch custom ops
+# through the LibTorch Stable ABI), so one wheel per CUDA major serves every
+# CPython >= 3.10 and every torch >= 2.14.
 #
 # Inside a manylinux builder container (pytorch/manylinux2_28-builder:cudaXY.Z):
 #   tools/release/build_wheel.sh --python 3.12 --torch 2.14.1 --cuda cu130
@@ -12,7 +15,8 @@
 #   FOUNDRY_DOCKER_GPUS=all tools/release/build_wheel.sh --docker ...   # smoke with a real driver
 #
 # Options:
-#   --python X.Y        CPython version (manylinux /opt/python/cpXY-cpXY)   [3.12]
+#   --python X.Y        CPython that runs the build and the smoke test (manylinux
+#                       /opt/python/cpXY-cpXY); the wheel itself is py3-none  [3.12]
 #   --torch  X.Y.Z      torch to compile against (the stable-ABI target, 2.14.x; the
 #                       wheel requires torch>=2.14 and loads on any later torch)  [2.14.1]
 #   --cuda   cuXYZ      torch CUDA flavor (index https://download.pytorch.org/whl/cuXYZ) [cu130]
@@ -42,7 +46,7 @@ while [[ $# -gt 0 ]]; do
         --out) OUT="$2"; shift 2 ;;
         --no-smoke) SMOKE=0; shift ;;
         --docker) DOCKER=1; shift ;;
-        -h | --help) sed -n '5,25p' "$0"; exit 0 ;;
+        -h | --help) sed -n '5,31p' "$0"; exit 0 ;;
         *) echo "build_wheel: unknown argument $1" >&2; exit 2 ;;
     esac
 done
@@ -109,8 +113,7 @@ BPY="$WORK/build-venv/bin/python"
 "$BPY" -m pip install -q -U pip
 "$BPY" -m pip download -q -d "$WORK/torch-wheels" --index-url "$TORCH_INDEX" "torch==${TORCH_VER}"
 "$BPY" -m pip install -q --no-index --find-links "$WORK/torch-wheels" "torch==${TORCH_VER}"
-# pybind11: headers only, at build time (foundry.ops has no runtime dependency on it).
-"$BPY" -m pip install -q "cmake>=4.0" ninja "setuptools>=80" wheel "pybind11>=2.12"
+"$BPY" -m pip install -q "cmake>=4.0" ninja "setuptools>=80" wheel
 "$BPY" -c "import torch; print('build torch', torch.__version__, 'cuda', torch.version.cuda)"
 
 # Build from a clean copy of the tree: no stale CMake cache, editable-install
@@ -184,7 +187,9 @@ log "checking wheel layout"
 # List once into a file: with pipefail, `unzip -l | grep -q` fails when grep exits early (SIGPIPE in unzip).
 unzip -l "$WHEEL" | tee "$WORK/wheel.list"
 grep -qE ' foundry/libcuda_hook\.so$' "$WORK/wheel.list" || die "foundry/libcuda_hook.so missing from the wheel"
-grep -qE ' foundry/ops\..*\.so$' "$WORK/wheel.list" || die "foundry/ops*.so missing from the wheel"
+grep -qE ' foundry/libfoundry_ops\.so$' "$WORK/wheel.list" || die "foundry/libfoundry_ops.so missing from the wheel"
+grep -qE ' foundry/ops\.py$' "$WORK/wheel.list" || die "foundry/ops.py missing from the wheel"
+[[ "$(basename "$WHEEL")" == *-py3-none-manylinux* ]] || die "expected a py3-none-manylinux wheel, got $(basename "$WHEEL")"
 grep -q 'libcuda_hook-' "$WORK/wheel.list" && die "auditwheel grafted a renamed libcuda_hook copy"
 grep -qE 'foundry_core\.libs/.*(boost|torch|c10|cudart|libcuda)' "$WORK/wheel.list" \
     && die "auditwheel grafted a library that must come from the host/torch"
@@ -192,11 +197,16 @@ mkdir -p "$WORK/x"
 unzip -q -o "$WHEEL" -d "$WORK/x"
 readelf -d "$WORK/x/foundry/libcuda_hook.so" | tee "$WORK/hook.dyn"
 grep -qi boost "$WORK/hook.dyn" && die "libcuda_hook.so has a Boost DT_NEEDED"
-OPS_SO="$(ls "$WORK"/x/foundry/ops.*.so)"
+OPS_SO="$WORK/x/foundry/libfoundry_ops.so"
 readelf -d "$OPS_SO" | tee "$WORK/ops.dyn"
-grep -qi boost "$WORK/ops.dyn" && die "foundry.ops has a Boost DT_NEEDED"
-grep -q 'Shared library: \[libcuda_hook.so\]' "$WORK/ops.dyn" || die "foundry.ops does not need libcuda_hook.so by that name"
-grep -qE 'R(UN)?PATH.*\$ORIGIN' "$WORK/ops.dyn" || die "foundry.ops lost its \$ORIGIN RPATH"
+grep -qi boost "$WORK/ops.dyn" && die "libfoundry_ops.so has a Boost DT_NEEDED"
+grep -qiE 'Shared library: \[lib(python|torch_python)' "$WORK/ops.dyn" && die "libfoundry_ops.so needs libpython / libtorch_python"
+grep -q 'Shared library: \[libcuda_hook.so\]' "$WORK/ops.dyn" || die "libfoundry_ops.so does not need libcuda_hook.so by that name"
+grep -qE 'R(UN)?PATH.*\$ORIGIN' "$WORK/ops.dyn" || die "libfoundry_ops.so lost its \$ORIGIN RPATH"
+# No Python C API and no libtorch C++ ABI: only the stable C shims (aoti_torch_*/torch_*).
+nm -D --undefined-only "$OPS_SO" | awk '{print $2}' > "$WORK/ops.undef"
+grep -E '^_?Py' "$WORK/ops.undef" && die "libfoundry_ops.so uses the Python C API"
+c++filt < "$WORK/ops.undef" | grep -E '(^| )(at|c10|torch)::' && die "libfoundry_ops.so uses libtorch C++ symbols"
 cat "$WORK/x"/foundry_core-*.dist-info/METADATA | grep -E '^(Name|Version|Requires-Dist):'
 # One wheel serves every torch >= the stable-ABI target: never pin the build torch.
 grep -E '^Requires-Dist: torch' "$WORK/x"/foundry_core-*.dist-info/METADATA | grep -q '==' \

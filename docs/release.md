@@ -7,12 +7,14 @@ checklist and how CUDA versions map to wheels.
 
 ## What a release contains
 
-`foundry.ops` uses only the LibTorch Stable ABI (C shims, target torch 2.14,
-`MIN_TORCH` in `setup.py`), so one wheel loads on torch 2.14 and every later
-torch with the same CUDA major (it links `libcudart.so.<major>`). Wheels are
-therefore built once per CPython version and CUDA major, compiled against a
-torch of the target minor (2.14.x), and declare `Requires-Dist: torch>=2.14`
-with no upper bound.
+The native part of `foundry.ops` (`foundry/libfoundry_ops.so`) uses only the
+LibTorch Stable ABI (C shims, target torch 2.14, `MIN_TORCH` in `setup.py`) and
+no Python C API: it registers torch custom ops that `foundry/ops.py` calls
+through `torch.ops.foundry`. One wheel therefore loads on every CPython >= 3.10,
+on torch 2.14 and every later torch with the same CUDA major (it links
+`libcudart.so.<major>`). Wheels are built once per CUDA major, tagged
+`py3-none-manylinux_2_28_x86_64`, compiled against a torch of the target minor
+(2.14.x), and declare `Requires-Dist: torch>=2.14` with no upper bound.
 
 - **The first CUDA of `BUILD_CUDAS`** (top of the workflow) goes to PyPI with
   the plain version.
@@ -28,7 +30,7 @@ with no upper bound.
 
 | Release line | Build torch | Requires | Index | CPython | Platform |
 |---|---|---|---|---|---|
-| 0.1.x from 0.1.0rc5 | 2.14.1, cu130 | `torch>=2.14` | PyPI, `whl/cu130/` | 3.10-3.13 | manylinux_2_28 x86_64 |
+| 0.1.x from 0.1.0rc5 | 2.14.1, cu130 | `torch>=2.14` | PyPI, `whl/cu130/` | >= 3.10 (one `py3-none` wheel) | manylinux_2_28 x86_64 |
 | 0.1.0rc2-rc4 | 2.14.1 / 2.13.0, cu130 | `torch==` build torch | PyPI / `whl/cu130/torch2.13/` | 3.10-3.13 | manylinux_2_28 x86_64 |
 
 SGLang depends on `foundry-core>=0.1.0rc2,<0.2` (the rc lower bound lets pip pick the release candidate; it becomes `>=0.1.0` with the final release).
@@ -185,7 +187,7 @@ Users select the CUDA with its index, or install a wheel by URL:
 
 ```bash
 pip install "foundry-core==0.1.0" --extra-index-url https://foundry-org.github.io/foundry/whl/cu128/
-pip install "https://github.com/foundry-org/foundry/releases/download/v0.1.0/foundry_core-0.1.0+cu128-cp312-cp312-manylinux_2_28_x86_64.whl"
+pip install "https://github.com/foundry-org/foundry/releases/download/v0.1.0/foundry_core-0.1.0+cu128-py3-none-manylinux_2_28_x86_64.whl"
 ```
 
 ## What the wheel build checks
@@ -200,10 +202,12 @@ tree with `FOUNDRY_WHEEL_BUILD=1 FOUNDRY_REQUIRE_VENDORED_BOOST=1` and then:
   from there;
 - fails if the wheel's `Requires-Dist: torch` pins the build torch (`==`) or
   `foundry/_build_info.py` lacks `STABLE_ABI_TARGET`;
-- fails if `foundry/libcuda_hook.so` or `foundry/ops.*.so` is missing, if
+- fails if `foundry/libcuda_hook.so`, `foundry/libfoundry_ops.so` or
+  `foundry/ops.py` is missing, if the wheel is not `py3-none-manylinux`, if
   auditwheel grafted a renamed hook or a torch/CUDA/driver library, if either
-  shared object has a Boost `DT_NEEDED`, if `foundry.ops` does not need
-  `libcuda_hook.so` by that name, or if it lost its `$ORIGIN` RPATH;
+  shared object has a Boost `DT_NEEDED`, if `libfoundry_ops.so` needs
+  libpython / libtorch_python, uses a `Py*` or `at::`/`c10::`/`torch::` symbol,
+  does not need `libcuda_hook.so` by that name, or lost its `$ORIGIN` RPATH;
 - installs the wheel and the same torch into a clean venv and runs
   `import foundry, foundry.integration.sglang.api` and `import foundry.ops`.
   GitHub runners have no NVIDIA driver, so `libcuda.so.1` there is the CUDA

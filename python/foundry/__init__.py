@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Foundry project
 # The ops wildcard must come FIRST: .graph's CUDAGraph (and the
-# allocation_region helpers) intentionally override the raw pybind names.
+# allocation_region helpers) intentionally override the raw ops names.
 # `# isort: off` PINS this order — ruff's isort (lint rule "I") otherwise
 # auto-sorts `.ops` last (alphabetical), which re-shadows the wrapper
-# CUDAGraph with the raw pybind class and breaks `foundry.graph(...)`
+# CUDAGraph with the raw ops class and breaks `foundry.graph(...)`
 # (raw capture_begin requires a positional `pool`; the wrapper defaults it).
 # isort: off
 # _loader sets __version__, checks the installed torch against the one

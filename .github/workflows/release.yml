@@ -30,7 +30,9 @@ permissions:
   contents: read
 
 env:
-  # Release matrix: PYTHONS x BUILD_CUDAS, one wheel per (CPython, CUDA major).
+  # Release matrix: one py3-none wheel per BUILD_CUDAS entry (CUDA major). The native
+  # library has no Python C API (torch custom ops through the LibTorch Stable ABI), so
+  # the wheel serves every CPython >= 3.10; BUILD_PYTHON only runs the build.
   # "torch" is the torch the wheel is COMPILED with: its major.minor must be the
   # stable-ABI target (setup.py MIN_TORCH); every wheel requires torch>=<target>
   # and loads on any later torch with the same CUDA major. The FIRST entry is the
@@ -41,7 +43,7 @@ env:
   # on the gh-pages branch, which users select with pip --extra-index-url.
   # "image" is optional; the default is
   # pytorch/manylinux2_28-builder:cuda<major.minor of the cuda tag>.
-  PYTHONS: '["3.10", "3.11", "3.12", "3.13"]'
+  BUILD_PYTHON: "3.12"
   BUILD_CUDAS: '[{"cuda": "cu130", "torch": "2.14.1"}]'
 
 jobs:
@@ -82,7 +84,7 @@ jobs:
               print(f"::error::tag {os.environ['REF_NAME']} does not match pyproject version {version}")
               sys.exit(1)
 
-          pythons = json.loads(os.environ["PYTHONS"])
+          build_python = os.environ["BUILD_PYTHON"]
           cudas = json.loads(os.environ["BUILD_CUDAS"])
           pypi_cuda = cudas[0]["cuda"]
           torch, cuda = os.environ.get("IN_TORCH", ""), os.environ.get("IN_CUDA", "")
@@ -104,9 +106,8 @@ jobs:
               image = entry.get("image") or f"pytorch/manylinux2_28-builder:cuda{digits[:-1]}.{digits[-1]}"
               pypi = entry["cuda"] == pypi_cuda
               local = "" if pypi else entry["cuda"]
-              for py in pythons:
-                  include.append(dict(python=py, torch=entry["torch"], cuda=entry["cuda"],
-                                      image=image, pypi=pypi, local_version=local))
+              include.append(dict(python=build_python, torch=entry["torch"], cuda=entry["cuda"],
+                                  image=image, pypi=pypi, local_version=local))
 
           publish = is_tag or os.environ.get("IN_PUBLISH") == "yes"
           # PyPI gets the plain-version CUDA only; a manual build of another
@@ -156,7 +157,7 @@ jobs:
 
   wheels:
     needs: plan
-    name: wheel py${{ matrix.python }} ${{ matrix.cuda }}
+    name: wheel ${{ matrix.cuda }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -185,7 +186,7 @@ jobs:
           ls -l wheelhouse
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.pypi && 'pypi' || 'ghrelease' }}-py${{ matrix.python }}-${{ matrix.cuda }}
+          name: wheel-${{ matrix.pypi && 'pypi' || 'ghrelease' }}-${{ matrix.cuda }}
           path: wheelhouse/*.whl
           if-no-files-found: error
 
@@ -244,9 +245,9 @@ jobs:
           foundry-core $VERSION. Release notes: RELEASE.md in this tag.
 
           PyPI wheels (\`pip install foundry-core==$VERSION\`) are built for the first CUDA of
-          \`$BUILD_CUDAS\` (CPython 3.10-3.13, manylinux_2_28 x86_64). One wheel per CPython serves
-          every torch >= the LibTorch Stable ABI target (Requires-Dist torch>=A.B, no upper bound)
-          with that CUDA major. Wheels with a local version (\`+cuNNN\`) target other CUDA majors and
+          \`$BUILD_CUDAS\` (py3-none-manylinux_2_28_x86_64). One wheel serves every CPython >= 3.10
+          and every torch >= the LibTorch Stable ABI target (Requires-Dist torch>=A.B, no upper
+          bound) with that CUDA major. Wheels with a local version (\`+cuNNN\`) target other CUDA majors and
           have a package index each:
           \`pip install foundry-core==$VERSION --extra-index-url $INDEX_URL/<cuda>/\`,
           or install the wheel by URL from this page.
@@ -308,11 +309,13 @@ jobs:
 
           def cuda_of(name):
               """CUDA tag of a wheel from this run's matrix."""
-              m = re.match(r"foundry_core-(?P<ver>[^-]+)-cp(?P<py>\d+)-", name)
-              ver, py = m["ver"], m["py"]
+              m = re.match(r"foundry_core-(?P<ver>[^-]+)-py3-none-", name)
+              if m is None:
+                  raise SystemExit(f"not a py3-none foundry-core wheel: {name}")
+              ver = m["ver"]
               local = ver.split("+", 1)[1] if "+" in ver else ""
               for e in entries:
-                  if e["python"].replace(".", "") == py and e["local_version"] == local:
+                  if e["local_version"] == local:
                       return e["cuda"]
               raise SystemExit(f"no matrix entry for {name}")
 

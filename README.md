@@ -127,13 +127,13 @@ See [ROADMAP.md](ROADMAP.md) for the full development plan and progress.
 ## Installation
 
 Prebuilt wheels are published as **`foundry-core`** (the import name is
-`foundry`): one wheel per CPython version and CUDA major, requiring
+`foundry`): one wheel per CUDA major for every CPython >= 3.10, requiring
 `torch>=2.14`. Install torch first (pip would otherwise resolve `torch>=2.14`
 from PyPI's default build):
 
 | foundry-core | torch | index | CPython | Platform |
 |---|---|---|---|---|
-| next release | >= 2.14, cu13x | PyPI, `whl/cu130/` | 3.10-3.13 | manylinux_2_28 x86_64 |
+| next release | >= 2.14, cu13x | PyPI, `whl/cu130/` | >= 3.10 | manylinux_2_28 x86_64 |
 | 0.1.0rc2-0.1.0rc4 | `==2.14.1` (cu130) / `==2.13.0` (cu130) | PyPI / `whl/cu130/torch2.13/` | 3.10-3.13 | manylinux_2_28 x86_64 |
 
 ```bash
@@ -142,7 +142,7 @@ pip install "foundry-core>=0.1.0rc5,<0.2"
 python -c "import foundry; print(foundry.__version__)"
 ```
 
-The wheel ships `foundry/ops.*.so` and `foundry/libcuda_hook.so` (the hook
+The wheel ships `foundry/libfoundry_ops.so` (torch custom ops, no Python C API) and `foundry/libcuda_hook.so` (the hook
 SGLang/vLLM preload around their workers). No Boost or
 other C++ runtime dependency is needed. Every wheel is also attached to the
 [GitHub Release](https://github.com/foundry-org/foundry/releases).
@@ -151,7 +151,7 @@ other C++ runtime dependency is needed. Every wheel is also attached to the
 
 Needed for another CUDA major, or for development. Requirements:
 
-- CMake 4.0+, ninja and pybind11 (`pip install "cmake>=4.0" ninja pybind11`)
+- CMake 4.0+ and ninja (`pip install "cmake>=4.0" ninja`)
 - torch >= 2.14, already installed (Foundry compiles against its stable-ABI headers; the build loads on any later torch with the same CUDA major)
 - CUDA Toolkit with `nvcc` (CUDA 12+; CUDA 13 with torch cu130)
 - Boost headers, header-only (nothing is linked): the vendored copy in
@@ -161,7 +161,7 @@ Needed for another CUDA major, or for development. Requirements:
   at the directory that contains `boost/version.hpp`)
 
 ```bash
-pip install "cmake>=4.0" ninja pybind11
+pip install "cmake>=4.0" ninja
 # Torch 2.14 with CUDA 13.0
 pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
 pip install -e . --no-build-isolation
