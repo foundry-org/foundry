@@ -123,40 +123,56 @@ def _rng_pool(device: int) -> torch.cuda.MemPool:
     return pool
 
 
-def _int64_blocks(
-    pool_id: tuple[int, int] | None = None, exclude: tuple[int, int] | None = None
-) -> set[int]:
-    """Addresses of live caching-allocator blocks that hold one int64 (requested 8 bytes,
-    the shape of torch's capture RNG seed/offset tensors), in `pool_id` or in any pool
-    but `exclude`."""
-    out = set()
-    for seg in torch.cuda.memory_snapshot():
-        seg_pool = tuple(seg.get("segment_pool_id", (0, 0)))
-        if (pool_id is not None and seg_pool != pool_id) or seg_pool == exclude:
-            continue
-        for b in seg["blocks"]:
-            if b["state"] == "active_allocated" and b.get("requested_size", b["size"]) == 8:
-                out.add(b["address"])
-    return out
-
-
-def _pool_blocks(pool_id: tuple[int, int]) -> dict[int, tuple[int, int, int]]:
-    """Live blocks of one caching-allocator pool: address -> (size, requested, stream)."""
-    out = {}
-    for seg in torch.cuda.memory_snapshot():
-        if tuple(seg.get("segment_pool_id", (0, 0))) != pool_id:
-            continue
-        for b in seg["blocks"]:
-            if b["state"] == "active_allocated":
-                out[b["address"]] = (b["size"], b.get("requested_size", b["size"]), seg["stream"])
-    return out
-
-
-def _stray_message(strays: dict[int, tuple[int, int, int]]) -> str:
-    return ", ".join(
-        f"{a:#x} (block {s} B, requested {r} B, stream {st:#x})"
-        for a, (s, r, st) in sorted(strays.items())
+def _unsupported_torch(what: str) -> RuntimeError:
+    return RuntimeError(
+        f"foundry capture: unsupported: torch {torch.__version__}: {what} (Foundry's RNG state "
+        "detection depends on it)"
     )
+
+
+class _Block(NamedTuple):
+    pool: tuple[int, int]
+    stream: int
+    size: int
+    requested: int
+
+
+def _live_blocks() -> dict[int, _Block]:
+    """address -> _Block of every live caching-allocator block of the current device. A
+    snapshot without the fields this relies on raises instead of hiding blocks."""
+    out = {}
+    try:
+        for seg in torch.cuda.memory_snapshot():
+            pool = tuple(seg["segment_pool_id"])
+            for b in seg["blocks"]:
+                if b["state"] == "active_allocated":
+                    out[b["address"]] = _Block(pool, seg["stream"], b["size"], b["requested_size"])
+    except KeyError as e:
+        raise _unsupported_torch(f"torch.cuda.memory_snapshot() has no {e} field") from None
+    return out
+
+
+def _stray_message(strays: dict[int, _Block]) -> str:
+    return ", ".join(
+        f"{a:#x} (block {b.size} B, requested {b.requested} B, stream {b.stream:#x})"
+        for a, b in sorted(strays.items())
+    )
+
+
+# SAVE: what Foundry keeps alive in its RNG pool for the process, per device: the
+# seed/offset pair of every capture that claimed one (philox_state aliases: the archived
+# address of one graph's pair is never handed to another graph's state, and no pair can
+# be freed inside a later capture and reused by that capture's state unseen). Every other
+# live block of the pool (state of a refused capture) is unaccounted for.
+_RNG_HELD: dict[int, list] = {}
+
+
+def _held_addresses(device: int) -> set[int]:
+    return {
+        t.data_ptr() if isinstance(t, torch.Tensor) else t
+        for t in _RNG_HELD.get(device, [])
+        if isinstance(t, (torch.Tensor, int))
+    }
 
 
 class CUDAGraph(ops.CUDAGraph):
@@ -181,17 +197,33 @@ class CUDAGraph(ops.CUDAGraph):
                 "foundry native capture: unsupported torch "
                 f"{torch.__version__} (needs Generator.philox_state, torch >= 2.14)"
             )
+        backend = torch.cuda.get_allocator_backend()
+        if backend != "native":
+            raise RuntimeError(
+                f"foundry capture: unsupported: CUDA allocator backend {backend!r} "
+                "(PYTORCH_CUDA_ALLOC_CONF backend:native is required: Foundry routes and finds "
+                "torch's capture RNG state through caching-allocator pools)"
+            )
         native = torch.cuda.CUDAGraph(keep_graph=True)
         self._native_capture_stream = torch.cuda.current_stream().cuda_stream
         rng_pool = _rng_pool(device)
         self._rng_pool_id = tuple(rng_pool.id)
-        # RNG state candidates = int64[1] blocks torch creates for this capture, in any
-        # pool (difference against this snapshot at capture end).
-        self._rng_blocks_before = _int64_blocks()
-        self._rng_pool_before = set(_pool_blocks(self._rng_pool_id))
         # Hook record window: opened before torch's beginAllocateToPool, closed by
         # adopt_native_capture after torch's endAllocateToPool (same as capture_begin/_end).
         ops.native_record_begin()
+        try:
+            # Blocks live before the capture: anything new at capture end was created by
+            # this capture (or by another thread meanwhile).
+            self._blocks_before = _live_blocks()
+        except BaseException:
+            ops.native_record_abort()
+            raise
+        # Live RNG-pool blocks Foundry does not hold could be freed inside this capture and
+        # their addresses reused by this capture's state, unseen by the difference above.
+        held = _held_addresses(device)
+        self._rng_unaccounted = {
+            a for a, b in self._blocks_before.items() if b.pool == self._rng_pool_id and a not in held
+        }
         # Opened before torch's capture scope: the allocator searches its routing scopes
         # last-in first-out, so the capture's own (capturing-stream) filter still wins for
         # everything captured; only this thread's allocations on non-capturing streams
@@ -213,17 +245,28 @@ class CUDAGraph(ops.CUDAGraph):
             raise RuntimeError("capture_end() without capture_begin()")
         device = torch.cuda.current_device()
         gen = torch.cuda.default_generators[device]
+        rng_pool_id = self._rng_pool_id
+        before = self._blocks_before
         philox = None
         try:
             try:
-                # Some generator holds RNG state for this capture (2.14/2.15: an RNG op ran;
-                # 2.16: capture_begin's pre-allocated pairs). Still capturing: philox_state
-                # returns aliases of the default generator's seed/offset buffers of this
-                # capture (claiming / creating them in the RNG pool) and the offset consumed
-                # so far = torch's wholegraph_increment for it
-                # (v2.14.1 aten/src/ATen/cuda/CUDAGeneratorImpl.cpp:516-536). No state: no RNG
-                # in this capture, and nothing is created.
-                if _int64_blocks(self._rng_pool_id) - self._rng_blocks_before:
+                # Does the default generator hold RNG state for this capture? Torch creates
+                # it in the RNG pool (2.14/2.15: lazily at the first RNG op, on the default
+                # stream; 2.16: capture_begin's pre-allocated pairs); another thread creates
+                # it in its default pool. Any new block in the RNG pool, any new int64[1]
+                # block in a default pool, or an RNG-pool block that may have been freed and
+                # reused inside the capture: ask. Still capturing, philox_state returns
+                # aliases of the default generator's seed/offset buffers of this capture
+                # (creating them in the RNG pool if absent) and the offset consumed so far =
+                # torch's wholegraph_increment (v2.14.1 CUDAGeneratorImpl.cpp:516-536).
+                # Otherwise no RNG ran in this capture and nothing is created.
+                now = _live_blocks()
+                new = {a: b for a, b in now.items() if a not in before}
+                if (
+                    self._rng_unaccounted
+                    or any(b.pool == rng_pool_id for b in new.values())
+                    or any(b.pool == (0, 0) and b.requested == 8 for b in new.values())
+                ):
                     philox = gen.philox_state(0)
                 native.capture_end()
             finally:
@@ -232,8 +275,11 @@ class CUDAGraph(ops.CUDAGraph):
         except BaseException:
             ops.native_record_abort()
             raise
+        graph_pool = tuple(native.pool())
+        now = _live_blocks()
+        new = {a: b for a, b in now.items() if a not in before}
         generators = []
-        philox_used = philox is not None
+        pair = set()
         if philox is not None:
             seed_buf, offset_buf, intragraph = philox
             increment = int(intragraph.item())
@@ -244,7 +290,19 @@ class CUDAGraph(ops.CUDAGraph):
                 "increment": increment,
                 "seed": seed,
             }
+            pair = {seed_buf.data_ptr(), offset_buf.data_ptr()}
+            # Kept for the process: no later state (of this or another capture) can take
+            # these addresses while this graph's archive refers to them.
+            _RNG_HELD.setdefault(device, []).extend((seed_buf, offset_buf))
             del seed_buf, offset_buf, philox
+            outside = [a for a in sorted(pair) if a not in now or now[a].pool != rng_pool_id]
+            if outside:
+                ops.native_record_abort()
+                raise RuntimeError(
+                    "foundry capture: unsupported: the default generator's capture RNG state "
+                    f"{', '.join(hex(a) for a in outside)} is not in Foundry's RNG pool (RNG "
+                    "drawn on the capturing stream from a thread other than the capturing one)"
+                )
             generators.append(
                 (
                     device,
@@ -255,44 +313,36 @@ class CUDAGraph(ops.CUDAGraph):
                     self._native_rng["offset_ptr"],
                 )
             )
-        # Candidates = every int64[1] block torch created for this capture and kept (any
-        # pool: an RNG state that escaped the RNG pool, e.g. created on another thread, is
-        # caught too). adopt scans every kernel parameter of the raw graph for their
-        # addresses (by value): a referenced one that is not the default generator's pair
-        # (philox_state above) is refused; the default pair must lie in a driver
-        # allocation Foundry recorded (the RNG pool's segment), which LOAD maps by
-        # replaying the recorded events and writes (seed, offset) into per replay.
-        # The capture's graph pool holds the body's tensors (int64 scalars too), never RNG state.
-        candidates = sorted(_int64_blocks(exclude=tuple(native.pool())) - self._rng_blocks_before)
-        # The RNG pool must hold nothing from this capture but torch's RNG state: anything
+        # Candidates: every RNG-pool block that may hold this capture's RNG state (created
+        # during the capture, or live but not held by Foundry, so possibly freed and reused
+        # inside it: compared by address that looks unchanged) and every int64[1] block
+        # created during the capture outside the graph pool (RNG state another thread
+        # created). adopt scans every kernel parameter (and copy/memset address) of the raw
+        # graph for them by value: a read one that is not the default generator's pair is
+        # refused; the pair must lie in a driver allocation Foundry recorded (the RNG pool's
+        # segment), which LOAD maps by replaying the recorded events and writes (seed,
+        # offset) into per replay. The graph pool holds the body's tensors (int64 scalars
+        # too), never RNG state.
+        candidates = sorted(
+            {
+                a
+                for a, b in new.items()
+                if b.pool == rng_pool_id or (b.requested == 8 and b.pool != graph_pool)
+            }
+            | {a for a in self._rng_unaccounted if a in now}
+        )
+        super().adopt_native_capture(native.raw_cuda_graph(), native.pool(), generators, candidates)
+        # The RNG pool must hold nothing new from this capture but torch's RNG state: anything
         # else this thread allocated on a non-capturing stream inside the routing scope (in
         # the body, or in torch's Python capture-end hooks, which run after the capture's own
-        # routing ended) would be memory SAVE's later code may bake into graphs but that
-        # LOAD's torch never allocates.
-        default_pair = (
-            {self._native_rng["seed_ptr"], self._native_rng["offset_ptr"]} if philox_used else set()
-        )
-        new_in_pool = {
-            a: v
-            for a, v in _pool_blocks(self._rng_pool_id).items()
-            if a not in self._rng_pool_before and a not in default_pair
-        }
-        strays = {a: v for a, v in new_in_pool.items() if v[1] != 8}
-        if strays:
-            ops.native_record_abort()
-            raise RuntimeError(
-                "foundry capture: unsupported: allocation(s) on a non-capturing stream during the "
-                "capture (they landed in Foundry's RNG pool, not in the graph pool): "
-                f"{_stray_message(strays)}"
-            )
-        super().adopt_native_capture(native.raw_cuda_graph(), native.pool(), generators, candidates)
-        # int64[1] blocks other than the default pair: adopt refused those a kernel reads
-        # (another generator's state); an unread one is a stray allocation as above.
-        strays = {a: v for a, v in new_in_pool.items() if v[1] == 8}
+        # routing ended) is memory SAVE's later code may bake into graphs but that LOAD's
+        # torch never allocates; an unread int64[1] there is another generator's state.
+        strays = {a: b for a, b in new.items() if b.pool == rng_pool_id and a not in pair}
         if strays:
             raise RuntimeError(
-                "foundry capture: unsupported: int64[1] allocation(s) on a non-capturing stream "
-                f"during the capture that no kernel reads as RNG state: {_stray_message(strays)}"
+                "foundry capture: unsupported: allocation(s) on a non-capturing stream during "
+                "the capture (they landed in Foundry's RNG pool, not in the graph pool) or RNG "
+                f"state of another generator: {_stray_message(strays)}"
             )
 
     def replay(self) -> None:
