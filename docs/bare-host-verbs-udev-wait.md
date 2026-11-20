@@ -108,7 +108,7 @@ with `NCCL_IB_DISABLE=1` for the NCCL-side probe.
 
 ## Evidence
 
-`claude-doc/report_coldstart/h200_8gpu_venv/capture_speed_env_diff.md`: the container-vs-venv
+The evidence is the container-vs-venv
 environment diff (everything else identical: compat libcuda 610.57.04, torch 2.13.0+cu130, NCCL 2.29.7,
 NVSHMEM, triton, flashinfer, sgl-kernel, glibc 2.39, ulimits, CPU settings), the per-shape capture
 timings, the strace, and the bisection that leaves the udev wait as the only difference.

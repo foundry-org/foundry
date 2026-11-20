@@ -2516,6 +2516,34 @@ CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, cu
   return real_func(symbol, pfn, cudaVersion, flags, symbolStatus);
 }
 
+// The deterministic region is full. A driver-placed fallback would give SAVE and
+// LOAD different layouts, so the allocation fails, named in region_size terms.
+static bool region_exhausted(CUdeviceptr start, size_t size, const char* who) {
+  const CUdeviceptr base = (CUdeviceptr)tls_storage.region.base;
+  if (start + size <= base + tls_storage.region.size) {
+    return false;
+  }
+  fprintf(stderr,
+          "[HOOK] ERROR: Foundry allocation region exhausted (%s of %zu bytes at offset %llu, "
+          "region_size %zu bytes = %.1f GiB); raise region_size in the Foundry TOML\n",
+          who, size, (unsigned long long)(start - base), tls_storage.region.size,
+          tls_storage.region.size / (double)(1ULL << 30));
+  return true;
+}
+
+// cuMemCreate ran out of physical memory while the region still had room: the
+// device is full, which no region_size fixes; say so instead of falling back.
+static CUresult device_out_of_memory(size_t size, CUdeviceptr start, const char* who) {
+  const CUdeviceptr base = (CUdeviceptr)tls_storage.region.base;
+  fprintf(stderr,
+          "[HOOK] ERROR: GPU out of physical memory (%s: cuMemCreate of %zu bytes at region "
+          "offset %llu failed; the region still has %.1f GiB of address space, so this is not "
+          "region_size: lower --mem-fraction-static or the batch sizes)\n",
+          who, size, (unsigned long long)(start - base),
+          (base + tls_storage.region.size - start - size) / (double)(1ULL << 30));
+  return CUDA_ERROR_OUT_OF_MEMORY;
+}
+
 CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
   typedef CUresult (*cuMemAlloc_t)(CUdeviceptr*, size_t);
   auto real_func =
@@ -2547,6 +2575,9 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
   CUdeviceptr target_addr = align_to(tls_storage.current_alloc_base_addr, kAllocAlignment);
   CUdeviceptr region_base_addr = (CUdeviceptr)tls_storage.region.base;
   CUdeviceptr region_end_addr = region_base_addr + tls_storage.region.size;
+  if (region_exhausted(target_addr, aligned_size, "cuMemAlloc")) {
+    return CUDA_ERROR_OUT_OF_MEMORY;
+  }
 
   // Fast path: check if we can serve from preallocated memory
   if (tls_storage.has_preallocation &&
@@ -2624,6 +2655,9 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
   CUmemAllocationProp prop = region_alloc_prop(device);
 
   CUresult result = mem_create_func(&allocHandle, aligned_size, &prop, 0);
+  if (result == CUDA_ERROR_OUT_OF_MEMORY) {
+    return device_out_of_memory(aligned_size, target_addr, "cuMemAlloc");
+  }
   if (result != CUDA_SUCCESS) {
     fprintf(stderr, "[HOOK] ERROR: cuMemCreate failed with error %d for size=%zu\n", result,
             aligned_size);
@@ -2758,6 +2792,9 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
   CUdeviceptr target_addr = align_to(tls_storage.current_alloc_base_addr, kAllocAlignment);
   CUdeviceptr region_base_addr = (CUdeviceptr)tls_storage.region.base;
   CUdeviceptr region_end_addr = region_base_addr + tls_storage.region.size;
+  if (region_exhausted(target_addr, aligned_size, "cuMemAllocPitch")) {
+    return CUDA_ERROR_OUT_OF_MEMORY;
+  }
 
   // Fast path: check if we can serve from preallocated memory
   if (tls_storage.has_preallocation &&
@@ -2812,6 +2849,9 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
   CUmemAllocationProp prop = region_alloc_prop(device);
 
   result = mem_create_func(&allocHandle, aligned_size, &prop, 0);
+  if (result == CUDA_ERROR_OUT_OF_MEMORY) {
+    return device_out_of_memory(aligned_size, target_addr, "cuMemAllocPitch");
+  }
   if (result != CUDA_SUCCESS) {
     fprintf(stderr, "[HOOK] ERROR: cuMemCreate failed with error %d\n", result);
     return real_func(dptr, pPitch, WidthInBytes, Height, ElementSizeBytes);
@@ -2972,14 +3012,7 @@ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CU
   if (size < kSmallAllocThreshold) {
     CUdeviceptr aligned_addr = align_to(tls_storage.current_alloc_base_addr, alignment);
 
-    size_t region_base = (size_t)tls_storage.region.base;
-    size_t region_end = region_base + tls_storage.region.size;
-
-    if (aligned_addr + size > region_end) {
-      fprintf(stderr,
-              "[HOOK] ERROR: Not enough space in reserved region for allocation (size=0x%zx, "
-              "available=0x%llx)\n",
-              size, region_end - aligned_addr);
+    if (region_exhausted(aligned_addr, size, "cuMemAddressReserve")) {
       return CUDA_ERROR_OUT_OF_MEMORY;
     }
 
@@ -4012,7 +4045,7 @@ namespace foundry {
 // Forward declarations
 void free_preallocated_region();
 
-void set_allocation_region(void* base, size_t size) {
+bool set_allocation_region(void* base, size_t size) {
   size_t aligned_base = align_to((size_t)base, kAllocAlignment);
   if (aligned_base != (size_t)base) {
     fprintf(stderr,
@@ -4032,7 +4065,7 @@ void set_allocation_region(void* base, size_t size) {
     fprintf(stderr, "[HOOK] Allocation region already set (base=%p size=%zu), re-enabled\n",
             (void*)aligned_base, size);
 #endif
-    return;
+    return true;
   }
 
   typedef CUresult (*cuMemAddressReserve_t)(CUdeviceptr*, size_t, size_t, CUdeviceptr,
@@ -4051,7 +4084,7 @@ void set_allocation_region(void* base, size_t size) {
     fprintf(stderr, "[HOOK] HINT: Try restarting the system or use a different base_addr\n");
     tls_storage.enabled = false;
     tls_storage.region_initialized = false;
-    return;
+    return false;
   }
 
   if (reserved_ptr != aligned_base) {
@@ -4087,7 +4120,7 @@ void set_allocation_region(void* base, size_t size) {
 
     tls_storage.enabled = false;
     tls_storage.region_initialized = false;
-    return;
+    return false;
   }
 
   tls_storage.region.base = (void*)aligned_base;
@@ -4101,6 +4134,7 @@ void set_allocation_region(void* base, size_t size) {
   fprintf(stderr, "[HOOK] Allocation region set: base=%p size=%zu, vmm_reserve_addr=%p\n",
           (void*)aligned_base, size, (void*)tls_storage.current_vmm_reserve_addr);
 #endif
+  return true;
 }
 
 void stop_allocation_region() {

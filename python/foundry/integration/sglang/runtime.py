@@ -212,7 +212,13 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
 
     region_size = parse_size(cfg.region_size)
     t1 = time.perf_counter()
-    cge.set_allocation_region(cfg.base_addr, region_size)
+    if not cge.set_allocation_region(cfg.base_addr, region_size):
+        raise RuntimeError(
+            f"[Foundry] could not reserve the allocation region at base_addr={hex(cfg.base_addr)} "
+            f"with region_size={cfg.region_size} (cuMemAddressReserve failed or returned another "
+            "address; the [HOOK] lines above name the mappings in the way): choose another "
+            "base_addr or a smaller region_size in the Foundry TOML"
+        )
     t_region = time.perf_counter() - t1
     t1 = time.perf_counter()
     _ = torch._C._cuda_getCurrentBlasHandle()
