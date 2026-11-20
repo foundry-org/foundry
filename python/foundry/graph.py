@@ -162,9 +162,12 @@ def _stray_message(strays: dict[int, _Block]) -> str:
 # SAVE: what Foundry keeps alive in its RNG pool for the process, per device: the
 # seed/offset pair of every capture that claimed one (philox_state aliases: the archived
 # address of one graph's pair is never handed to another graph's state, and no pair can
-# be freed inside a later capture and reused by that capture's state unseen). Every other
-# live block of the pool (state of a refused capture) is unaccounted for.
+# be freed inside a later capture and reused by that capture's state unseen) and what the
+# RNG self-test left there. Every other live block of the pool (state of a refused
+# capture) is unaccounted for.
 _RNG_HELD: dict[int, list] = {}
+# Per device: None = the RNG self-test passed, else its error message.
+_RNG_SELF_TEST: dict[int, str | None] = {}
 
 
 def _held_addresses(device: int) -> set[int]:
@@ -173,6 +176,49 @@ def _held_addresses(device: int) -> set[int]:
         for t in _RNG_HELD.get(device, [])
         if isinstance(t, (torch.Tensor, int))
     }
+
+
+def _rng_self_test(device: int, pool: torch.cuda.MemPool) -> str | None:
+    """Once per process and device, inside the first capture's record window (so LOAD maps
+    what it allocates): torch must put a capture's default-generator RNG state into the
+    pool routed with use_mem_pool, philox_state must return it, and the graph must hold its
+    address where the kernel-parameter scan finds it. Everything stays alive (no reuse).
+    Returns None, or what failed."""
+    pool_id = tuple(pool.id)
+    gen = torch.cuda.default_generators[device]
+    before = set(_live_blocks())
+    side = torch.cuda.Stream(device)
+    native = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.use_mem_pool(pool):
+        # The draw goes in place into a tensor of the RNG pool, on the default stream like
+        # torch's state (one segment), so the graph's own pool stays empty.
+        with torch.cuda.stream(torch.cuda.default_stream(device)):
+            out = torch.empty(4, device=device)
+        side.wait_stream(torch.cuda.current_stream(device))
+        side.wait_stream(torch.cuda.default_stream(device))
+    with torch.cuda.use_mem_pool(pool), torch.cuda.stream(side):
+        native.capture_begin(capture_error_mode="relaxed")
+        try:
+            out.uniform_()
+            seed_buf, offset_buf, intragraph = gen.philox_state(0)
+        finally:
+            native.capture_end()
+    torch.cuda.synchronize(device)
+    pair = (seed_buf.data_ptr(), offset_buf.data_ptr())
+    new = {a: b for a, b in _live_blocks().items() if a not in before}
+    held = _RNG_HELD.setdefault(device, [])
+    held += [native, out, seed_buf, offset_buf]
+    problems = []
+    if not all(a in new and new[a].pool == pool_id for a in pair):
+        problems.append(f"its seed/offset pair {[hex(a) for a in pair]} is not new in the routed pool")
+    if int(intragraph.item()) <= 0:
+        problems.append("philox_state reports no offset consumed by uniform_")
+    if not ops.scan_graph_words(native.raw_cuda_graph(), list(pair)):
+        problems.append("no kernel parameter of the graph holds the pair's addresses")
+    held += list(new)  # addresses of everything the self-test left (all in the pool)
+    if problems:
+        return "; ".join(problems)
+    return None
 
 
 class CUDAGraph(ops.CUDAGraph):
@@ -212,6 +258,12 @@ class CUDAGraph(ops.CUDAGraph):
         # adopt_native_capture after torch's endAllocateToPool (same as capture_begin/_end).
         ops.native_record_begin()
         try:
+            if device not in _RNG_SELF_TEST:
+                _RNG_SELF_TEST[device] = _rng_self_test(device, rng_pool)
+            if _RNG_SELF_TEST[device] is not None:
+                raise _unsupported_torch(
+                    f"RNG self-test capture of Tensor.uniform_: {_RNG_SELF_TEST[device]}"
+                )
             # Blocks live before the capture: anything new at capture end was created by
             # this capture (or by another thread meanwhile).
             self._blocks_before = _live_blocks()
