@@ -7,7 +7,8 @@ loudly at SAVE ("foundry capture: unsupported: ..."); never saved as RNG-free (1
     pytest tests/core/test_rng_detect.py -q -s
 
 SAVE seeds the default generator, captures, re-seeds and replays the graphs with torch
-(the reference), saves. LOAD loads every graph, re-seeds and replays in the same order.
+(the reference), then draws eagerly, saves. LOAD loads every graph, re-seeds, replays in
+the same order and draws eagerly.
 """
 
 import os
@@ -196,6 +197,8 @@ def _replays(graphs, names, case):
             graphs[n][0].replay()
         torch.cuda.synchronize()
         got.append([t.cpu().clone() for n in names for t in graphs[n][1]])
+    # Eager RNG after the replays: the replays advanced the default generator as torch's do.
+    got.append([torch.rand(16, device="cuda").cpu()])
     return got
 
 
@@ -260,12 +263,9 @@ def test_rng_refused(tmp_path, case):
     assert _save_then_load(tmp_path, case) == "refused"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="LOAD's RNG counter is Foundry's own (archived seed, offset from 0), "
-    "not torch's default generator: eager RNG / manual_seed in the LOAD process are not followed",
-)
 def test_rng_follows_eager_counter(tmp_path):
+    """Loaded graphs take (seed, offset) from torch's default generator per replay, like
+    torch's own replay: eager RNG before the replays shifts both alike."""
     _save_then_load(tmp_path, "eager_rng")
 
 

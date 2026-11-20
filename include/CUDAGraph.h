@@ -60,15 +60,6 @@ std::unordered_set<uint64_t> scan_raw_graph_words(CUgraph graph,
                                                   const std::unordered_set<uint64_t>& cand);
 void native_record_abort();
 
-// Process-wide philox (seed, offset) per archived generator id (first
-// registration fixes the seed, offset starts at 0, shared by every loaded graph
-// with that id).
-struct FoundryRngState {
-  uint64_t seed = 0;
-  uint64_t offset = 0;
-};
-std::shared_ptr<FoundryRngState> foundry_rng_state_from_id(uint64_t id, uint64_t seed);
-
 // Where SAVE found the default generator's capture seed/offset buffers (archive
 // "placement"). The only placement: inside a driver allocation Foundry recorded in a
 // record window (torch created them in Foundry's RNG pool, foundry/graph.py _rng_pool);
@@ -80,13 +71,18 @@ enum class RngPlacement : uint64_t {
 using NativeGenerator = std::tuple<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t>;
 
 // Per (loaded graph, generator id) seed/offset buffer addresses the archived kernels read
-// (torch's CUDAGeneratorCaptureState::rng_state_{seed,offset}_extragraph_ at SAVE).
+// (torch's CUDAGeneratorCaptureState::rng_state_{seed,offset}_extragraph_ at SAVE), and
+// the (seed, offset) the next replay writes there: taken from torch's default generator of
+// the graph's device right before each replay (binding.cpp), which advances it by the
+// increment, as torch's own replay does.
 struct LoadedRngBuffers {
   uint64_t id = 0;
-  std::shared_ptr<FoundryRngState> state;
   uint64_t wholegraph_increment = 0;
   uint64_t seed_ptr = 0;  // device addresses the replay prologue writes
   uint64_t offset_ptr = 0;
+  uint64_t seed = 0;
+  uint64_t offset = 0;
+  bool philox_set = false;  // seed/offset set for the next replay
 };
 
 struct CUDAGraph {
@@ -104,6 +100,13 @@ struct CUDAGraph {
   // LOAD, after this graph's allocator events were replayed: every archived RNG address
   // must lie in a live allocation Foundry replayed; raises otherwise.
   void verify_native_rng() const;
+  // LOAD: the archived generator entries whose (seed, offset) each replay takes from torch's
+  // default generator of native_rng_device() (philox_state(increment)), and the setter the
+  // replay binding calls before replay() for each entry with a nonzero increment.
+  size_t native_rng_count() const { return native_rng_.size(); }
+  uint64_t native_rng_increment(size_t i) const { return native_rng_.at(i).wholegraph_increment; }
+  int native_rng_device() const { return capture_dev_; }
+  void set_native_rng_philox(size_t i, uint64_t seed, uint64_t offset);
   void instantiate();
   void replay();
   std::string exec_share_stats() const;

@@ -46,14 +46,13 @@ void native_record_abort() {
 // allocator-event replay maps the segment at the same address (checked), and every
 // replay writes (seed, offset) there with stream-ordered 64-bit stores, as torch's
 // CUDAGeneratorState::replay_prologue + CUDAGeneratorCaptureState::setup_for_replay do
-// (v2.14.1 aten/src/ATen/cuda/CUDAGeneratorImpl.cpp :153-170, :247-257), through the
-// CUDA driver only.
+// (v2.14.1 aten/src/ATen/cuda/CUDAGeneratorImpl.cpp :153-170, :247-257). The values come
+// from torch's default generator of the device (philox_state(increment) outside capture:
+// current seed and offset, offset advanced by the increment), so loaded graphs and eager
+// RNG share one counter as with torch's own replay.
 // ---------------------------------------------------------------------------
 
 namespace {
-std::mutex foundry_rng_mutex;
-std::unordered_map<uint64_t, std::shared_ptr<FoundryRngState>> foundry_rng_states;
-
 // Stream-ordered 64-bit store (exact for every uint64 value; replaces
 // Tensor::fill_(int64), whose stable counterpart takes a double).
 inline void write_u64(uint64_t addr, uint64_t value, cudaStream_t stream) {
@@ -63,27 +62,13 @@ inline void write_u64(uint64_t addr, uint64_t value, cudaStream_t stream) {
 }
 }  // namespace
 
-std::shared_ptr<FoundryRngState> foundry_rng_state_from_id(uint64_t id, uint64_t seed) {
-  std::lock_guard<std::mutex> lock(foundry_rng_mutex);
-  auto& slot = foundry_rng_states[id];
-  if (!slot) {
-    // The first registration of an id fixes its seed, offset 0.
-    slot = std::make_shared<FoundryRngState>();
-    slot->seed = seed;
-    slot->offset = 0;
-  }
-  return slot;
-}
-
 void CUDAGraph::register_native_rng(const boost::json::object& gen) {
   const uint64_t id = gen.at("id").to_number<uint64_t>();
-  const uint64_t seed = gen.at("seed").to_number<uint64_t>();
   const uint64_t wholegraph_increment = gen.at("wholegraph_increment").to_number<uint64_t>();
   const auto placement = static_cast<RngPlacement>(gen.at("placement").to_number<uint64_t>());
   FOUNDRY_CHECK(placement == RngPlacement::Recorded,
                 "graph load: unsupported RNG buffer placement ", static_cast<uint64_t>(placement),
                 " (archive of an older build; re-capture it)");
-  auto state = foundry_rng_state_from_id(id, seed);
   // A repeated id in one archive registers once (torch: get_capture_state(id, true)
   // returns the existing capture state).
   for (auto& r : native_rng_) {
@@ -94,7 +79,6 @@ void CUDAGraph::register_native_rng(const boost::json::object& gen) {
   }
   LoadedRngBuffers r;
   r.id = id;
-  r.state = std::move(state);
   r.wholegraph_increment = wholegraph_increment;
   // torch allocated the pair in Foundry's RNG pool inside this or an earlier graph's
   // record window; LOAD's allocator-event replay maps it (checked in verify_native_rng).
@@ -117,15 +101,25 @@ void CUDAGraph::verify_native_rng() const {
   }
 }
 
+void CUDAGraph::set_native_rng_philox(size_t i, uint64_t seed, uint64_t offset) {
+  auto& r = native_rng_.at(i);
+  r.seed = seed;
+  r.offset = offset;
+  r.philox_set = true;
+}
+
 void CUDAGraph::native_rng_replay_prologue(cudaStream_t stream) {
   for (auto& r : native_rng_) {
-    // = CUDAGeneratorState::replay_prologue + CUDAGeneratorCaptureState::setup_for_replay.
+    // = CUDAGeneratorState::replay_prologue + CUDAGeneratorCaptureState::setup_for_replay,
+    // with the (seed, offset) the replay binding took from torch's generator.
     if (r.wholegraph_increment == 0) {
       continue;
     }
-    write_u64(r.seed_ptr, r.state->seed, stream);
-    write_u64(r.offset_ptr, r.state->offset, stream);
-    r.state->offset += r.wholegraph_increment;
+    FOUNDRY_CHECK(r.philox_set, "replay: no (seed, offset) taken from torch's generator for ",
+                  "generator id ", r.id, " (replay a loaded graph through foundry.ops)");
+    r.philox_set = false;
+    write_u64(r.seed_ptr, r.seed, stream);
+    write_u64(r.offset_ptr, r.offset, stream);
   }
 }
 
