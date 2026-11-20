@@ -130,20 +130,22 @@ def case_h4_thread_memcpy(fdry, x, stream, archive):
     graph reads the state through a copy (no kernel holds the address by value)."""
 
     def body():
-        out = {}
+        buf = torch.zeros(1, dtype=torch.int64, device="cuda")  # graph pool (this thread)
+        done = []
 
         def worker():
             torch.cuda.set_device(0)
             with torch.cuda.stream(stream):
                 _, off, _ = torch.cuda.default_generators[0].philox_state(4)
-                out["o"] = off.clone()
+                buf.copy_(off)  # a copy node, no allocation on the worker
+                done.append(True)
 
         t = threading.Thread(target=worker)
         t.start()
         t.join()
-        if "o" not in out:
+        if not done:
             raise RuntimeError("worker thread failed")
-        return [out["o"] + 0]
+        return [buf + 0]
 
     g, o = _capture(fdry, body, mode="relaxed")
     return [("g", g, o)], ["g"]
