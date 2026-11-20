@@ -36,8 +36,12 @@ from _helpers import map_saved_layout, prefix_region, run_phase, save_layout
 
 ROOT = Path(__file__).resolve().parents[2]
 BASE_ADDR = 0x3F0000000000
-SIZES = [4, 8]  # blocks per launch, one graph each
+SIZES = [4, 8]  # blocks of the launch without cluster attribute, one graph each
 LAUNCHES = [0, 2]  # clusterDim.x per launch (0: no cluster attribute)
+# Blocks of a cluster launch, the same in every graph: the cluster count is part of the
+# topology key, so the graphs share one template (and the 8-block graph is its on-demand
+# member) only if it does not change; the launch without cluster attribute may.
+CLUSTER_BLOCKS = 4
 # clusterDim.x -> (is_explicit_cluster, cluster_nctarank) per block
 SEEN = {0: (0, 1), 2: (1, 2)}
 NO_CLUSTER = (0, 1)
@@ -60,25 +64,35 @@ def _paths(archive):
     return [os.path.join(archive, f"graph_{i}_bs{n}.json") for i, n in enumerate(SIZES)]
 
 
+def _blocks(blocks, cluster):
+    return blocks if cluster == 0 else CLUSTER_BLOCKS
+
+
 def _expected(blocks, restored_cluster=True):
     out = []
     for c in LAUNCHES:
         pair = SEEN[c] if restored_cluster or c == 0 else NO_CLUSTER
-        out += list(pair) * blocks
+        out += list(pair) * _blocks(blocks, c)
     return out
 
 
 def _alloc():
     return [
-        torch.full((len(LAUNCHES) * n * 2,), -1, dtype=torch.int32, device="cuda") for n in SIZES
+        torch.full(
+            (sum(_blocks(n, c) for c in LAUNCHES) * 2,), -1, dtype=torch.int32, device="cuda"
+        )
+        for n in SIZES
     ]
 
 
 def _launch_all(lib, out, blocks):
     stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-    for i, cluster in enumerate(LAUNCHES):
-        ptr = ctypes.c_void_p(out.data_ptr() + i * blocks * 2 * out.element_size())
-        assert lib.launch_cluster(ptr, blocks, cluster, stream) == 0
+    offset = 0
+    for cluster in LAUNCHES:
+        n = _blocks(blocks, cluster)
+        ptr = ctypes.c_void_p(out.data_ptr() + offset * 2 * out.element_size())
+        assert lib.launch_cluster(ptr, n, cluster, stream) == 0
+        offset += n
 
 
 def _run_save(archive, lib_path):

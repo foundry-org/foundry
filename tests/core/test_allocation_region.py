@@ -83,11 +83,14 @@ def _run_size_formats(archive):
     import foundry as fdry
 
     torch.cuda.init()
+    # Bases above BASE_ADDR and below Foundry's default 0x600000000000: the
+    # 0x7f... range holds the process's own mappings (shared libraries, thread
+    # stacks, glibc arenas), which make a fixed reservation there fail at random.
     cases = [
-        (0x7F0000000000, "1GB"),
-        (0x7F1000000000, "512MB"),
-        (0x7F2000000000, "100MB"),
-        ("0x7f3000000000", 50 * MB),
+        (0x510000000000, "1GB"),
+        (0x520000000000, "512MB"),
+        (0x530000000000, "100MB"),
+        ("0x540000000000", 50 * MB),
     ]
     for base, size in cases:
         base_int = int(base, 16) if isinstance(base, str) else base
