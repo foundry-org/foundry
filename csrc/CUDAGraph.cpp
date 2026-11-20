@@ -135,60 +135,88 @@ void CUDAGraph::release_native_rng() {
 }
 
 namespace {
-// Every 8-byte-aligned word of every kernel parameter of a raw graph (driver API only;
-// no assumption about the PhiloxCudaState layout): which candidate values occur.
+// Every 8-byte-aligned word of the kernel parameters of one kernel node.
+template <typename F>
+void scan_kernel_node_words(CUgraphNode node, F&& check) {
+  CUDA_KERNEL_NODE_PARAMS_v2 p{};
+  FOUNDRY_CU_CHECK(cuGraphKernelNodeGetParams_v2(node, &p));
+  CUfunction func = p.func;
+  if (func == nullptr && p.kern != nullptr) {
+    FOUNDRY_CU_CHECK(cuKernelGetFunction(&func, p.kern));
+  }
+  auto scan_bytes = [&](const void* data, size_t size) {
+    const char* b = static_cast<const char*>(data);
+    for (size_t w = 0; w + sizeof(uint64_t) <= size; w += sizeof(uint64_t)) {
+      uint64_t v;
+      std::memcpy(&v, b + w, sizeof(v));
+      check(v);
+    }
+  };
+  if (p.kernelParams != nullptr) {
+    for (size_t i = 0;; ++i) {
+      size_t off = 0, size = 0;
+      if (cuFuncGetParamInfo(func, i, &off, &size) != CUDA_SUCCESS)
+        break;
+      scan_bytes(p.kernelParams[i], size);
+    }
+  } else if (p.extra != nullptr) {
+    void* buf = nullptr;
+    size_t* bufsize = nullptr;
+    for (size_t i = 0; p.extra[i] != CU_LAUNCH_PARAM_END; i += 2) {
+      if (p.extra[i] == CU_LAUNCH_PARAM_BUFFER_POINTER)
+        buf = p.extra[i + 1];
+      if (p.extra[i] == CU_LAUNCH_PARAM_BUFFER_SIZE)
+        bufsize = static_cast<size_t*>(p.extra[i + 1]);
+    }
+    if (buf != nullptr && bufsize != nullptr)
+      scan_bytes(buf, *bufsize);
+  }
+}
+}  // namespace
+
+// Every 8-byte-aligned word of every kernel parameter, and the device addresses of every
+// memcpy/memset node, of a raw graph and its child graphs (driver API only; no assumption
+// about the PhiloxCudaState layout): which candidate values occur.
 std::unordered_set<uint64_t> scan_raw_graph_words(CUgraph graph,
                                                   const std::unordered_set<uint64_t>& cand) {
   std::unordered_set<uint64_t> found;
   if (cand.empty())
     return found;
-  size_t n = 0;
-  FOUNDRY_CU_CHECK(cuGraphGetNodes(graph, nullptr, &n));
-  std::vector<CUgraphNode> nodes(n);
-  FOUNDRY_CU_CHECK(cuGraphGetNodes(graph, nodes.data(), &n));
-  for (CUgraphNode node : nodes) {
-    CUgraphNodeType t;
-    FOUNDRY_CU_CHECK(cuGraphNodeGetType(node, &t));
-    if (t != CU_GRAPH_NODE_TYPE_KERNEL)
-      continue;
-    CUDA_KERNEL_NODE_PARAMS_v2 p{};
-    FOUNDRY_CU_CHECK(cuGraphKernelNodeGetParams_v2(node, &p));
-    CUfunction func = p.func;
-    if (func == nullptr && p.kern != nullptr) {
-      FOUNDRY_CU_CHECK(cuKernelGetFunction(&func, p.kern));
-    }
-    auto scan_bytes = [&](const void* data, size_t size) {
-      const char* b = static_cast<const char*>(data);
-      for (size_t w = 0; w + sizeof(uint64_t) <= size; w += sizeof(uint64_t)) {
-        uint64_t v;
-        std::memcpy(&v, b + w, sizeof(v));
-        if (cand.count(v))
-          found.insert(v);
+  auto check = [&](uint64_t v) {
+    if (cand.count(v))
+      found.insert(v);
+  };
+  std::vector<CUgraph> graphs{graph};
+  while (!graphs.empty()) {
+    CUgraph g = graphs.back();
+    graphs.pop_back();
+    size_t n = 0;
+    FOUNDRY_CU_CHECK(cuGraphGetNodes(g, nullptr, &n));
+    std::vector<CUgraphNode> nodes(n);
+    FOUNDRY_CU_CHECK(cuGraphGetNodes(g, nodes.data(), &n));
+    for (CUgraphNode node : nodes) {
+      CUgraphNodeType t;
+      FOUNDRY_CU_CHECK(cuGraphNodeGetType(node, &t));
+      if (t == CU_GRAPH_NODE_TYPE_KERNEL) {
+        scan_kernel_node_words(node, check);
+      } else if (t == CU_GRAPH_NODE_TYPE_GRAPH) {
+        CUgraph child = nullptr;
+        FOUNDRY_CU_CHECK(cuGraphChildGraphNodeGetGraph(node, &child));
+        graphs.push_back(child);
+      } else if (t == CU_GRAPH_NODE_TYPE_MEMCPY) {
+        CUDA_MEMCPY3D m{};
+        FOUNDRY_CU_CHECK(cuGraphMemcpyNodeGetParams(node, &m));
+        check(static_cast<uint64_t>(m.srcDevice));
+        check(static_cast<uint64_t>(m.dstDevice));
+      } else if (t == CU_GRAPH_NODE_TYPE_MEMSET) {
+        CUDA_MEMSET_NODE_PARAMS m{};
+        FOUNDRY_CU_CHECK(cuGraphMemsetNodeGetParams(node, &m));
+        check(static_cast<uint64_t>(m.dst));
       }
-    };
-    if (p.kernelParams != nullptr) {
-      for (size_t i = 0;; ++i) {
-        size_t off = 0, size = 0;
-        if (cuFuncGetParamInfo(func, i, &off, &size) != CUDA_SUCCESS)
-          break;
-        scan_bytes(p.kernelParams[i], size);
-      }
-    } else if (p.extra != nullptr) {
-      void* buf = nullptr;
-      size_t* bufsize = nullptr;
-      for (size_t i = 0; p.extra[i] != CU_LAUNCH_PARAM_END; i += 2) {
-        if (p.extra[i] == CU_LAUNCH_PARAM_BUFFER_POINTER)
-          buf = p.extra[i + 1];
-        if (p.extra[i] == CU_LAUNCH_PARAM_BUFFER_SIZE)
-          bufsize = static_cast<size_t*>(p.extra[i + 1]);
-      }
-      if (buf != nullptr && bufsize != nullptr)
-        scan_bytes(buf, *bufsize);
     }
   }
   return found;
 }
-}  // namespace
 
 void CUDAGraph::adopt_native_capture(uintptr_t raw_graph, MempoolId_t pool,
                                      const std::vector<NativeGenerator>& generators,
@@ -198,9 +226,12 @@ void CUDAGraph::adopt_native_capture(uintptr_t raw_graph, MempoolId_t pool,
   FOUNDRY_CHECK(raw_graph != 0, "adopt_native_capture: null cudaGraph_t");
   FOUNDRY_CHECK(generators.size() <= 1,
                 "adopt_native_capture: at most one default-generator entry expected");
-  // rng_candidates = every int64[1] block torch created and kept for this capture
-  // (foundry/graph.py: memory_snapshot difference); generators[0], if any, carries the
-  // default generator's pair (philox_state) and increment. Which of them do the kernels read?
+  // rng_candidates (foundry/graph.py) = blocks of Foundry's RNG pool that may hold this
+  // capture's RNG state (created during it, or not held by Foundry and so possibly freed
+  // and reused during it) and int64[1] blocks created during it outside the graph pool;
+  // generators[0], if any, carries the default generator's pair (philox_state) and
+  // increment. Any of them the graph reads other than that pair is RNG state Foundry
+  // cannot replay.
   std::vector<NativeGenerator> gens = generators;
   std::unordered_set<uint64_t> cand(rng_candidates.begin(), rng_candidates.end());
   uint64_t dseed = 0, doff = 0;
@@ -217,12 +248,12 @@ void CUDAGraph::adopt_native_capture(uintptr_t raw_graph, MempoolId_t pool,
       char hex[32];
       snprintf(hex, sizeof(hex), "0x%lx", (unsigned long)a);
       native_record_abort();
-      FOUNDRY_CHECK(false, "foundry capture: unsupported: a kernel of this graph reads RNG state ",
-                    hex,
-                    " that torch created for the capture but that is not the default CUDA "
-                    "generator's pair in Foundry's RNG pool: RNG from another torch.Generator "
-                    "(its seed and increment are not obtainable with public API) or RNG state "
-                    "created on a thread other than the capturing one");
+      FOUNDRY_CHECK(false, "foundry capture: unsupported: this graph reads ", hex,
+                    ", RNG state of the capture (or memory allocated during it on a "
+                    "non-capturing stream) that is not the default CUDA generator's seed/offset "
+                    "pair: RNG from another torch.Generator (its seed and increment are not "
+                    "obtainable with public API) or RNG state created on a thread other than "
+                    "the capturing one");
     }
   }
   if (!gens.empty() && !found.count(dseed) && !found.count(doff)) {
@@ -230,8 +261,8 @@ void CUDAGraph::adopt_native_capture(uintptr_t raw_graph, MempoolId_t pool,
     if (inc != 0) {
       native_record_abort();
       FOUNDRY_CHECK(false, "foundry capture: unsupported: the default generator advanced by ", inc,
-                    " in this capture but no kernel parameter holds its seed/offset buffer "
-                    "addresses");
+                    " in this capture but no kernel parameter or copy node holds its seed/offset "
+                    "buffer addresses");
     }
     gens.clear();  // no kernel reads the pair: nothing to archive, LOAD does nothing
   }
@@ -248,7 +279,8 @@ void CUDAGraph::adopt_native_capture(uintptr_t raw_graph, MempoolId_t pool,
                     "foundry capture: unsupported: the default generator's capture RNG buffer ",
                     hex,
                     " is not inside a driver allocation Foundry recorded (torch did not create it "
-                    "in Foundry's RNG pool inside a record window)");
+                    "in Foundry's RNG pool inside a record window, or the RNG pool's segment was "
+                    "allocated in the record window of a capture that was refused or aborted)");
     }
   }
 

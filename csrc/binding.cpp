@@ -1,5 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include "CUDAGraph.h"
@@ -87,6 +88,16 @@ PYBIND11_MODULE(ops, m) {
   // SAVE: hook record window around torch's own capture (foundry/graph.py)
   m.def("native_record_begin", &::foundry::native_record_begin);
   m.def("native_record_abort", &::foundry::native_record_abort);
+  m.def(
+      "scan_graph_words",
+      [](uintptr_t raw_graph, const std::vector<uint64_t>& words) {
+        std::unordered_set<uint64_t> cand(words.begin(), words.end());
+        auto found = ::foundry::scan_raw_graph_words(reinterpret_cast<CUgraph>(raw_graph), cand);
+        std::vector<uint64_t> out(found.begin(), found.end());
+        std::sort(out.begin(), out.end());
+        return out;
+      },
+      py::arg("raw_graph"), py::arg("words"));
   m.def(
       "recorded_allocation_contains",
       [](uint64_t addr, size_t len) { return ::foundry::recorded_allocation_contains(addr, len); },

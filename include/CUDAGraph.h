@@ -6,9 +6,11 @@
 #include "StableTorch.h"
 #include "metadata.h"
 
+#include <cuda.h>
 #include <map>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 #include <vector>
 #include <map>
 #include <utility>
@@ -52,6 +54,10 @@ void preallocate_cublas_workspaces(bool torch_has_workspace_cache_flag);
 // SAVE captures with torch's own torch.cuda.CUDAGraph; foundry only opens/closes
 // its hook record around it (foundry/graph.py).
 void native_record_begin();
+// SAVE: the candidates that occur as a word of a raw graph's kernel parameters or as a
+// copy/memset node address (child graphs included).
+std::unordered_set<uint64_t> scan_raw_graph_words(CUgraph graph,
+                                                  const std::unordered_set<uint64_t>& cand);
 void native_record_abort();
 
 // Process-wide philox (seed, offset) per archived generator id (first
