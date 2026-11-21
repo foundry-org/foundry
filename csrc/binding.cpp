@@ -1,5 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include "CUDAGraph.h"
@@ -87,6 +88,25 @@ PYBIND11_MODULE(ops, m) {
   // SAVE: hook record window around torch's own capture (foundry/graph.py)
   m.def("native_record_begin", &::foundry::native_record_begin);
   m.def("native_record_abort", &::foundry::native_record_abort);
+  m.def(
+      "scan_graph_words",
+      [](uintptr_t raw_graph, const std::vector<uint64_t>& words) {
+        std::unordered_set<uint64_t> cand(words.begin(), words.end());
+        auto found = ::foundry::scan_raw_graph_words(reinterpret_cast<CUgraph>(raw_graph), cand);
+        std::vector<uint64_t> out(found.begin(), found.end());
+        std::sort(out.begin(), out.end());
+        return out;
+      },
+      py::arg("raw_graph"), py::arg("words"));
+  m.def(
+      "note_reserved_allocation",
+      [](uint64_t ptr, size_t size) { ::foundry::note_reserved_allocation(ptr, size); },
+      py::arg("ptr"), py::arg("size"));
+  m.def(
+      "recorded_allocation_contains",
+      [](uint64_t addr, size_t len) { return ::foundry::recorded_allocation_contains(addr, len); },
+      py::arg("addr"), py::arg("len"),
+      "SAVE/LOAD: [addr, addr+len) lies in a live driver allocation Foundry recorded / replayed");
 
   m.def(
       "get_graph_ptr",
@@ -275,12 +295,40 @@ PYBIND11_MODULE(ops, m) {
       .def(
           "adopt_native_capture",
           [](::foundry::CUDAGraph& self, uintptr_t raw_graph, ::foundry::MempoolId_t pool,
-             const std::vector<std::tuple<uint64_t, uint64_t, uint64_t>>& generators) {
-            self.adopt_native_capture(raw_graph, pool, generators);
+             const std::vector<::foundry::NativeGenerator>& generators,
+             const std::vector<uint64_t>& rng_candidates) {
+            return self.adopt_native_capture(raw_graph, pool, generators, rng_candidates);
           },
           py::arg("raw_graph"), py::arg("pool"), py::arg("generators"),
+          py::arg("rng_candidates") = std::vector<uint64_t>{},
           py::call_guard<py::gil_scoped_release>())
-      .def("replay", &foundry::CUDAGraph::replay, py::call_guard<py::gil_scoped_release>())
+      .def("replay",
+           [](::foundry::CUDAGraph& self) {
+             // A loaded graph with RNG takes (seed, offset) per replay from torch's default
+             // generator of its device, like torch's replay_prologue: philox_state(inc)
+             // outside capture returns the current seed and offset and advances the offset
+             // by inc under the generator's lock. Graphs without RNG skip this.
+             const size_t n = self.native_rng_count();
+             for (size_t i = 0; i < n; ++i) {
+               const uint64_t inc = self.native_rng_increment(i);
+               if (inc == 0)
+                 continue;
+               static PyObject* generators =  // torch.cuda.default_generators (a tuple), kept
+                   py::object(py::module_::import("torch.cuda").attr("default_generators"))
+                       .release()
+                       .ptr();
+               py::tuple st =
+                   py::reinterpret_borrow<py::tuple>(generators)[self.native_rng_device()].attr(
+                       "philox_state")(inc);
+               // int64 tensors holding the uint64 seed/offset bits (torch fills its own
+               // buffers with static_cast<int64_t> of them too).
+               self.set_native_rng_philox(
+                   i, static_cast<uint64_t>(st[0].attr("item")().cast<int64_t>()),
+                   static_cast<uint64_t>(st[1].attr("item")().cast<int64_t>()));
+             }
+             py::gil_scoped_release release;
+             self.replay();
+           })
       .def("exec_share_stats", &foundry::CUDAGraph::exec_share_stats)
       .def("loaded_events",
            [](py::object self_obj) {

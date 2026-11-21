@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import weakref
 from collections.abc import Callable
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -97,31 +98,245 @@ class LoadedEvent(NamedTuple):
     event: RestoredEvent  # the handle as a torch.cuda.Event
 
 
-def _check_rng_buffers_loadable(rng: dict) -> None:
-    """SAVE, graphs with RNG only: LOAD re-creates the seed/offset buffers the kernels read
-    by repeating torch 2.14's allocation (CUDAGeneratorCaptureState::initialize: two int64[1]
-    on the default stream, default pool), so their addresses match only if SAVE's came from
-    there. torch builds that allocate them elsewhere (e.g. per-graph RNG state created in
-    CUDAGraph::capture_begin on the capture stream) are refused here instead of loading
-    silently wrong random numbers."""
-    segments = torch.cuda.memory_snapshot()
-    for name in ("seed_ptr", "offset_ptr"):
-        addr = rng[name]
-        seg = next(
-            (s for s in segments if s["address"] <= addr < s["address"] + s["total_size"]), None
+# Archive "placement" of the default generator's capture seed/offset buffers (csrc
+# RngPlacement): inside a driver allocation Foundry recorded (torch allocated them in
+# Foundry's RNG pool inside a record window); LOAD writes at the archived addresses.
+_RNG_RECORDED = 1
+
+# SAVE: one caching-allocator pool per device for torch's capture RNG state. Every
+# capture runs inside torch.cuda.use_mem_pool(<this pool>) (opened before
+# torch.cuda.CUDAGraph.capture_begin, closed after capture_end), so the int64[1]
+# seed/offset tensors torch creates for the capture land here instead of torch's
+# default pools, on every torch version: 2.14/2.15 create them lazily on the default
+# stream (not capturing: the capture's pool filter misses, this thread's use_mem_pool
+# filter matches); 2.16 pre-allocates them in capture_begin before the capture's
+# routing starts. The pool's segments are allocated inside record windows (recorded
+# alloc events), so LOAD's event replay maps them; torch's default pools are left
+# exactly as LOAD (which does not capture) has them. Kept alive for the process.
+_RNG_POOLS: dict[int, torch.cuda.MemPool] = {}
+
+
+def _rng_pool(device: int) -> torch.cuda.MemPool:
+    pool = _RNG_POOLS.get(device)
+    if pool is None:
+        with torch.cuda.device(device):
+            pool = _RNG_POOLS[device] = torch.cuda.MemPool()
+    return pool
+
+
+class CaptureUnsupported(RuntimeError):
+    """SAVE refused a capture (or the save of a captured graph) that Foundry cannot persist
+    correctly; the message starts with "foundry capture: unsupported:" (or "foundry save:
+    unsupported:") and names the reason. Integrations fall back to native capture."""
+
+
+_UNSUPPORTED_PREFIXES = ("foundry capture: unsupported:", "foundry save: unsupported:")
+
+
+def _as_capture_unsupported(e: BaseException) -> BaseException:
+    """The CaptureUnsupported for a refusal raised as a plain RuntimeError (the C++ checks)."""
+    if isinstance(e, RuntimeError) and not isinstance(e, CaptureUnsupported):
+        text = str(e)
+        if any(p in text for p in _UNSUPPORTED_PREFIXES):
+            return CaptureUnsupported(text[text.index("foundry ") :])
+    return e
+
+
+_RNG_RESERVED: set[int] = set()
+_CAPTURES_BEGUN: set[int] = set()  # devices where a Foundry capture began
+
+
+def _check_generator_contract(device: int) -> None:
+    """LOAD takes (seed, offset) per replay from ``philox_state(inc)`` outside capture (the
+    replay binding): it must return the generator's current seed and offset and advance the
+    offset by exactly ``inc``. Checked once per device with public API; the generator's
+    offset is restored, so later draws are unchanged."""
+    gen = torch.cuda.default_generators[device]
+    offset = gen.get_offset()
+    seed_t, offset_t, _ = gen.philox_state(4)
+    after = gen.get_offset()
+    gen.set_offset(offset)
+    seed = int(seed_t.item()) & 0xFFFFFFFFFFFFFFFF
+    if seed != gen.initial_seed() or int(offset_t.item()) != offset or after != offset + 4:
+        raise CaptureUnsupported(
+            f"foundry capture: unsupported: torch {torch.__version__}: Generator.philox_state(4) "
+            f"outside capture returned seed {seed} / offset {int(offset_t.item())} and left offset "
+            f"{after}; Foundry's loaded graphs need seed {gen.initial_seed()}, offset {offset} and "
+            f"offset {offset + 4} after it"
         )
-        if seg is None:
-            where = "not in a caching-allocator segment"
-        else:
-            stream, pool = seg.get("stream"), tuple(seg.get("segment_pool_id", (None, None)))
-            if stream == 0 and pool == (0, 0):
-                continue
-            where = f"in a segment of stream {stream:#x}, pool {pool}"
-        raise RuntimeError(
-            f"foundry capture: unsupported: RNG in a graph on torch {torch.__version__}: the "
-            f"default generator's capture {name[:-4]} buffer {addr:#x} is {where}, not in the "
-            "default stream's default pool, so LOAD cannot reproduce its address"
+
+
+def reserve_rng_pool() -> None:
+    """SAVE and LOAD alike, at the same program point right after ``set_allocation_region``
+    and before any capture (the integrations call it there): create the first segment of
+    Foundry's RNG pool for the current device outside any capture, with the same torch
+    allocation on both sides, so it lands at the same address and counts as recorded on
+    both. Capture seed/offset pairs then live in it instead of in a segment of the first
+    capture's record window (later segments, one per ~2048 live captures, are still
+    allocated inside the capture that needs them and recorded when that graph is saved).
+    The allocated block is kept for the process on both sides, so the segment survives any
+    pool-release rule. LOAD allocates this one segment once; nothing per graph or replay.
+    Also checks the generator contract LOAD relies on. Without the call the first segment
+    comes from the first capture. A second call on the same device is a no-op."""
+    device = torch.cuda.current_device()
+    if device in _RNG_RESERVED:
+        return
+    if device in _CAPTURES_BEGUN:
+        raise CaptureUnsupported(
+            "foundry capture: unsupported: reserve_rng_pool() after a capture began on device "
+            f"{device}: call it right after set_allocation_region, before any capture"
         )
+    _check_generator_contract(device)
+    pool = _rng_pool(device)
+    pool_id = tuple(pool.id)
+
+    def segments():
+        try:
+            return [
+                (seg["address"], seg["total_size"], seg["is_expandable"])
+                for seg in torch.cuda.memory_snapshot()
+                if tuple(seg["segment_pool_id"]) == pool_id
+            ]
+        except KeyError as e:
+            raise _unsupported_torch(f"torch.cuda.memory_snapshot() has no {e} field") from None
+
+    if segments():
+        raise CaptureUnsupported(
+            "foundry capture: unsupported: reserve_rng_pool(): Foundry's RNG pool already has a "
+            "segment it did not create here"
+        )
+    with torch.cuda.use_mem_pool(pool), torch.cuda.stream(torch.cuda.default_stream(device)):
+        block = torch.empty(1, dtype=torch.int64, device=device)
+    _RNG_HELD.setdefault(device, []).append(block)  # kept for the process, SAVE and LOAD
+    reserved = segments()
+    if any(expandable for _, _, expandable in reserved):
+        raise CaptureUnsupported(
+            "foundry capture: unsupported: expandable segments (PYTORCH_CUDA_ALLOC_CONF "
+            "expandable_segments:True) in Foundry's RNG pool: a segment that grows in place is "
+            "not a fixed reservation"
+        )
+    for address, size, _ in reserved:
+        ops.note_reserved_allocation(address, size)
+    _RNG_RESERVED.add(device)
+
+
+def _unsupported_torch(what: str) -> RuntimeError:
+    return CaptureUnsupported(
+        f"foundry capture: unsupported: torch {torch.__version__}: {what} (Foundry's RNG state "
+        "detection depends on it)"
+    )
+
+
+class _Block(NamedTuple):
+    pool: tuple[int, int]
+    stream: int
+    size: int
+    requested: int
+
+
+def _live_blocks() -> dict[int, _Block]:
+    """address -> _Block of every live caching-allocator block of the current device. A
+    snapshot without the fields this relies on raises instead of hiding blocks."""
+    out = {}
+    try:
+        for seg in torch.cuda.memory_snapshot():
+            pool = tuple(seg["segment_pool_id"])
+            for b in seg["blocks"]:
+                if b["state"] == "active_allocated":
+                    out[b["address"]] = _Block(pool, seg["stream"], b["size"], b["requested_size"])
+    except KeyError as e:
+        raise _unsupported_torch(f"torch.cuda.memory_snapshot() has no {e} field") from None
+    return out
+
+
+def _stray_message(strays: dict[int, _Block]) -> str:
+    return ", ".join(
+        f"{a:#x} (block {b.size} B, requested {b.requested} B, stream {b.stream:#x})"
+        for a, b in sorted(strays.items())
+    )
+
+
+# SAVE, per device: the RNG-pool blocks accounted for. HELD: kept alive for the process
+# (the archived seed/offset pairs, as philox_state aliases, and what the self-test left):
+# never freed, so no later state takes an archived address. LIVE: pairs of captures that
+# archive none, alive as long as torch's graph keeps its capture state (removed by a
+# finaliser on that graph); a LIVE address that disappears during a capture was freed
+# inside it and may hold that capture's state.
+_RNG_HELD: dict[int, list] = {}
+_RNG_LIVE: dict[int, set[int]] = {}
+# Per device: None = the RNG self-test passed, else its error message.
+_RNG_SELF_TEST: dict[int, str | None] = {}
+# SAVE: adopted captures whose record window made driver allocations and that are not saved
+# yet: capture sequence number -> bytes. LOAD replays the windows of the saved graphs in
+# save order, so a graph must not be saved after such an earlier capture was skipped.
+_UNSAVED_WINDOWS: dict[int, int] = {}
+_CAPTURE_SEQ = [0]
+_LAST_SAVED_SEQ = [-1]
+# Set when a capture ended without being adopted after its record window allocated driver
+# memory: SAVE's allocation cursor has moved past memory no archive records, which LOAD
+# (where no capture is aborted) never allocates, so every later allocation and graph of
+# this process would sit at other addresses than on LOAD.
+_POISONED: str | None = None
+
+
+def _held_addresses(device: int) -> set[int]:
+    return {
+        t.data_ptr() if isinstance(t, torch.Tensor) else t
+        for t in _RNG_HELD.get(device, [])
+        if isinstance(t, (torch.Tensor, int))
+    }
+
+
+def _rng_self_test(device: int, pool: torch.cuda.MemPool) -> str | None:
+    """Once per process and device, at the end of the first capture, inside its record
+    window and after that capture's own seed/offset pair exists (so it shares the RNG
+    pool's segment and adds no segment of its own): torch must put a capture's
+    default-generator state into the pool routed with use_mem_pool, philox_state must
+    return it with the consumed offset, and the graph must hold its address where the
+    kernel-parameter scan finds it. Everything stays alive. Returns None, or what failed."""
+    pool_id = tuple(pool.id)
+    gen = torch.cuda.default_generators[device]
+    before = set(_live_blocks())
+    side = torch.cuda.Stream(device)
+    native = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.use_mem_pool(pool):
+        # The draw goes in place into a tensor of the RNG pool, on the default stream like
+        # torch's state (same segment), so the self-test graph's own pool stays empty.
+        with torch.cuda.stream(torch.cuda.default_stream(device)):
+            out = torch.empty(4, device=device)
+        side.wait_stream(torch.cuda.current_stream(device))
+        side.wait_stream(torch.cuda.default_stream(device))
+    with torch.cuda.use_mem_pool(pool), torch.cuda.stream(side):
+        native.capture_begin(capture_error_mode="relaxed")
+        try:
+            out.uniform_()
+            seed_buf, offset_buf, intragraph = gen.philox_state(0)
+        finally:
+            native.capture_end()
+    torch.cuda.synchronize(device)
+    pair = (seed_buf.data_ptr(), offset_buf.data_ptr())
+    new = {a: b for a, b in _live_blocks().items() if a not in before}
+    held = _RNG_HELD.setdefault(device, [])
+    held += [native, out, seed_buf, offset_buf]
+    if any(
+        seg["is_expandable"]
+        for seg in torch.cuda.memory_snapshot()
+        if tuple(seg["segment_pool_id"]) == pool_id
+    ):
+        return "expandable segments (PYTORCH_CUDA_ALLOC_CONF expandable_segments:True) in the pool"
+    problems = []
+    if not all(a in new and new[a].pool == pool_id for a in pair):
+        problems.append(
+            f"its seed/offset pair {[hex(a) for a in pair]} is not new in the routed pool"
+        )
+    if int(intragraph.item()) <= 0:
+        problems.append("philox_state reports no offset consumed by uniform_")
+    if not ops.scan_graph_words(native.raw_cuda_graph(), list(pair)):
+        problems.append("no kernel parameter of the graph holds the pair's addresses")
+    held += list(new)  # addresses of everything the self-test left (all in the pool)
+    if problems:
+        return "; ".join(problems)
+    return None
 
 
 class CUDAGraph(ops.CUDAGraph):
@@ -133,66 +348,212 @@ class CUDAGraph(ops.CUDAGraph):
     # save. The torch graph owning the capture, and its RNG probe:
     _native_graph = None
     _native_rng = None
+    _rng_route = None
 
     def capture_begin(
         self, pool: _POOL_HANDLE | None = None, capture_error_mode: str = "global"
     ) -> None:
         if self._native_graph is not None:
             raise RuntimeError("This CUDAGraph instance already owns a captured graph.")
-        gen = torch.cuda.default_generators[torch.cuda.current_device()]
+        if _POISONED is not None:
+            raise CaptureUnsupported(f"foundry capture: unsupported: {_POISONED}")
+        device = torch.cuda.current_device()
+        gen = torch.cuda.default_generators[device]
         if not hasattr(gen, "philox_state"):
-            raise RuntimeError(
-                "foundry native capture: unsupported torch "
-                f"{torch.__version__} (needs Generator.philox_state, torch >= 2.14)"
+            raise CaptureUnsupported(
+                f"foundry capture: unsupported: torch {torch.__version__} (needs "
+                "Generator.philox_state, torch >= 2.14)"
             )
+        backend = torch.cuda.get_allocator_backend()
+        if backend != "native":
+            raise CaptureUnsupported(
+                f"foundry capture: unsupported: CUDA allocator backend {backend!r} "
+                "(PYTORCH_CUDA_ALLOC_CONF backend:native is required: Foundry routes and finds "
+                "torch's capture RNG state through caching-allocator pools)"
+            )
+        if _RNG_SELF_TEST.get(device):
+            raise _unsupported_torch(
+                f"RNG self-test capture of Tensor.uniform_: {_RNG_SELF_TEST[device]}"
+            )
+        _CAPTURES_BEGUN.add(device)
         native = torch.cuda.CUDAGraph(keep_graph=True)
+        self._native_capture_stream = torch.cuda.current_stream().cuda_stream
+        rng_pool = _rng_pool(device)
+        self._rng_pool_id = tuple(rng_pool.id)
+        # Blocks live before the capture: anything new at capture end was created by this
+        # capture (or by another thread meanwhile).
+        self._blocks_before = _live_blocks()
+        self._rng_live_before = set(_RNG_LIVE.get(device, ()))
+        self._alloc_offset_before = ops.get_current_alloc_offset()
         # Hook record window: opened before torch's beginAllocateToPool, closed by
         # adopt_native_capture after torch's endAllocateToPool (same as capture_begin/_end).
         ops.native_record_begin()
+        # Opened before torch's capture scope: the allocator searches its routing scopes
+        # last-in first-out, so the capture's own (capturing-stream) filter still wins for
+        # everything captured; only this thread's allocations on non-capturing streams
+        # (the RNG state) reach the RNG pool.
+        route = torch.cuda.use_mem_pool(rng_pool)
+        route.__enter__()
         try:
             native.capture_begin(pool=pool, capture_error_mode=capture_error_mode)
         except BaseException:
-            ops.native_record_abort()
+            route.__exit__(*sys.exc_info())
+            self._record_abort()
             raise
+        self._rng_route = route
         self._native_graph = native
+
+    def _record_abort(self, discard_window: bool = True) -> None:
+        """A capture failed: discard its record window (unless adopt already closed it; the
+        refused graph is never saved either way). If the window allocated driver memory,
+        SAVE can no longer match LOAD: refuse every later capture."""
+        global _POISONED
+        if discard_window:
+            ops.native_record_abort()
+        moved = ops.get_current_alloc_offset() - self._alloc_offset_before
+        if moved and _POISONED is None:
+            _POISONED = (
+                f"an earlier capture of this process ended without being saved after its record "
+                f"window allocated {moved} bytes of driver memory; LOAD cannot reproduce that "
+                "allocation, so no later graph of this SAVE would load at its addresses "
+                "(restart SAVE without the failing capture)"
+            )
 
     def capture_end(self) -> None:
         native = self._native_graph
         if native is None:
             raise RuntimeError("capture_end() without capture_begin()")
+        try:
+            self._capture_end(native)
+        except BaseException as e:
+            self._record_abort(discard_window=not self._adopted)
+            converted = _as_capture_unsupported(e)
+            if converted is not e:
+                raise converted from e
+            raise
+
+    _adopted = False
+
+    def _capture_end(self, native) -> None:
         device = torch.cuda.current_device()
         gen = torch.cuda.default_generators[device]
+        rng_pool_id = self._rng_pool_id
+        before = self._blocks_before
+        # Still capturing, on every torch version: philox_state returns aliases of the
+        # default generator's seed/offset buffers of this capture (created now in the RNG
+        # pool if no RNG op ran, by whichever thread created them otherwise) and the offset
+        # consumed so far = torch's wholegraph_increment (v2.14.1 CUDAGeneratorImpl.cpp:516-536).
+        probe_error = None
         try:
-            # Still capturing: returns aliases of this capture's seed/offset buffers of the
-            # default generator (creating them, like foundry's own capture_begin always does)
-            # and the offset consumed so far = torch's wholegraph_increment for it.
-            # v2.14.1 aten/src/ATen/cuda/CUDAGeneratorImpl.cpp:516-536.
-            seed_buf, offset_buf, intragraph = gen.philox_state(0)
-            native.capture_end()
-        except BaseException:
-            ops.native_record_abort()
-            raise
-        increment = int(intragraph.item())
-        seed = gen.initial_seed()
-        self._native_rng = {
-            "seed_ptr": seed_buf.data_ptr(),
-            "offset_ptr": offset_buf.data_ptr(),
-            "increment": increment,
-            "seed": seed,
-        }
-        del seed_buf, offset_buf
-        if increment:
             try:
-                _check_rng_buffers_loadable(self._native_rng)
-            except BaseException:
-                ops.native_record_abort()
-                raise
-        # Default generator of the capture device; id as foundry's registry gives the first
-        # generator it sees (CUDAGeneratorStateRegistry::id_counter starts at 0).
-        # NOT covered: RNG from any other generator (no public API lists the generators the
-        # torch graph registered on 2.14.1); such a graph is saved without its RNG state.
-        generators = [(device, seed, increment)]
-        super().adopt_native_capture(native.raw_cuda_graph(), native.pool(), generators)
+                seed_buf, offset_buf, intragraph = gen.philox_state(0)
+            except RuntimeError as e:  # e.g. 2.16: "CUDA graph RNG state limit exceeded"
+                probe_error = e
+            native.capture_end()  # torch's capture is closed whatever the probe did
+        finally:
+            self._rng_route.__exit__(None, None, None)
+            self._rng_route = None
+        if probe_error is not None:
+            raise CaptureUnsupported(
+                "foundry capture: unsupported: torch refused the default generator's capture "
+                f"RNG state: {probe_error}"
+            ) from probe_error
+        pair = (seed_buf.data_ptr(), offset_buf.data_ptr())
+        if device not in _RNG_SELF_TEST:
+            # After this capture's pair exists: the self-test shares its segment.
+            _RNG_SELF_TEST[device] = _rng_self_test(device, _rng_pool(device))
+            if _RNG_SELF_TEST[device] is not None:
+                raise _unsupported_torch(
+                    f"RNG self-test capture of Tensor.uniform_: {_RNG_SELF_TEST[device]}"
+                )
+        graph_pool = tuple(native.pool())
+        now = _live_blocks()
+        new = {a: b for a, b in now.items() if a not in before}
+        increment = int(intragraph.item())
+        seed = gen.initial_seed()  # diagnostic only: LOAD takes the seed from torch
+        outside = [a for a in pair if a not in now or now[a].pool != rng_pool_id]
+        if outside:
+            raise CaptureUnsupported(
+                "foundry capture: unsupported: the default generator's capture RNG state "
+                f"{', '.join(hex(a) for a in outside)} is not in Foundry's RNG pool (RNG drawn "
+                "on the capturing stream from a thread other than the capturing one)"
+            )
+        generators = [(device, seed, increment, _RNG_RECORDED, pair[0], pair[1])]
+        # Candidates: blocks that may hold RNG state of this capture other than the default
+        # pair: RNG-pool blocks created during the capture, RNG-pool pairs of other captures
+        # freed during it (their address may have been reused unseen), and int64[1] blocks
+        # created during it in torch's default pools (state another thread created). The
+        # self-test's blocks are held and excluded. adopt scans every kernel parameter (and
+        # copy/memset address) of the raw graph for them by value and refuses a read one; it
+        # archives the default pair only if the graph reads it. The graph pool holds the
+        # body's tensors (int64 scalars too), never RNG state; other user pools are not
+        # touched by torch's RNG.
+        held = _held_addresses(device)
+        freed_live = self._rng_live_before - _RNG_LIVE.get(device, set())
+        candidates = sorted(
+            {
+                a
+                for a, b in new.items()
+                if a not in held
+                and (b.pool == rng_pool_id or (b.requested == 8 and b.pool == (0, 0)))
+            }
+            | {a for a in freed_live if a in now}
+        )
+        archived = super().adopt_native_capture(
+            native.raw_cuda_graph(), graph_pool, generators, candidates
+        )
+        self._adopted = True
+        self._capture_seq = _CAPTURE_SEQ[0]
+        _CAPTURE_SEQ[0] += 1
+        allocated = ops.get_current_alloc_offset() - self._alloc_offset_before
+        if allocated:
+            _UNSAVED_WINDOWS[self._capture_seq] = allocated
+        if archived:
+            self._native_rng = {
+                "seed_ptr": pair[0],
+                "offset_ptr": pair[1],
+                "increment": increment,
+                "seed": seed,
+            }
+            # Kept for the process: no later state can take an archived address.
+            _RNG_HELD.setdefault(device, []).extend((seed_buf, offset_buf))
+        else:
+            # Alive as long as torch's graph keeps the capture state.
+            live = _RNG_LIVE.setdefault(device, set())
+            live.update(pair)
+            weakref.finalize(native, live.difference_update, pair)
+        del seed_buf, offset_buf
+        # The RNG pool must hold nothing new from this capture but torch's RNG state: anything
+        # else this thread allocated on a non-capturing stream inside the routing scope (in
+        # the body, or in torch's Python capture-end hooks, which run after the capture's own
+        # routing ended) is memory SAVE's later code may bake into graphs but that LOAD's
+        # torch never allocates; an unread int64[1] there is another generator's state.
+        strays = {
+            a: b for a, b in new.items() if b.pool == rng_pool_id and a not in set(pair) | held
+        }
+        if strays:
+            raise CaptureUnsupported(
+                "foundry capture: unsupported: allocation(s) on a non-capturing stream during "
+                "the capture (they landed in Foundry's RNG pool, not in the graph pool) or RNG "
+                f"state of another generator: {_stray_message(strays)}"
+            )
+
+    def _abort_capture(self) -> None:
+        """End a capture whose body raised without adopting it: torch's capture is ended
+        (its errors are dropped, the body's exception is the one that propagates) and the
+        hook record window is discarded (see _record_abort)."""
+        native = self._native_graph
+        if native is None:
+            return
+        try:
+            native.capture_end()
+        except Exception:
+            pass
+        finally:
+            if self._rng_route is not None:
+                self._rng_route.__exit__(None, None, None)
+                self._rng_route = None
+            self._record_abort()
 
     def replay(self) -> None:
         if self._native_graph is not None:
@@ -221,8 +582,37 @@ class CUDAGraph(ops.CUDAGraph):
     def raw_cuda_graph(self) -> int:
         return super().raw_cuda_graph()
 
+    _capture_seq = None
+
     def save(self, json_path: str, output_tensors: OutputTensors | None = None) -> None:
-        return super().save(json_path, output_tensors)
+        seq = self._capture_seq
+        if seq is not None and seq < _LAST_SAVED_SEQ[0]:
+            raise CaptureUnsupported(
+                f"foundry save: unsupported: capture #{seq} saved after capture "
+                f"#{_LAST_SAVED_SEQ[0]}: LOAD replays the saved graphs' windows in save order and "
+                "its region cursor only moves forward (save graphs in capture order)"
+            )
+        if seq is not None:
+            skipped = sorted(k for k in _UNSAVED_WINDOWS if k < seq)
+            if skipped:
+                k = skipped[0]
+                raise CaptureUnsupported(
+                    f"foundry save: unsupported: capture #{k} (before this graph, #{seq}) "
+                    f"allocated {_UNSAVED_WINDOWS[k]} bytes of driver memory in its record window "
+                    "and was not saved before this graph: LOAD replays the windows of the saved "
+                    "graphs in save order and would place this graph's memory elsewhere (save "
+                    "every capture whose window allocated, in capture order)"
+                )
+        try:
+            super().save(json_path, output_tensors)
+        except RuntimeError as e:
+            converted = _as_capture_unsupported(e)
+            if converted is not e:
+                raise converted from e
+            raise
+        if seq is not None:
+            _UNSAVED_WINDOWS.pop(seq, None)
+            _LAST_SAVED_SEQ[0] = max(_LAST_SAVED_SEQ[0], seq)
 
     @staticmethod
     def load(
@@ -334,14 +724,25 @@ class graph:
         # torch.cuda.empty_cache()
 
         self.stream_ctx.__enter__()
-        self.cuda_graph.capture_begin(
-            *self.pool,
-            capture_error_mode=self.capture_error_mode,
-        )
+        try:
+            self.cuda_graph.capture_begin(
+                *self.pool,
+                capture_error_mode=self.capture_error_mode,
+            )
+        except BaseException:
+            # __exit__ does not run when __enter__ raises: restore the caller's stream.
+            self.stream_ctx.__exit__(*sys.exc_info())
+            raise
 
-    def __exit__(self, *args) -> None:
-        self.cuda_graph.capture_end()
-        self.stream_ctx.__exit__(*args)
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            if exc_type is None:
+                self.cuda_graph.capture_end()
+            else:
+                # The body raised: nothing of this capture is adopted or archived.
+                self.cuda_graph._abort_capture()
+        finally:
+            self.stream_ctx.__exit__(exc_type, exc, tb)
 
 
 def save_graph_manifest(

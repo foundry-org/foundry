@@ -198,12 +198,7 @@ ParsedGraphData CUDAGraph::prepare_graph_shell(boost::json::value&& root_val, Me
   if (gen_it != root.end()) {
     const boost::json::array& generators_array = gen_it->value().as_array();
     for (const auto& gen_val : generators_array) {
-      const boost::json::object& gen_obj = gen_val.as_object();
-      uint64_t state_id = gen_obj.at("id").to_number<uint64_t>();
-      uint64_t seed = gen_obj.at("seed").to_number<uint64_t>();
-      uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
-
-      graph->register_native_rng(state_id, seed, wholegraph_increment);
+      graph->register_native_rng(gen_val.as_object());
     }
   }
 
@@ -2318,6 +2313,9 @@ std::shared_ptr<PendingGraphLoads> start_graph_builds_impl(
           go["id"] = gens[g].id;
           go["seed"] = gens[g].seed;
           go["wholegraph_increment"] = gens[g].wholegraph_increment;
+          go["placement"] = gens[g].placement;
+          go["seed_ptr"] = gens[g].seed_ptr;
+          go["offset_ptr"] = gens[g].offset_ptr;
           gens_array.push_back(go);
         }
         pending->entries[i].generators_meta = boost::json::value(std::move(gens_array));
@@ -2952,35 +2950,18 @@ GraphLoadResult finish_one_graph_load_impl(std::shared_ptr<PendingGraphLoads> pe
 
   auto& entry = pending->entries[index];
 
-  // Register deferred generators (before allocator replay to match
-  // SAVE mode timing where generators are created before graph capture).
-  //
-  // The first registration lazily creates the generator state's
-  // seed/offset_extragraph_ tensors (two at::empty in
-  // CUDAGeneratorState::register_graph). Whether that at::empty grows a
-  // fresh caching-allocator segment depends on the free-pool state, which
-  // is NOT mirrored between SAVE and LOAD (SAVE's lazy init fires inside
-  // capture_begin, before the start_base_addr snapshot). If the growth
-  // happened inside the tracked region here, the VMM cursor would move
-  // past the recorded start_base_addr and replay_hook_events_from_json
-  // below would abort ("Memory offset mismatch during replay", observed
-  // as a 2 MB drift on A100). Suspend the region so any segment growth
-  // lands outside the tracked cursor.
+  // Register deferred generators (no allocation: the RNG buffers lie in memory the
+  // allocator-event replay below maps; verify_native_rng checks that after it).
   if (!entry.generators_meta.is_null()) {
-    foundry::SuspendAllocationRegion suspend_region;
-    const boost::json::array& gen_array = entry.generators_meta.as_array();
-    for (const auto& gen_val : gen_array) {
-      const boost::json::object& gen_obj = gen_val.as_object();
-      uint64_t state_id = gen_obj.at("id").to_number<uint64_t>();
-      uint64_t seed = gen_obj.at("seed").to_number<uint64_t>();
-      uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
-      entry.graph->register_native_rng(state_id, seed, wholegraph_increment);
+    for (const auto& gen_val : entry.generators_meta.as_array()) {
+      entry.graph->register_native_rng(gen_val.as_object());
     }
   }
 
   // Replay allocator events (advances VMM cursor)
   const boost::json::object& alloc_events = entry.allocator_events.as_object();
   foundry::replay_hook_events_from_json(alloc_events);
+  entry.graph->verify_native_rng();
 
   // Reconstruct output tensors from extracted metadata
   return make_load_result_from_extracted(entry.graph, entry.output_tensors_meta, reconstruct_fn);

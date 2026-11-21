@@ -122,6 +122,7 @@ def prefix_region(base: int, size: str = "1GB", seed: int = 0):
     torch.cuda.init()
     torch.cuda.set_device(0)
     fdry.set_allocation_region(base, fdry.parse_size(size))
+    fdry.reserve_rng_pool()  # as the integrations do, on SAVE and LOAD alike
     stream = torch.cuda.Stream()
     fdry.graph.default_capture_stream = stream
     return torch.Generator().manual_seed(seed), stream

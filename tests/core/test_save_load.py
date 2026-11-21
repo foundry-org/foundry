@@ -222,7 +222,7 @@ def _run_save(archive, workload):
 
     w = WORKLOADS[workload]
     inputs = _prefix(w)
-    torch.cuda.manual_seed(SEED)  # seed + philox offset 0, as a fresh LOAD state
+    torch.cuda.manual_seed(SEED)  # seed + philox offset 0, as LOAD sets before its replays
     graph = fdry.CUDAGraph()
     with fdry.graph(graph):
         outs = w.body(*inputs)
@@ -269,6 +269,9 @@ def _run_load(archive, workload, load_api):
     else:
         assert not outs, f"saved without outputs, LOAD reconstructed {outs!r}"
         outs = [inputs[-1]]  # the preallocated output buffer
+    # Loaded graphs draw from torch's default generator like torch's replays: same seed and
+    # offset 0 as SAVE's replays.
+    torch.cuda.manual_seed(SEED)
     assert_bit_exact(_replay_twice(graph, outs), want, f"{workload} replays")
 
     if w.mutate:

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <iostream>
 #include <unordered_map>
+#include <unordered_set>
 #include <cuda.h>
 #include <fstream>
 #include <boost/json.hpp>
@@ -37,52 +38,38 @@ void native_record_abort() {
 }
 
 // ---------------------------------------------------------------------------
-// LOAD RNG state. Same allocations and replay writes as torch's
-// CUDAGeneratorCaptureState::initialize / setup_for_replay and
-// CUDAGeneratorState::replay_prologue (v2.14.1 aten/src/ATen/cuda/
-// CUDAGeneratorImpl.cpp :91-121, :153-164, :250-260), through the stable shim
-// (allocation) and the CUDA driver (replay writes) only.
+// RNG state of an adopted torch capture.
+// SAVE (foundry/graph.py): torch.cuda.use_mem_pool(<Foundry RNG pool>) around torch's
+// capture puts torch's capture seed/offset tensors (CUDAGeneratorCaptureState) into a
+// Foundry-owned caching-allocator pool whose segments are allocated inside record
+// windows. The archived kernels read those addresses. LOAD allocates nothing: the
+// allocator-event replay maps the segment at the same address (checked), and every
+// replay writes (seed, offset) there with stream-ordered 64-bit stores, as torch's
+// CUDAGeneratorState::replay_prologue + CUDAGeneratorCaptureState::setup_for_replay do
+// (v2.14.1 aten/src/ATen/cuda/CUDAGeneratorImpl.cpp :153-170, :247-257). The values come
+// from torch's default generator of the device (philox_state(increment) outside capture:
+// current seed and offset, offset advanced by the increment), so loaded graphs and eager
+// RNG share one counter as with torch's own replay.
 // ---------------------------------------------------------------------------
 
 namespace {
-std::mutex foundry_rng_mutex;
-std::unordered_map<uint64_t, std::shared_ptr<FoundryRngState>> foundry_rng_states;
-
-// One int64[1] CUDA tensor on the current stream/device from torch's caching
-// allocator (aoti_torch_empty_strided -> at::empty_strided: an 8-byte request,
-// the same allocator call as at::empty({1}, kLong)).
-TensorHandle empty_int64_1(DeviceIndex dev) {
-  const int64_t size = 1, stride = 1;
-  AtenTensorHandle h = nullptr;
-  FOUNDRY_SHIM_CHECK(aoti_torch_empty_strided(1, &size, &stride, aoti_torch_dtype_int64(),
-                                              aoti_torch_device_type_cuda(), dev, &h));
-  return TensorHandle(h);
-}
-
 // Stream-ordered 64-bit store (exact for every uint64 value; replaces
 // Tensor::fill_(int64), whose stable counterpart takes a double).
-inline void write_u64(const TensorHandle& buf, uint64_t value, cudaStream_t stream) {
-  FOUNDRY_CU_CHECK(cuStreamWriteValue64(
-      reinterpret_cast<CUstream>(stream), reinterpret_cast<CUdeviceptr>(buf.data_ptr()),
-      static_cast<cuuint64_t>(value), CU_STREAM_WRITE_VALUE_DEFAULT));
+inline void write_u64(uint64_t addr, uint64_t value, cudaStream_t stream) {
+  FOUNDRY_CU_CHECK(
+      cuStreamWriteValue64(reinterpret_cast<CUstream>(stream), static_cast<CUdeviceptr>(addr),
+                           static_cast<cuuint64_t>(value), CU_STREAM_WRITE_VALUE_DEFAULT));
 }
 }  // namespace
 
-std::shared_ptr<FoundryRngState> foundry_rng_state_from_id(uint64_t id, uint64_t seed) {
-  std::lock_guard<std::mutex> lock(foundry_rng_mutex);
-  auto& slot = foundry_rng_states[id];
-  if (!slot) {
-    // The first registration of an id fixes its seed, offset 0.
-    slot = std::make_shared<FoundryRngState>();
-    slot->seed = seed;
-    slot->offset = 0;
-  }
-  return slot;
-}
-
-void CUDAGraph::register_native_rng(uint64_t id, uint64_t seed, uint64_t wholegraph_increment) {
-  auto state = foundry_rng_state_from_id(id, seed);
-  // A repeated id in one archive allocates once (torch: get_capture_state(id, true)
+void CUDAGraph::register_native_rng(const boost::json::object& gen) {
+  const uint64_t id = gen.at("id").to_number<uint64_t>();
+  const uint64_t wholegraph_increment = gen.at("wholegraph_increment").to_number<uint64_t>();
+  const auto placement = static_cast<RngPlacement>(gen.at("placement").to_number<uint64_t>());
+  FOUNDRY_CHECK(placement == RngPlacement::Recorded,
+                "graph load: unsupported RNG buffer placement ", static_cast<uint64_t>(placement),
+                " (archive of an older build; re-capture it)");
+  // A repeated id in one archive registers once (torch: get_capture_state(id, true)
   // returns the existing capture state).
   for (auto& r : native_rng_) {
     if (r.id == id) {
@@ -92,88 +79,198 @@ void CUDAGraph::register_native_rng(uint64_t id, uint64_t seed, uint64_t wholegr
   }
   LoadedRngBuffers r;
   r.id = id;
-  r.state = std::move(state);
   r.wholegraph_increment = wholegraph_increment;
-  {
-    // = CUDAGeneratorCaptureState::initialize: two int64[1] empties on the current
-    // device's default stream (default pool), relaxed thread capture mode, then
-    // synchronize the default stream. torch's InferenceMode(false) is not needed:
-    // nothing but raw stream writes ever touches these tensors (no autograd op).
-    const DeviceIndex dev = current_device();
-    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
-    FOUNDRY_CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
-    {
-      CUDAStreamGuardHandle guard = nullptr;
-      // native handle 0 = the legacy default stream = c10::cuda::getDefaultCUDAStream()
-      FOUNDRY_SHIM_CHECK(aoti_torch_create_cuda_stream_guard(nullptr, dev, &guard));
-      try {
-        r.seed_buf = empty_int64_1(dev);
-        r.offset_buf = empty_int64_1(dev);
-        FOUNDRY_CUDA_CHECK(cudaStreamSynchronize(nullptr));
-      } catch (...) {
-        (void)aoti_torch_delete_cuda_stream_guard(guard);
-        throw;
-      }
-      FOUNDRY_SHIM_CHECK(aoti_torch_delete_cuda_stream_guard(guard));
-    }
-    FOUNDRY_CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
-  }
+  // torch allocated the pair in Foundry's RNG pool inside this or an earlier graph's
+  // record window; LOAD's allocator-event replay maps it (checked in verify_native_rng).
+  r.seed_ptr = gen.at("seed_ptr").to_number<uint64_t>();
+  r.offset_ptr = gen.at("offset_ptr").to_number<uint64_t>();
   native_rng_.push_back(std::move(r));
+}
+
+void CUDAGraph::verify_native_rng() const {
+  for (const auto& r : native_rng_) {
+    for (uint64_t addr : {r.seed_ptr, r.offset_ptr}) {
+      char hex[32];
+      snprintf(hex, sizeof(hex), "0x%lx", (unsigned long)addr);
+      FOUNDRY_CHECK(foundry::recorded_allocation_contains(addr, sizeof(uint64_t)),
+                    "graph load: the archived RNG ", addr == r.seed_ptr ? "seed" : "offset",
+                    " buffer ", hex, " (generator id ", r.id,
+                    ") is not inside an allocation Foundry replayed in this process; load the "
+                    "graphs whose record windows allocated it (same archive, save order) first");
+    }
+  }
+}
+
+void CUDAGraph::set_native_rng_philox(size_t i, uint64_t seed, uint64_t offset) {
+  auto& r = native_rng_.at(i);
+  r.seed = seed;
+  r.offset = offset;
+  r.philox_set = true;
 }
 
 void CUDAGraph::native_rng_replay_prologue(cudaStream_t stream) {
   for (auto& r : native_rng_) {
-    // = CUDAGeneratorState::replay_prologue + CUDAGeneratorCaptureState::setup_for_replay.
+    // = CUDAGeneratorState::replay_prologue + CUDAGeneratorCaptureState::setup_for_replay,
+    // with the (seed, offset) the replay binding took from torch's generator.
     if (r.wholegraph_increment == 0) {
       continue;
     }
-    write_u64(r.seed_buf, r.state->seed, stream);
-    write_u64(r.offset_buf, r.state->offset, stream);
-    if (std::find(r.replay_streams.begin(), r.replay_streams.end(), stream) ==
-        r.replay_streams.end()) {
-      r.replay_streams.push_back(stream);
-    }
-    r.state->offset += r.wholegraph_increment;
+    FOUNDRY_CHECK(r.philox_set, "replay: no (seed, offset) taken from torch's generator for ",
+                  "generator id ", r.id, " (replay a loaded graph through foundry.ops)");
+    r.philox_set = false;
+    write_u64(r.seed_ptr, r.seed, stream);
+    write_u64(r.offset_ptr, r.offset, stream);
   }
 }
 
 void CUDAGraph::release_native_rng() {
-  // torch keeps the buffers' blocks out of reuse until the replay streams' work
-  // is done (recordStream + free-time events). No stable shim for that: wait for
-  // the device instead, only when a replay used the buffers.
-  bool used = false;
-  for (const auto& r : native_rng_) {
-    used = used || !r.replay_streams.empty();
-  }
-  if (used) {
-    try {
-      DeviceGuard guard(capture_dev_);
-      if (cudaDeviceSynchronize() != cudaSuccess) {
-        (void)cudaGetLastError();  // e.g. at process teardown; nothing left to protect
-      }
-    } catch (...) {
-    }
-  }
+  // The buffers are Foundry-mapped memory (replayed allocator events), not freed here.
   native_rng_.clear();
 }
 
-void CUDAGraph::adopt_native_capture(
-    uintptr_t raw_graph, MempoolId_t pool,
-    const std::vector<std::tuple<uint64_t, uint64_t, uint64_t>>& generators) {
+namespace {
+// Every 8-byte-aligned word of the kernel parameters of one kernel node.
+template <typename F>
+void scan_kernel_node_words(CUgraphNode node, F&& check) {
+  CUDA_KERNEL_NODE_PARAMS_v2 p{};
+  FOUNDRY_CU_CHECK(cuGraphKernelNodeGetParams_v2(node, &p));
+  CUfunction func = p.func;
+  if (func == nullptr && p.kern != nullptr) {
+    FOUNDRY_CU_CHECK(cuKernelGetFunction(&func, p.kern));
+  }
+  auto scan_bytes = [&](const void* data, size_t size) {
+    const char* b = static_cast<const char*>(data);
+    for (size_t w = 0; w + sizeof(uint64_t) <= size; w += sizeof(uint64_t)) {
+      uint64_t v;
+      std::memcpy(&v, b + w, sizeof(v));
+      check(v);
+    }
+  };
+  if (p.kernelParams != nullptr) {
+    for (size_t i = 0;; ++i) {
+      size_t off = 0, size = 0;
+      if (cuFuncGetParamInfo(func, i, &off, &size) != CUDA_SUCCESS)
+        break;
+      scan_bytes(p.kernelParams[i], size);
+    }
+  } else if (p.extra != nullptr) {
+    void* buf = nullptr;
+    size_t* bufsize = nullptr;
+    for (size_t i = 0; p.extra[i] != CU_LAUNCH_PARAM_END; i += 2) {
+      if (p.extra[i] == CU_LAUNCH_PARAM_BUFFER_POINTER)
+        buf = p.extra[i + 1];
+      if (p.extra[i] == CU_LAUNCH_PARAM_BUFFER_SIZE)
+        bufsize = static_cast<size_t*>(p.extra[i + 1]);
+    }
+    if (buf != nullptr && bufsize != nullptr)
+      scan_bytes(buf, *bufsize);
+  }
+}
+}  // namespace
+
+// Every 8-byte-aligned word of every kernel parameter, and the device addresses of every
+// memcpy/memset node, of a raw graph and its child graphs (driver API only; no assumption
+// about the PhiloxCudaState layout): which candidate values occur.
+std::unordered_set<uint64_t> scan_raw_graph_words(CUgraph graph,
+                                                  const std::unordered_set<uint64_t>& cand) {
+  std::unordered_set<uint64_t> found;
+  if (cand.empty())
+    return found;
+  auto check = [&](uint64_t v) {
+    if (cand.count(v))
+      found.insert(v);
+  };
+  std::vector<CUgraph> graphs{graph};
+  while (!graphs.empty()) {
+    CUgraph g = graphs.back();
+    graphs.pop_back();
+    size_t n = 0;
+    FOUNDRY_CU_CHECK(cuGraphGetNodes(g, nullptr, &n));
+    std::vector<CUgraphNode> nodes(n);
+    FOUNDRY_CU_CHECK(cuGraphGetNodes(g, nodes.data(), &n));
+    for (CUgraphNode node : nodes) {
+      CUgraphNodeType t;
+      FOUNDRY_CU_CHECK(cuGraphNodeGetType(node, &t));
+      if (t == CU_GRAPH_NODE_TYPE_KERNEL) {
+        scan_kernel_node_words(node, check);
+      } else if (t == CU_GRAPH_NODE_TYPE_GRAPH) {
+        CUgraph child = nullptr;
+        FOUNDRY_CU_CHECK(cuGraphChildGraphNodeGetGraph(node, &child));
+        graphs.push_back(child);
+      } else if (t == CU_GRAPH_NODE_TYPE_MEMCPY) {
+        CUDA_MEMCPY3D m{};
+        FOUNDRY_CU_CHECK(cuGraphMemcpyNodeGetParams(node, &m));
+        check(static_cast<uint64_t>(m.srcDevice));
+        check(static_cast<uint64_t>(m.dstDevice));
+      } else if (t == CU_GRAPH_NODE_TYPE_MEMSET) {
+        CUDA_MEMSET_NODE_PARAMS m{};
+        FOUNDRY_CU_CHECK(cuGraphMemsetNodeGetParams(node, &m));
+        check(static_cast<uint64_t>(m.dst));
+      }
+    }
+  }
+  return found;
+}
+
+bool CUDAGraph::adopt_native_capture(uintptr_t raw_graph, MempoolId_t pool,
+                                     const std::vector<NativeGenerator>& generators,
+                                     const std::vector<uint64_t>& rng_candidates) {
   FOUNDRY_CHECK(!has_graph_ && !has_graph_exec_ && !capture_ended_ && !adopted_native_,
                 "adopt_native_capture: this CUDAGraph already holds a graph");
+  FOUNDRY_CHECK(raw_graph != 0, "adopt_native_capture: null cudaGraph_t");
+  FOUNDRY_CHECK(generators.size() <= 1,
+                "adopt_native_capture: at most one default-generator entry expected");
+  // rng_candidates (foundry/graph.py) = blocks of Foundry's RNG pool that may hold this
+  // capture's RNG state (created during it, or not held by Foundry and so possibly freed
+  // and reused during it) and int64[1] blocks created during it outside the graph pool;
+  // generators[0], if any, carries the default generator's pair (philox_state) and
+  // increment. Any of them the graph reads other than that pair is RNG state Foundry
+  // cannot replay.
+  std::vector<NativeGenerator> gens = generators;
+  std::unordered_set<uint64_t> cand(rng_candidates.begin(), rng_candidates.end());
+  uint64_t dseed = 0, doff = 0;
+  if (!gens.empty()) {
+    dseed = std::get<4>(gens[0]);
+    doff = std::get<5>(gens[0]);
+    cand.insert(dseed);
+    cand.insert(doff);
+  }
+  const std::unordered_set<uint64_t> found =
+      scan_raw_graph_words(reinterpret_cast<CUgraph>(raw_graph), cand);
+  for (uint64_t a : found) {
+    if (gens.empty() || (a != dseed && a != doff)) {
+      char hex[32];
+      snprintf(hex, sizeof(hex), "0x%lx", (unsigned long)a);
+      native_record_abort();
+      FOUNDRY_CHECK(false, "foundry capture: unsupported: this graph reads ", hex,
+                    ", RNG state of the capture (or memory allocated during it on a "
+                    "non-capturing stream) that is not the default CUDA generator's seed/offset "
+                    "pair: RNG from another torch.Generator (its seed and increment are not "
+                    "obtainable with public API) or RNG state created on a thread other than "
+                    "the capturing one");
+    }
+  }
+  if (!gens.empty() && !found.count(dseed) && !found.count(doff)) {
+    const uint64_t inc = std::get<2>(gens[0]);
+    if (inc != 0) {
+      native_record_abort();
+      FOUNDRY_CHECK(false, "foundry capture: unsupported: the default generator advanced by ", inc,
+                    " in this capture but no kernel parameter or copy node holds its seed/offset "
+                    "buffer addresses");
+    }
+    gens.clear();  // no kernel reads the pair: nothing to archive, LOAD does nothing
+  }
   // Same window end as torch's capture_end: after its endAllocateToPool.
   foundry::end_hook_record();
   allocator_events_ = foundry::save_hook_events_to_json();
   foundry::clear_hook_events();
-  FOUNDRY_CHECK(raw_graph != 0, "adopt_native_capture: null cudaGraph_t");
 
   graph_ = reinterpret_cast<cudaGraph_t>(raw_graph);
   has_graph_ = true;
   adopted_native_ = true;
   capture_dev_ = current_device();
   mempool_id_ = pool;
-  native_generators_ = generators;
+  native_generators_ = gens;
 
   analyze_captured_graph();
   if (!keep_graph_) {
@@ -181,6 +278,7 @@ void CUDAGraph::adopt_native_capture(
     graph_ = nullptr;
     has_graph_ = false;
   }
+  return !gens.empty();
 }
 
 namespace {
@@ -776,8 +874,6 @@ MempoolId_t CUDAGraph::pool() {
 }
 
 CUDAGraph::~CUDAGraph() {
-  // Free the RNG buffers where torch frees its capture state (remove_capture_state):
-  // before reset(), offset_buf then seed_buf.
   release_native_rng();
   reset();
 
@@ -1249,6 +1345,24 @@ static Tensor reconstruct_tensor_from_metadata(const boost::json::object& obj) {
 void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_tensors,
                      OutputTensorType output_type) {
   FOUNDRY_CHECK(!graph_nodes.empty(), "Graph hasn't been captured yet or has no nodes");
+  if (!saved_events_noted_ && allocator_events_.contains("events")) {
+    // Once: a graph saved again (another path, binary) adds no new window to LOAD's sequence.
+    foundry::note_saved_hook_events(allocator_events_);
+    saved_events_noted_ = true;
+  }
+  // LOAD maps exactly the driver allocations recorded in the windows of the graphs loaded so
+  // far (= saved so far, in this order): the archived RNG pair must be in one of them.
+  for (const auto& g : native_generators_) {
+    for (uint64_t addr : {std::get<4>(g), std::get<5>(g)}) {
+      char hex[32];
+      snprintf(hex, sizeof(hex), "0x%lx", (unsigned long)addr);
+      FOUNDRY_CHECK(foundry::recorded_allocation_contains(addr, sizeof(uint64_t)),
+                    "foundry save: unsupported: the default generator's capture RNG buffer ", hex,
+                    " is not inside a driver allocation recorded in the window of this graph or "
+                    "of a graph saved before it (save the graph that allocated Foundry's RNG pool "
+                    "segment first; LOAD loads in save order)");
+    }
+  }
 
   set_pack_fatbins_on_exit(true);
 
@@ -1789,18 +1903,23 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
   }
   root["dependencies"] = deps_array;
 
-  // (id, seed, increment) from the public Python API (Generator.philox_state, foundry/graph.py).
-  std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> sorted_generators = native_generators_;
+  // NativeGenerator entries from the public Python API (Generator.philox_state,
+  // torch.cuda.memory_snapshot and the hook record; foundry/graph.py).
+  std::vector<NativeGenerator> sorted_generators = native_generators_;
 
   std::sort(sorted_generators.begin(), sorted_generators.end(),
             [](const auto& a, const auto& b) { return std::get<0>(a) < std::get<0>(b); });
 
   json::array generators_array;
-  for (const auto& [state_id, seed, wholegraph_increment] : sorted_generators) {
+  for (const auto& [state_id, seed, wholegraph_increment, placement, seed_ptr, offset_ptr] :
+       sorted_generators) {
     json::object gen_obj;
     gen_obj["id"] = state_id;
     gen_obj["seed"] = seed;
     gen_obj["wholegraph_increment"] = wholegraph_increment;
+    gen_obj["placement"] = placement;
+    gen_obj["seed_ptr"] = seed_ptr;
+    gen_obj["offset_ptr"] = offset_ptr;
     generators_array.push_back(gen_obj);
   }
   root["generators"] = generators_array;
@@ -1892,26 +2011,14 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool) 
     graph->mempool_id_ = pool;
   }
 
-  {
-    // Suspend the tracked region: the first register_graph lazily
-    // allocates seed/offset_extragraph_ (see finish_one_graph_load_impl
-    // in CUDAGraphParallel.cpp for the full rationale); in-region pool
-    // growth here would push the VMM cursor past the recorded
-    // start_base_addr and abort the replay below.
-    foundry::SuspendAllocationRegion suspend_region;
-    const json::array& generators_array = root.at("generators").as_array();
-    for (const auto& gen_val : generators_array) {
-      const json::object& gen_obj = gen_val.as_object();
-      uint64_t state_id = gen_obj.at("id").to_number<uint64_t>();
-      uint64_t seed = gen_obj.at("seed").to_number<uint64_t>();
-      uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
-
-      graph->register_native_rng(state_id, seed, wholegraph_increment);
-    }
+  // No allocation: the RNG buffers are in memory the event replay below maps.
+  for (const auto& gen_val : root.at("generators").as_array()) {
+    graph->register_native_rng(gen_val.as_object());
   }
 
   const json::object& allocator_events = root.at("allocator_events").as_object();
   foundry::replay_hook_events_from_json(allocator_events);
+  graph->verify_native_rng();
 
   CUgraph cuGraph;
   FOUNDRY_CU_CHECK(cuGraphCreate(&cuGraph, 0));
