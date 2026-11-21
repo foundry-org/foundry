@@ -404,9 +404,7 @@ EXPECTED = {
     "h1_reuse": ("saved", None),
     "h1_live_reuse": ("saved", None),
     "c3_pair_reuse": ("saved", None),
-    # 2.16 pre-allocates the pairs in capture_begin: even this window allocated (the RNG
-    # pool's first segment).
-    "raise_before_alloc": ("refused", POISONED) if PREALLOCATED_PAIRS else ("saved", None),
+    "raise_before_alloc": ("saved", None),
     "eager_rng": ("saved", None),
     # A capture that failed after its window allocated: every later capture is refused.
     "h1_unaccounted": ("refused", POISONED),

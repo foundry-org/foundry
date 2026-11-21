@@ -219,6 +219,10 @@ def setup_graph_extension(server_args, tp_rank: int, pp_rank: int, dp_rank: int 
             "address; the [HOOK] lines above name the mappings in the way): choose another "
             "base_addr or a smaller region_size in the Foundry TOML"
         )
+    # Same point on SAVE and LOAD: the RNG pool's first segment (foundry.reserve_rng_pool).
+    from foundry.graph import reserve_rng_pool
+
+    reserve_rng_pool()
     t_region = time.perf_counter() - t1
     t1 = time.perf_counter()
     _ = torch._C._cuda_getCurrentBlasHandle()

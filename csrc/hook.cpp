@@ -4445,6 +4445,10 @@ void note_saved_hook_events(const boost::json::object& events_obj) {
   }
 }
 
+void note_reserved_allocation(uint64_t ptr, size_t size) {
+  note_recorded_event("alloc", static_cast<CUdeviceptr>(ptr), size);
+}
+
 bool recorded_allocation_contains(uint64_t addr, size_t len) {
   std::lock_guard<std::mutex> lock(recorded_allocs_mutex);
   auto it = recorded_allocs.upper_bound(static_cast<CUdeviceptr>(addr));

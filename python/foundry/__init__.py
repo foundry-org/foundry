@@ -27,6 +27,7 @@ from .graph import (
     LoadedEvent,
     RestoredEvent,
     graph,
+    reserve_rng_pool,
     save_graph_manifest,
 )
 
@@ -45,6 +46,7 @@ __all__ = [
     "graph",
     "parse_size",
     "preallocate_region",
+    "reserve_rng_pool",
     "resume_allocation_region",
     "save_graph_manifest",
     "set_current_alloc_offset",

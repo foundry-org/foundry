@@ -99,6 +99,10 @@ PYBIND11_MODULE(ops, m) {
       },
       py::arg("raw_graph"), py::arg("words"));
   m.def(
+      "note_reserved_allocation",
+      [](uint64_t ptr, size_t size) { ::foundry::note_reserved_allocation(ptr, size); },
+      py::arg("ptr"), py::arg("size"));
+  m.def(
       "recorded_allocation_contains",
       [](uint64_t addr, size_t len) { return ::foundry::recorded_allocation_contains(addr, len); },
       py::arg("addr"), py::arg("len"),

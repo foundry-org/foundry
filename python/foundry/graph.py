@@ -142,6 +142,39 @@ def _as_capture_unsupported(e: BaseException) -> BaseException:
     return e
 
 
+_RNG_RESERVED: set[int] = set()
+
+
+def reserve_rng_pool() -> None:
+    """SAVE and LOAD alike, at the same program point right after ``set_allocation_region``
+    (the integrations call it there): create the first segment of Foundry's RNG pool for the
+    current device outside any capture, with the same torch allocation on both sides, so it
+    lands at the same address and counts as recorded on both. Capture seed/offset pairs then
+    live in it instead of in a segment of the first capture's record window (later segments,
+    one per ~2048 live captures, are still allocated inside the capture that needs them and
+    recorded when that graph is saved). LOAD allocates this one segment once; nothing per
+    graph or replay. Without the call the first segment comes from the first capture."""
+    device = torch.cuda.current_device()
+    if device in _RNG_RESERVED:
+        return
+    pool = _rng_pool(device)
+    pool_id = tuple(pool.id)
+    with torch.cuda.use_mem_pool(pool), torch.cuda.stream(torch.cuda.default_stream(device)):
+        block = torch.empty(1, dtype=torch.int64, device=device)
+    del block  # the pool keeps the segment
+    try:
+        segments = [
+            (seg["address"], seg["total_size"])
+            for seg in torch.cuda.memory_snapshot()
+            if tuple(seg["segment_pool_id"]) == pool_id
+        ]
+    except KeyError as e:
+        raise _unsupported_torch(f"torch.cuda.memory_snapshot() has no {e} field") from None
+    for address, size in segments:
+        ops.note_reserved_allocation(address, size)
+    _RNG_RESERVED.add(device)
+
+
 def _unsupported_torch(what: str) -> RuntimeError:
     return CaptureUnsupported(
         f"foundry capture: unsupported: torch {torch.__version__}: {what} (Foundry's RNG state "
