@@ -12,6 +12,7 @@ SAVE seeds the default generator, captures, re-seeds and replays the graphs with
 the same order and draws eagerly.
 """
 
+import importlib
 import os
 import sys
 import threading
@@ -83,7 +84,8 @@ def case_h1_reuse(fdry, x, stream, archive):
 
 def case_h1_live_reuse(fdry, x, stream, archive):
     """An earlier RNG-free graph (its pair not archived, alive with torch's graph) is
-    destroyed inside the capture body; the new capture's state may take the freed address."""
+    destroyed inside the capture body; the new capture's state may take the freed address.
+    Handled by the positive default-generator probe alone (the finaliser plays no part)."""
     g0, o0 = _capture(fdry, lambda: [x * 2.0])
     g0.save(os.path.join(archive, "g0.json"), output_tensors=o0)
     old = g0._native_rng
@@ -95,6 +97,55 @@ def case_h1_live_reuse(fdry, x, stream, archive):
     g1, o1 = _capture(fdry, body, mode="relaxed")
     print(f"PAIRS old={old} new={g1._native_rng}", flush=True)
     return [("g1", g1, o1)], ["g1"]
+
+
+def case_freed_live_custom(fdry, x, stream, archive):
+    """An earlier RNG-free graph is destroyed inside the capture body, then a non-default
+    generator draws: its state can take the freed pair's addresses (live before the
+    capture, so only the finaliser-tracked candidates find it)."""
+    g0, o0 = _capture(fdry, lambda: [x * 2.0])
+    g0.save(os.path.join(archive, "g0.json"), output_tensors=o0)
+    gen = torch.Generator(device="cuda")
+    live = sorted(importlib.import_module("foundry.graph")._RNG_LIVE.get(0, ()))
+    print(f"PAIRS live before the capture: {[hex(a) for a in live]}", flush=True)
+
+    def body():
+        g0.reset()
+        return [torch.rand(x.shape, device="cuda", generator=gen)]
+
+    g, o = _capture(fdry, body, mode="relaxed")
+    return [("g", g, o)], ["g"]
+
+
+def case_save_order(fdry, x, stream, archive):
+    """An RNG-free graph (its window allocates) captured first, an RNG graph second, the
+    second saved before the first."""
+    g0, o0 = _capture(fdry, lambda: [x * 2.0])
+    g1, o1 = _capture(fdry, _rng_body(x))
+    g1.save(os.path.join(archive, "g1.json"), output_tensors=o1)
+    g0.save(os.path.join(archive, "g0.json"), output_tensors=o0)
+    return [], ["g1"]
+
+
+def case_unsaved_window(fdry, x, stream, archive):
+    """A captured graph whose window allocated is never saved; a later graph is saved."""
+    g0, o0 = _capture(fdry, _rng_body(x))
+    g0.save(os.path.join(archive, "g0.json"), output_tensors=o0)
+    _capture(fdry, lambda: [x * 3.0])  # new output: its window allocates; not saved
+    g, o = _capture(fdry, _rng_body(x))
+    return [("g", g, o)], ["g"]
+
+
+def case_unsaved_empty_window(fdry, x, stream, archive):
+    """A captured graph whose window allocated nothing (in-place, into a pool with room) is
+    never saved; a later graph is saved."""
+    g0, o0 = _capture(fdry, _rng_body(x))
+    g0.save(os.path.join(archive, "g0.json"), output_tensors=o0)
+    ga = fdry.CUDAGraph()
+    with fdry.graph(ga, pool=g0.pool()):
+        x.mul_(1.0)
+    g, o = _capture(fdry, _rng_body(x))
+    return [("g", g, o)], ["g"]
 
 
 def case_c3_pair_reuse(fdry, x, stream, archive):
@@ -300,13 +351,14 @@ def _run_save(archive, case):
     x, stream = _prefix()
     try:
         saved, names = CASES[case](fdry, x, stream, archive)
+        for n, g, o in saved:
+            g.save(os.path.join(archive, f"{n}.json"), output_tensors=o)
     except RuntimeError as e:
-        print(f"OUTCOME refused: {e}", flush=True)
+        kind = "CaptureUnsupported" if isinstance(e, fdry.CaptureUnsupported) else type(e).__name__
+        print(f"OUTCOME refused: {e} [{kind}]", flush=True)
         fdry.stop_allocation_region()
         return
     graphs = {n: (g, o) for n, g, o in saved}
-    for n, g, o in saved:
-        g.save(os.path.join(archive, f"{n}.json"), output_tensors=o)
     ref = _replays(graphs, names, case)
     torch.save({"names": names, "replays": ref}, os.path.join(archive, "ref.pt"))
     gens = {n: g._native_rng for n, g, _ in saved}
@@ -335,7 +387,9 @@ def _save_then_load(tmp_path, case):
     out = run_phase(__file__, "save", tmp_path, case)
     if "OUTCOME refused:" in out:
         line = out[out.index("OUTCOME refused:") :].splitlines()[0]
-        assert "foundry capture: unsupported:" in line or "non-default stream" in line, line
+        if "non-default stream" not in line:  # torch's own refusal
+            assert "[CaptureUnsupported]" in line, line
+            assert "foundry capture: unsupported:" in line or "foundry save: unsupported:" in line
         return "refused", line
     assert "OUTCOME saved" in out, out[-2000:]
     assert "OUTCOME pair_reused" not in out, out[-2000:]
@@ -359,6 +413,10 @@ EXPECTED = {
     "rng_then_refused_then_rng": ("refused", POISONED),
     "raise_then_rng": ("refused", POISONED),
     "rng_then_raise_then_rng": ("refused", POISONED),
+    "freed_live_custom": ("refused", "not the default CUDA generator's seed/offset pair"),
+    "save_order": ("refused", "was not saved before this graph"),
+    "unsaved_window": ("refused", "was not saved before this graph"),
+    "unsaved_empty_window": ("saved", None),
     "h3_no_requested_size": ("refused", "has no 'requested_size' field"),
     "custom_generator": ("refused", "not the default CUDA generator's seed/offset pair"),
     "default_stream": ("refused", "non-default stream"),
