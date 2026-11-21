@@ -3,6 +3,7 @@
 """Every captured graph that draws torch RNG is either archived with its RNG state (LOAD
 replays bit for bit what torch's own replays drew at SAVE from the same seed) or refused
 loudly at SAVE ("foundry capture: unsupported: ..."); never saved as RNG-free (1 GPU).
+Each case expects one outcome (per torch version where torch's behaviour differs).
 
     pytest tests/core/test_rng_detect.py -q -s
 
@@ -24,8 +25,16 @@ SEED = 1234
 REPLAYS = 3
 
 
+# torch >= 2.16 pre-allocates a capture's seed/offset pairs in capture_begin (in Foundry's
+# RNG pool), so another thread drawing from the default generator claims one of those.
+PREALLOCATED_PAIRS = tuple(int(v) for v in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 16)
+_KEEP = []  # default-pool int64[1] blocks a case frees inside its capture body
+
+
 def _prefix():
     g, stream = prefix_region(BASE_ADDR, "1GB")
+    # Two 8 B default-pool blocks (on SAVE and LOAD alike; s1_thread_freed frees them).
+    _KEEP[:] = [torch.zeros(1, dtype=torch.int64, device="cuda") for _ in range(2)]
     x = torch.randn(64, 128, generator=g).cuda()
     with torch.cuda.stream(stream):  # warm-up on the capture stream (identical on LOAD)
         torch.nn.functional.dropout(x * 2.0, p=0.5, training=True)
@@ -56,8 +65,8 @@ def case_multi(fdry, x, stream, archive):
 
 
 def case_h1_reuse(fdry, x, stream, archive):
-    """An earlier RNG graph is destroyed inside the capture body; the new capture's RNG
-    state reuses its freed seed/offset blocks (same addresses as before the capture)."""
+    """An earlier RNG graph is destroyed inside the capture body (its archived pair is held,
+    so the new capture's state cannot take its address)."""
     g0, o0 = _capture(fdry, _rng_body(x))
     g0.save(os.path.join(archive, "g0.json"), output_tensors=o0)
     old = dict(g0._native_rng)
@@ -71,23 +80,20 @@ def case_h1_reuse(fdry, x, stream, archive):
     return [("g1", g1, o1)], ["g1"]
 
 
-def case_h1_unaccounted(fdry, x, stream, archive):
-    """The state of a refused capture (not held by Foundry) is freed inside a later capture,
-    whose RNG state can then take its address."""
-    gen = torch.Generator(device="cuda")
-    bad = fdry.CUDAGraph()
-    try:
-        with fdry.graph(bad):
-            torch.rand(x.shape, device="cuda", generator=gen)
-    except RuntimeError as e:
-        print(f"first capture refused: {str(e)[:80]}", flush=True)
+def case_h1_live_reuse(fdry, x, stream, archive):
+    """An earlier RNG-free graph (its pair not archived, alive with torch's graph) is
+    destroyed inside the capture body; the new capture's state may take the freed address."""
+    g0, o0 = _capture(fdry, lambda: [x * 2.0])
+    g0.save(os.path.join(archive, "g0.json"), output_tensors=o0)
+    old = g0._native_rng
 
     def body():
-        bad._native_graph.reset()
+        g0.reset()
         return [torch.rand_like(x)]
 
-    g, o = _capture(fdry, body, mode="relaxed")
-    return [("g", g, o)], ["g"]
+    g1, o1 = _capture(fdry, body, mode="relaxed")
+    print(f"PAIRS old={old} new={g1._native_rng}", flush=True)
+    return [("g1", g1, o1)], ["g1"]
 
 
 def case_c3_pair_reuse(fdry, x, stream, archive):
@@ -103,6 +109,76 @@ def case_c3_pair_reuse(fdry, x, stream, archive):
     if set(old) & set(new):
         print("OUTCOME pair_reused", flush=True)
     return [("g1", g1, o1)], ["g1"]
+
+
+def _refused_capture(fdry, x):
+    """A capture refused at SAVE (RNG from a non-default generator); its window allocated."""
+    gen = torch.Generator(device="cuda")
+    bad = fdry.CUDAGraph()
+    try:
+        with fdry.graph(bad):
+            torch.rand(x.shape, device="cuda", generator=gen)
+    except RuntimeError as e:
+        print(f"first capture refused: {str(e)[:80]}", flush=True)
+    return bad
+
+
+def _raised_capture(fdry, x, draw=True):
+    """A capture whose body raises (after an RNG op, which allocates, if draw)."""
+    bad = fdry.CUDAGraph()
+    try:
+        with fdry.graph(bad):
+            if draw:
+                torch.rand_like(x)
+            raise ValueError("body failed")
+    except ValueError:
+        pass
+    return bad
+
+
+def case_h1_unaccounted(fdry, x, stream, archive):
+    """A refused capture, then a capture that frees its state inside the body."""
+    bad = _refused_capture(fdry, x)
+
+    def body():
+        bad._native_graph.reset()
+        return [torch.rand_like(x)]
+
+    g, o = _capture(fdry, body, mode="relaxed")
+    return [("g", g, o)], ["g"]
+
+
+def case_rng_then_refused_then_rng(fdry, x, stream, archive):
+    """A saved RNG graph, a refused capture, another RNG capture."""
+    g0, o0 = _capture(fdry, _rng_body(x))
+    g0.save(os.path.join(archive, "g0.json"), output_tensors=o0)
+    _refused_capture(fdry, x)
+    g, o = _capture(fdry, _rng_body(x))
+    return [("g", g, o)], ["g0", "g"]
+
+
+def case_raise_then_rng(fdry, x, stream, archive):
+    """A capture that raises midway (after an RNG op, the first RNG state of the process),
+    then a normal RNG capture."""
+    _raised_capture(fdry, x)
+    g, o = _capture(fdry, _rng_body(x))
+    return [("g", g, o)], ["g"]
+
+
+def case_rng_then_raise_then_rng(fdry, x, stream, archive):
+    """A saved RNG graph, a capture that raises after an RNG op, another RNG capture."""
+    g0, o0 = _capture(fdry, _rng_body(x))
+    g0.save(os.path.join(archive, "g0.json"), output_tensors=o0)
+    _raised_capture(fdry, x)
+    g, o = _capture(fdry, _rng_body(x))
+    return [("g", g, o)], ["g"]
+
+
+def case_raise_before_alloc(fdry, x, stream, archive):
+    """A capture whose body raises before anything is allocated, then an RNG capture."""
+    _raised_capture(fdry, x, draw=False)
+    g, o = _capture(fdry, _rng_body(x))
+    return [("g", g, o)], ["g"]
 
 
 def _strip_requested_size():
@@ -125,43 +201,56 @@ def case_h3_no_requested_size(fdry, x, stream, archive):
     return [("g", g, o)], ["g"]
 
 
+def _on_worker(fn):
+    done = []
+
+    def worker():
+        torch.cuda.set_device(0)
+        fn()
+        done.append(True)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    if not done:
+        raise RuntimeError("worker thread failed")
+
+
 def case_h4_thread_memcpy(fdry, x, stream, archive):
     """Another thread draws from the default generator on the capturing stream and the
     graph reads the state through a copy (no kernel holds the address by value)."""
 
     def body():
         buf = torch.zeros(1, dtype=torch.int64, device="cuda")  # graph pool (this thread)
-        done = []
 
-        def worker():
-            torch.cuda.set_device(0)
+        def draw():
             with torch.cuda.stream(stream):
                 _, off, _ = torch.cuda.default_generators[0].philox_state(4)
                 buf.copy_(off)  # a copy node, no allocation on the worker
-                done.append(True)
 
-        t = threading.Thread(target=worker)
-        t.start()
-        t.join()
-        if not done:
-            raise RuntimeError("worker thread failed")
+        _on_worker(draw)
         return [buf + 0]
 
     g, o = _capture(fdry, body, mode="relaxed")
     return [("g", g, o)], ["g"]
 
 
-def case_raise_then_rng(fdry, x, stream, archive):
-    """A capture that raises midway (after an RNG op, the first RNG state of the process),
-    then a normal RNG capture."""
-    bad = fdry.CUDAGraph()
-    try:
-        with fdry.graph(bad):
-            torch.rand_like(x)
-            raise ValueError("body failed")
-    except ValueError:
-        pass
-    g, o = _capture(fdry, _rng_body(x))
+def case_s1_thread_freed(fdry, x, stream, archive):
+    """The body frees two 8 B default-pool blocks, then another thread draws from the
+    default generator on the capturing stream: its state can take the freed addresses."""
+
+    def body():
+        buf = torch.empty_like(x)  # graph pool (this thread)
+        _KEEP.clear()
+
+        def draw():
+            with torch.cuda.stream(stream):
+                buf.uniform_()
+
+        _on_worker(draw)
+        return [buf + 0]
+
+    g, o = _capture(fdry, body, mode="relaxed")
     return [("g", g, o)], ["g"]
 
 
@@ -244,31 +333,46 @@ def _run_load(archive, case):
 def _save_then_load(tmp_path, case):
     out = run_phase(__file__, "save", tmp_path, case)
     if "OUTCOME refused:" in out:
-        assert "foundry capture: unsupported:" in out or "non-default stream" in out, out[-2000:]
-        return "refused"
+        line = out[out.index("OUTCOME refused:") :].splitlines()[0]
+        assert "foundry capture: unsupported:" in line or "non-default stream" in line, line
+        return "refused", line
     assert "OUTCOME saved" in out, out[-2000:]
     assert "OUTCOME pair_reused" not in out, out[-2000:]
     assert "OUTCOME load bitwise" in run_phase(__file__, "load", tmp_path, case)
-    return "saved"
+    return "saved", ""
 
 
-@pytest.mark.parametrize(
-    "case",
-    ["multi", "h1_reuse", "h1_unaccounted", "c3_pair_reuse", "raise_then_rng", "h4_thread_memcpy"],
-)
-def test_rng_handled_or_refused(tmp_path, case):
-    _save_then_load(tmp_path, case)
+POISONED = "ended without being saved after its record window allocated"
+THREAD = "not in Foundry's RNG pool" if not PREALLOCATED_PAIRS else None
+EXPECTED = {
+    "multi": ("saved", None),
+    "h1_reuse": ("saved", None),
+    "h1_live_reuse": ("saved", None),
+    "c3_pair_reuse": ("saved", None),
+    "raise_before_alloc": ("saved", None),
+    "eager_rng": ("saved", None),
+    # A capture that failed after its window allocated: every later capture is refused.
+    "h1_unaccounted": ("refused", POISONED),
+    "rng_then_refused_then_rng": ("refused", POISONED),
+    "raise_then_rng": ("refused", POISONED),
+    "rng_then_raise_then_rng": ("refused", POISONED),
+    "h3_no_requested_size": ("refused", "has no 'requested_size' field"),
+    "custom_generator": ("refused", "not the default CUDA generator's seed/offset pair"),
+    "default_stream": ("refused", "non-default stream"),
+    # 2.14/2.15: the other thread's state is created in its default pool, refused;
+    # 2.16: it claims a pair capture_begin pre-allocated in the RNG pool, archived.
+    "h4_thread_memcpy": ("refused", THREAD) if THREAD else ("saved", None),
+    "s1_thread_freed": ("refused", THREAD) if THREAD else ("saved", None),
+}
 
 
-@pytest.mark.parametrize("case", ["h3_no_requested_size", "custom_generator", "default_stream"])
-def test_rng_refused(tmp_path, case):
-    assert _save_then_load(tmp_path, case) == "refused"
-
-
-def test_rng_follows_eager_counter(tmp_path):
-    """Loaded graphs take (seed, offset) from torch's default generator per replay, like
-    torch's own replay: eager RNG before the replays shifts both alike."""
-    _save_then_load(tmp_path, "eager_rng")
+@pytest.mark.parametrize("case", list(EXPECTED))
+def test_rng_case(tmp_path, case):
+    want, message = EXPECTED[case]
+    got, line = _save_then_load(tmp_path, case)
+    assert got == want, f"{case}: {got} ({line}), expected {want}"
+    if message is not None:
+        assert message in line, line
 
 
 if __name__ == "__main__":

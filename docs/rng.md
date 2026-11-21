@@ -9,11 +9,14 @@ from that generator and advances it by the increment, as torch's own replay does
 Refused at SAVE (`foundry capture: unsupported: ...`):
 
 - RNG from a `torch.Generator` other than the device's default generator
-- RNG drawn on the capturing stream from a thread other than the capturing one
+- RNG drawn on the capturing stream from a thread other than the capturing one (torch 2.14 /
+  2.15; on 2.16 such a draw takes a pair torch pre-allocated and is saved)
 - allocations on a non-capturing stream inside the capture body
 - a CUDA allocator backend other than `native`
 - a torch whose `memory_snapshot()` lacks `segment_pool_id` / `requested_size`, or whose
   capture RNG state fails the SAVE-time self-test
-- graphs that use RNG state allocated in a capture that was refused or raised
+- any capture after a capture that failed (was refused, or its body raised) once its record
+  window had allocated memory: LOAD cannot reproduce that allocation
+- saving an RNG graph before the graph whose capture allocated Foundry's RNG pool segment
 
 torch refuses captures on the default stream.
