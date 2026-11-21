@@ -716,10 +716,15 @@ class graph:
         # torch.cuda.empty_cache()
 
         self.stream_ctx.__enter__()
-        self.cuda_graph.capture_begin(
-            *self.pool,
-            capture_error_mode=self.capture_error_mode,
-        )
+        try:
+            self.cuda_graph.capture_begin(
+                *self.pool,
+                capture_error_mode=self.capture_error_mode,
+            )
+        except BaseException:
+            # __exit__ does not run when __enter__ raises: restore the caller's stream.
+            self.stream_ctx.__exit__(*sys.exc_info())
+            raise
 
     def __exit__(self, exc_type, exc, tb) -> None:
         try:
