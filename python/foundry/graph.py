@@ -188,6 +188,11 @@ _RNG_HELD: dict[int, list] = {}
 _RNG_LIVE: dict[int, set[int]] = {}
 # Per device: None = the RNG self-test passed, else its error message.
 _RNG_SELF_TEST: dict[int, str | None] = {}
+# SAVE: adopted captures whose record window made driver allocations and that are not saved
+# yet: capture sequence number -> bytes. LOAD replays the windows of the saved graphs in
+# save order, so a graph must not be saved after such an earlier capture was skipped.
+_UNSAVED_WINDOWS: dict[int, int] = {}
+_CAPTURE_SEQ = [0]
 # Set when a capture ended without being adopted after its record window allocated driver
 # memory: SAVE's allocation cursor has moved past memory no archive records, which LOAD
 # (where no capture is aborted) never allocates, so every later allocation and graph of
@@ -412,6 +417,11 @@ class CUDAGraph(ops.CUDAGraph):
             native.raw_cuda_graph(), graph_pool, generators, candidates
         )
         self._adopted = True
+        self._capture_seq = _CAPTURE_SEQ[0]
+        _CAPTURE_SEQ[0] += 1
+        allocated = ops.get_current_alloc_offset() - self._alloc_offset_before
+        if allocated:
+            _UNSAVED_WINDOWS[self._capture_seq] = allocated
         if archived:
             self._native_rng = {
                 "seed_ptr": pair[0],
@@ -486,7 +496,21 @@ class CUDAGraph(ops.CUDAGraph):
     def raw_cuda_graph(self) -> int:
         return super().raw_cuda_graph()
 
+    _capture_seq = None
+
     def save(self, json_path: str, output_tensors: OutputTensors | None = None) -> None:
+        seq = self._capture_seq
+        if seq is not None:
+            skipped = sorted(k for k in _UNSAVED_WINDOWS if k < seq)
+            if skipped:
+                k = skipped[0]
+                raise CaptureUnsupported(
+                    f"foundry save: unsupported: capture #{k} (before this graph, #{seq}) "
+                    f"allocated {_UNSAVED_WINDOWS[k]} bytes of driver memory in its record window "
+                    "and was not saved before this graph: LOAD replays the windows of the saved "
+                    "graphs in save order and would place this graph's memory elsewhere (save "
+                    "every capture whose window allocated, in capture order)"
+                )
         try:
             super().save(json_path, output_tensors)
         except RuntimeError as e:
@@ -494,6 +518,8 @@ class CUDAGraph(ops.CUDAGraph):
             if converted is not e:
                 raise converted from e
             raise
+        if seq is not None:
+            _UNSAVED_WINDOWS.pop(seq, None)
 
     @staticmethod
     def load(
