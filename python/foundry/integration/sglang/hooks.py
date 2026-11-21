@@ -463,12 +463,14 @@ def capture_one(shape_key, forward_fn, *, pool, stream):
     # (pins.ENV_PINS), as it refuses to trace inside a capture.
     from foundry.integration.sglang.graph_ops import save_graph
 
-    graph, out = _save_capture(shape_key, variant, forward_fn, pool=pool, stream=stream)
-    if req_slots is not None:
-        save_graph(graph, out, shape_key, prefill_req_slots=req_slots)
-    else:
-        save_graph(graph, out, shape_key, kind=kind)
-    return graph, out
+    def save(graph, out):
+        if req_slots is not None:
+            save_graph(graph, out, shape_key, prefill_req_slots=req_slots)
+        else:
+            save_graph(graph, out, shape_key, kind=kind)
+
+    # The save runs before the vote: a save-time refusal falls back like a capture-time one.
+    return _save_capture(shape_key, variant, forward_fn, pool=pool, stream=stream, save=save)
 
 
 # SAVE: the dispatchers and logits processors of the current scope's model,
@@ -494,7 +496,7 @@ def _graph_variant(shape_key) -> str | None:
     return None
 
 
-def _save_capture(shape_key, variant, forward_fn, *, pool, stream):
+def _save_capture(shape_key, variant, forward_fn, *, pool, stream, save=None):
     """SAVE: capture one shape, unless it is unsupported on any rank: a
     graph variant, or the capture created an attribute of a
     dispatcher or logits processor. Such an attribute lives in graph-pool
@@ -502,9 +504,10 @@ def _save_capture(shape_key, variant, forward_fn, *, pool, stream):
     capture builds it in its eager warmup; so the graph is discarded, the
     attributes are reset and :class:`Unsupported` lets SGLang capture this
     shape and the rest natively (the graphs captured before stay valid). A
-    capture Foundry itself refuses (:class:`foundry.CaptureUnsupported`) takes the
-    same path; no Foundry capture follows the fallback, so Foundry's refusal of
-    every capture after a failed one never fires here."""
+    capture Foundry itself refuses (:class:`foundry.CaptureUnsupported`), at capture
+    or when ``save`` archives it (before the vote), takes the same path; no Foundry
+    capture follows the fallback, so Foundry's refusal of every capture after a failed
+    one never fires here."""
     from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
 
     from foundry.graph import CaptureUnsupported
@@ -542,6 +545,11 @@ def _save_capture(shape_key, variant, forward_fn, *, pool, stream):
                 key if n == 1 else f"{key} ({n} objects)" for key, n in counts.items()
             )
             reason = f"{names} created during graph capture"
+        if reason is None and save is not None:
+            try:
+                save(graph, out)
+            except CaptureUnsupported as e:
+                reason = str(e)
     try:
         agree_unsupported("capture", reason)
     except Unsupported:
