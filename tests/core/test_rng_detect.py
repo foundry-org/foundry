@@ -404,7 +404,10 @@ EXPECTED = {
     "h1_reuse": ("saved", None),
     "h1_live_reuse": ("saved", None),
     "c3_pair_reuse": ("saved", None),
-    "raise_before_alloc": ("saved", None),
+    # 2.16 pre-allocates the pairs in capture_begin on the capturing stream: a segment of
+    # the RNG pool for that stream (the reserved one is the default stream's), so even this
+    # window allocated.
+    "raise_before_alloc": ("refused", POISONED) if PREALLOCATED_PAIRS else ("saved", None),
     "eager_rng": ("saved", None),
     # A capture that failed after its window allocated: every later capture is refused.
     "h1_unaccounted": ("refused", POISONED),
