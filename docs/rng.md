@@ -6,7 +6,8 @@ its seed/offset buffers and its offset increment. On LOAD each replay takes (see
 from that generator and advances it by the increment, as torch's own replay does, so
 `torch.manual_seed` and eager RNG in the LOAD process apply to loaded graphs too.
 
-Refused at SAVE (`foundry capture: unsupported: ...`):
+SAVE refuses, with `foundry.CaptureUnsupported` (a `RuntimeError`; message
+`foundry capture: unsupported: ...` or `foundry save: unsupported: ...`):
 
 - RNG from a `torch.Generator` other than the device's default generator
 - RNG drawn on the capturing stream from a thread other than the capturing one (torch 2.14 /
@@ -17,9 +18,16 @@ Refused at SAVE (`foundry capture: unsupported: ...`):
   capture RNG state fails the SAVE-time self-test
 - any capture after a capture that failed (was refused, or its body raised) once its record
   window had allocated memory: LOAD cannot reproduce that allocation
-- saving an RNG graph before the graph whose capture allocated Foundry's RNG pool segment
+- saving a graph after an earlier capture whose record window allocated memory was left
+  unsaved (save every such capture, in capture order)
 
-torch refuses captures on the default stream.
+The SGLang integration turns these refusals into its native fallback. torch refuses
+captures on the default stream.
+
+Memory: Foundry's RNG pool takes one 2 MiB segment per device, created by
+`foundry.reserve_rng_pool()` right after `set_allocation_region` on SAVE and LOAD alike,
+plus about 1 KiB per live capture on SAVE (its seed/offset pair; another 2 MiB segment per
+~2048 live captures, allocated inside the capture that needs it).
 
 Unsupported and not detected:
 
