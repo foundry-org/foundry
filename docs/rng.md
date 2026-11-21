@@ -19,15 +19,23 @@ SAVE refuses, with `foundry.CaptureUnsupported` (a `RuntimeError`; message
 - any capture after a capture that failed (was refused, or its body raised) once its record
   window had allocated memory: LOAD cannot reproduce that allocation
 - saving a graph after an earlier capture whose record window allocated memory was left
-  unsaved (save every such capture, in capture order)
+  unsaved, or before a graph captured earlier (save graphs in capture order)
+- `reserve_rng_pool()` after a capture began, or on a torch whose `philox_state` outside
+  capture does not return the current seed/offset and advance it by the increment
+- expandable segments (`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`) in Foundry's
+  RNG pool
 
-The SGLang integration turns these refusals into its native fallback. torch refuses
-captures on the default stream.
+The SGLang integration turns these refusals, at capture or at save, into its native
+fallback. torch refuses captures on the default stream.
 
 Memory: Foundry's RNG pool takes one 2 MiB segment per device, created by
 `foundry.reserve_rng_pool()` right after `set_allocation_region` on SAVE and LOAD alike,
 plus about 1 KiB per live capture on SAVE (its seed/offset pair; another 2 MiB segment per
-~2048 live captures, allocated inside the capture that needs it).
+~2048 live captures, allocated inside the capture that needs it). With torch 2.16 the pairs
+are pre-allocated on the capturing stream, so the first capture on each stream also
+allocates a 2 MiB segment for that stream inside its window. The reserved 2 MiB is taken
+before an engine measures free memory, so memory-sized pools (SGLang's KV cache) come out
+slightly smaller.
 
 Unsupported and not detected:
 
