@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import weakref
 from collections.abc import Callable
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -159,17 +160,16 @@ def _stray_message(strays: dict[int, _Block]) -> str:
     )
 
 
-# SAVE: what Foundry keeps alive in its RNG pool for the process, per device: the
-# seed/offset pair of every capture that claimed one (philox_state aliases: the archived
-# address of one graph's pair is never handed to another graph's state, and no pair can
-# be freed inside a later capture and reused by that capture's state unseen) and what the
-# RNG self-test left there. Every other live block of the pool (state of a refused
-# capture) is unaccounted for.
+# SAVE, per device: the RNG-pool blocks accounted for. HELD: kept alive for the process
+# (the archived seed/offset pairs, as philox_state aliases, and what the self-test left):
+# never freed, so no later state takes an archived address. LIVE: pairs of captures that
+# archive none, alive as long as torch's graph keeps its capture state (removed by a
+# finaliser on that graph); a LIVE address that disappears during a capture was freed
+# inside it and may hold that capture's state.
 _RNG_HELD: dict[int, list] = {}
+_RNG_LIVE: dict[int, set[int]] = {}
 # Per device: None = the RNG self-test passed, else its error message.
 _RNG_SELF_TEST: dict[int, str | None] = {}
-
-
 def _held_addresses(device: int) -> set[int]:
     return {
         t.data_ptr() if isinstance(t, torch.Tensor) else t
@@ -179,11 +179,12 @@ def _held_addresses(device: int) -> set[int]:
 
 
 def _rng_self_test(device: int, pool: torch.cuda.MemPool) -> str | None:
-    """Once per process and device, inside the first capture's record window (so LOAD maps
-    what it allocates): torch must put a capture's default-generator RNG state into the
-    pool routed with use_mem_pool, philox_state must return it, and the graph must hold its
-    address where the kernel-parameter scan finds it. Everything stays alive (no reuse).
-    Returns None, or what failed."""
+    """Once per process and device, at the end of the first capture, inside its record
+    window and after that capture's own seed/offset pair exists (so it shares the RNG
+    pool's segment and adds no segment of its own): torch must put a capture's
+    default-generator state into the pool routed with use_mem_pool, philox_state must
+    return it with the consumed offset, and the graph must hold its address where the
+    kernel-parameter scan finds it. Everything stays alive. Returns None, or what failed."""
     pool_id = tuple(pool.id)
     gen = torch.cuda.default_generators[device]
     before = set(_live_blocks())
@@ -191,7 +192,7 @@ def _rng_self_test(device: int, pool: torch.cuda.MemPool) -> str | None:
     native = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.use_mem_pool(pool):
         # The draw goes in place into a tensor of the RNG pool, on the default stream like
-        # torch's state (one segment), so the graph's own pool stays empty.
+        # torch's state (same segment), so the self-test graph's own pool stays empty.
         with torch.cuda.stream(torch.cuda.default_stream(device)):
             out = torch.empty(4, device=device)
         side.wait_stream(torch.cuda.current_stream(device))
@@ -251,32 +252,21 @@ class CUDAGraph(ops.CUDAGraph):
                 "(PYTORCH_CUDA_ALLOC_CONF backend:native is required: Foundry routes and finds "
                 "torch's capture RNG state through caching-allocator pools)"
             )
+        if _RNG_SELF_TEST.get(device):
+            raise _unsupported_torch(
+                f"RNG self-test capture of Tensor.uniform_: {_RNG_SELF_TEST[device]}"
+            )
         native = torch.cuda.CUDAGraph(keep_graph=True)
         self._native_capture_stream = torch.cuda.current_stream().cuda_stream
         rng_pool = _rng_pool(device)
         self._rng_pool_id = tuple(rng_pool.id)
+        # Blocks live before the capture: anything new at capture end was created by this
+        # capture (or by another thread meanwhile).
+        self._blocks_before = _live_blocks()
+        self._rng_live_before = set(_RNG_LIVE.get(device, ()))
         # Hook record window: opened before torch's beginAllocateToPool, closed by
         # adopt_native_capture after torch's endAllocateToPool (same as capture_begin/_end).
         ops.native_record_begin()
-        try:
-            if device not in _RNG_SELF_TEST:
-                _RNG_SELF_TEST[device] = _rng_self_test(device, rng_pool)
-            if _RNG_SELF_TEST[device] is not None:
-                raise _unsupported_torch(
-                    f"RNG self-test capture of Tensor.uniform_: {_RNG_SELF_TEST[device]}"
-                )
-            # Blocks live before the capture: anything new at capture end was created by
-            # this capture (or by another thread meanwhile).
-            self._blocks_before = _live_blocks()
-        except BaseException:
-            ops.native_record_abort()
-            raise
-        # Live RNG-pool blocks Foundry does not hold could be freed inside this capture and
-        # their addresses reused by this capture's state, unseen by the difference above.
-        held = _held_addresses(device)
-        self._rng_unaccounted = {
-            a for a, b in self._blocks_before.items() if b.pool == self._rng_pool_id and a not in held
-        }
         # Opened before torch's capture scope: the allocator searches its routing scopes
         # last-in first-out, so the capture's own (capturing-stream) filter still wins for
         # everything captured; only this thread's allocations on non-capturing streams
@@ -287,110 +277,111 @@ class CUDAGraph(ops.CUDAGraph):
             native.capture_begin(pool=pool, capture_error_mode=capture_error_mode)
         except BaseException:
             route.__exit__(*sys.exc_info())
-            ops.native_record_abort()
+            self._record_abort()
             raise
         self._rng_route = route
         self._native_graph = native
+
+    def _record_abort(self, discard_window: bool = True) -> None:
+        """A capture failed: discard its record window (unless adopt already closed it)."""
+        if discard_window:
+            ops.native_record_abort()
 
     def capture_end(self) -> None:
         native = self._native_graph
         if native is None:
             raise RuntimeError("capture_end() without capture_begin()")
+        try:
+            self._capture_end(native)
+        except BaseException:
+            self._record_abort(discard_window=not self._adopted)
+            raise
+
+    _adopted = False
+
+    def _capture_end(self, native) -> None:
         device = torch.cuda.current_device()
         gen = torch.cuda.default_generators[device]
         rng_pool_id = self._rng_pool_id
         before = self._blocks_before
-        philox = None
+        # Still capturing, on every torch version: philox_state returns aliases of the
+        # default generator's seed/offset buffers of this capture (created now in the RNG
+        # pool if no RNG op ran, by whichever thread created them otherwise) and the offset
+        # consumed so far = torch's wholegraph_increment (v2.14.1 CUDAGeneratorImpl.cpp:516-536).
         try:
-            try:
-                # Does the default generator hold RNG state for this capture? Torch creates
-                # it in the RNG pool (2.14/2.15: lazily at the first RNG op, on the default
-                # stream; 2.16: capture_begin's pre-allocated pairs); another thread creates
-                # it in its default pool. Any new block in the RNG pool, any new int64[1]
-                # block in a default pool, or an RNG-pool block that may have been freed and
-                # reused inside the capture: ask. Still capturing, philox_state returns
-                # aliases of the default generator's seed/offset buffers of this capture
-                # (creating them in the RNG pool if absent) and the offset consumed so far =
-                # torch's wholegraph_increment (v2.14.1 CUDAGeneratorImpl.cpp:516-536).
-                # Otherwise no RNG ran in this capture and nothing is created.
-                now = _live_blocks()
-                new = {a: b for a, b in now.items() if a not in before}
-                if (
-                    self._rng_unaccounted
-                    or any(b.pool == rng_pool_id for b in new.values())
-                    or any(b.pool == (0, 0) and b.requested == 8 for b in new.values())
-                ):
-                    philox = gen.philox_state(0)
-                native.capture_end()
-            finally:
-                self._rng_route.__exit__(None, None, None)
-                self._rng_route = None
-        except BaseException:
-            ops.native_record_abort()
-            raise
+            seed_buf, offset_buf, intragraph = gen.philox_state(0)
+            native.capture_end()
+        finally:
+            self._rng_route.__exit__(None, None, None)
+            self._rng_route = None
+        pair = (seed_buf.data_ptr(), offset_buf.data_ptr())
+        if device not in _RNG_SELF_TEST:
+            # After this capture's pair exists: the self-test shares its segment.
+            _RNG_SELF_TEST[device] = _rng_self_test(device, _rng_pool(device))
+            if _RNG_SELF_TEST[device] is not None:
+                raise _unsupported_torch(
+                    f"RNG self-test capture of Tensor.uniform_: {_RNG_SELF_TEST[device]}"
+                )
         graph_pool = tuple(native.pool())
         now = _live_blocks()
         new = {a: b for a, b in now.items() if a not in before}
-        generators = []
-        pair = set()
-        if philox is not None:
-            seed_buf, offset_buf, intragraph = philox
-            increment = int(intragraph.item())
-            seed = gen.initial_seed()
-            self._native_rng = {
-                "seed_ptr": seed_buf.data_ptr(),
-                "offset_ptr": offset_buf.data_ptr(),
-                "increment": increment,
-                "seed": seed,
-            }
-            pair = {seed_buf.data_ptr(), offset_buf.data_ptr()}
-            # Kept for the process: no later state (of this or another capture) can take
-            # these addresses while this graph's archive refers to them.
-            _RNG_HELD.setdefault(device, []).extend((seed_buf, offset_buf))
-            del seed_buf, offset_buf, philox
-            outside = [a for a in sorted(pair) if a not in now or now[a].pool != rng_pool_id]
-            if outside:
-                ops.native_record_abort()
-                raise RuntimeError(
-                    "foundry capture: unsupported: the default generator's capture RNG state "
-                    f"{', '.join(hex(a) for a in outside)} is not in Foundry's RNG pool (RNG "
-                    "drawn on the capturing stream from a thread other than the capturing one)"
-                )
-            generators.append(
-                (
-                    device,
-                    seed,
-                    increment,
-                    _RNG_RECORDED,
-                    self._native_rng["seed_ptr"],
-                    self._native_rng["offset_ptr"],
-                )
+        increment = int(intragraph.item())
+        seed = gen.initial_seed()  # diagnostic only: LOAD takes the seed from torch
+        outside = [a for a in pair if a not in now or now[a].pool != rng_pool_id]
+        if outside:
+            raise RuntimeError(
+                "foundry capture: unsupported: the default generator's capture RNG state "
+                f"{', '.join(hex(a) for a in outside)} is not in Foundry's RNG pool (RNG drawn "
+                "on the capturing stream from a thread other than the capturing one)"
             )
-        # Candidates: every RNG-pool block that may hold this capture's RNG state (created
-        # during the capture, or live but not held by Foundry, so possibly freed and reused
-        # inside it: compared by address that looks unchanged) and every int64[1] block
-        # created during the capture outside the graph pool (RNG state another thread
-        # created). adopt scans every kernel parameter (and copy/memset address) of the raw
-        # graph for them by value: a read one that is not the default generator's pair is
-        # refused; the pair must lie in a driver allocation Foundry recorded (the RNG pool's
-        # segment), which LOAD maps by replaying the recorded events and writes (seed,
-        # offset) into per replay. The graph pool holds the body's tensors (int64 scalars
-        # too), never RNG state.
+        generators = [(device, seed, increment, _RNG_RECORDED, pair[0], pair[1])]
+        # Candidates: blocks that may hold RNG state of this capture other than the default
+        # pair: RNG-pool blocks created during the capture, RNG-pool pairs of other captures
+        # freed during it (their address may have been reused unseen), and int64[1] blocks
+        # created during it in torch's default pools (state another thread created). The
+        # self-test's blocks are held and excluded. adopt scans every kernel parameter (and
+        # copy/memset address) of the raw graph for them by value and refuses a read one; it
+        # archives the default pair only if the graph reads it. The graph pool holds the
+        # body's tensors (int64 scalars too), never RNG state; other user pools are not
+        # touched by torch's RNG.
+        held = _held_addresses(device)
+        freed_live = self._rng_live_before - _RNG_LIVE.get(device, set())
         candidates = sorted(
             {
                 a
                 for a, b in new.items()
-                if b.pool == rng_pool_id or (b.requested == 8 and b.pool != graph_pool)
+                if a not in held
+                and (b.pool == rng_pool_id or (b.requested == 8 and b.pool == (0, 0)))
             }
-            | {a for a in self._rng_unaccounted if a in now}
+            | {a for a in freed_live if a in now}
         )
-        super().adopt_native_capture(native.raw_cuda_graph(), native.pool(), generators, candidates)
+        archived = super().adopt_native_capture(
+            native.raw_cuda_graph(), graph_pool, generators, candidates
+        )
+        self._adopted = True
+        if archived:
+            self._native_rng = {
+                "seed_ptr": pair[0],
+                "offset_ptr": pair[1],
+                "increment": increment,
+                "seed": seed,
+            }
+            # Kept for the process: no later state can take an archived address.
+            _RNG_HELD.setdefault(device, []).extend((seed_buf, offset_buf))
+        else:
+            # Alive as long as torch's graph keeps the capture state.
+            live = _RNG_LIVE.setdefault(device, set())
+            live.update(pair)
+            weakref.finalize(native, live.difference_update, pair)
+        del seed_buf, offset_buf
         # The RNG pool must hold nothing new from this capture but torch's RNG state: anything
         # else this thread allocated on a non-capturing stream inside the routing scope (in
         # the body, or in torch's Python capture-end hooks, which run after the capture's own
         # routing ended) is memory SAVE's later code may bake into graphs but that LOAD's
         # torch never allocates; an unread int64[1] there is another generator's state.
-        strays = {a: b for a, b in new.items() if b.pool == rng_pool_id and a not in pair}
+        strays = {
+            a: b for a, b in new.items() if b.pool == rng_pool_id and a not in set(pair) | held
+        }
         if strays:
             raise RuntimeError(
                 "foundry capture: unsupported: allocation(s) on a non-capturing stream during "
@@ -401,9 +392,7 @@ class CUDAGraph(ops.CUDAGraph):
     def _abort_capture(self) -> None:
         """End a capture whose body raised without adopting it: torch's capture is ended
         (its errors are dropped, the body's exception is the one that propagates) and the
-        hook record window is discarded. Memory the capture allocated stays allocated on
-        SAVE but is in no archive, so later graphs that use it (an RNG-pool segment
-        allocated in this window) are refused at SAVE."""
+        hook record window is discarded."""
         native = self._native_graph
         if native is None:
             return
@@ -415,7 +404,7 @@ class CUDAGraph(ops.CUDAGraph):
             if self._rng_route is not None:
                 self._rng_route.__exit__(None, None, None)
                 self._rng_route = None
-            ops.native_record_abort()
+            self._record_abort()
 
     def replay(self) -> None:
         if self._native_graph is not None:
