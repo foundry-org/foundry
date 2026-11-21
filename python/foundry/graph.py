@@ -271,6 +271,7 @@ _RNG_SELF_TEST: dict[int, str | None] = {}
 # save order, so a graph must not be saved after such an earlier capture was skipped.
 _UNSAVED_WINDOWS: dict[int, int] = {}
 _CAPTURE_SEQ = [0]
+_LAST_SAVED_SEQ = [-1]
 # Set when a capture ended without being adopted after its record window allocated driver
 # memory: SAVE's allocation cursor has moved past memory no archive records, which LOAD
 # (where no capture is aborted) never allocates, so every later allocation and graph of
@@ -585,6 +586,12 @@ class CUDAGraph(ops.CUDAGraph):
 
     def save(self, json_path: str, output_tensors: OutputTensors | None = None) -> None:
         seq = self._capture_seq
+        if seq is not None and seq < _LAST_SAVED_SEQ[0]:
+            raise CaptureUnsupported(
+                f"foundry save: unsupported: capture #{seq} saved after capture "
+                f"#{_LAST_SAVED_SEQ[0]}: LOAD replays the saved graphs' windows in save order and "
+                "its region cursor only moves forward (save graphs in capture order)"
+            )
         if seq is not None:
             skipped = sorted(k for k in _UNSAVED_WINDOWS if k < seq)
             if skipped:
@@ -605,6 +612,7 @@ class CUDAGraph(ops.CUDAGraph):
             raise
         if seq is not None:
             _UNSAVED_WINDOWS.pop(seq, None)
+            _LAST_SAVED_SEQ[0] = max(_LAST_SAVED_SEQ[0], seq)
 
     @staticmethod
     def load(
