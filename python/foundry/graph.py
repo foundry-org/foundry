@@ -170,6 +170,13 @@ _RNG_HELD: dict[int, list] = {}
 _RNG_LIVE: dict[int, set[int]] = {}
 # Per device: None = the RNG self-test passed, else its error message.
 _RNG_SELF_TEST: dict[int, str | None] = {}
+# Set when a capture ended without being adopted after its record window allocated driver
+# memory: SAVE's allocation cursor has moved past memory no archive records, which LOAD
+# (where no capture is aborted) never allocates, so every later allocation and graph of
+# this process would sit at other addresses than on LOAD.
+_POISONED: str | None = None
+
+
 def _held_addresses(device: int) -> set[int]:
     return {
         t.data_ptr() if isinstance(t, torch.Tensor) else t
@@ -238,6 +245,8 @@ class CUDAGraph(ops.CUDAGraph):
     ) -> None:
         if self._native_graph is not None:
             raise RuntimeError("This CUDAGraph instance already owns a captured graph.")
+        if _POISONED is not None:
+            raise RuntimeError(f"foundry capture: unsupported: {_POISONED}")
         device = torch.cuda.current_device()
         gen = torch.cuda.default_generators[device]
         if not hasattr(gen, "philox_state"):
@@ -264,6 +273,7 @@ class CUDAGraph(ops.CUDAGraph):
         # capture (or by another thread meanwhile).
         self._blocks_before = _live_blocks()
         self._rng_live_before = set(_RNG_LIVE.get(device, ()))
+        self._alloc_offset_before = ops.get_current_alloc_offset()
         # Hook record window: opened before torch's beginAllocateToPool, closed by
         # adopt_native_capture after torch's endAllocateToPool (same as capture_begin/_end).
         ops.native_record_begin()
@@ -283,9 +293,20 @@ class CUDAGraph(ops.CUDAGraph):
         self._native_graph = native
 
     def _record_abort(self, discard_window: bool = True) -> None:
-        """A capture failed: discard its record window (unless adopt already closed it)."""
+        """A capture failed: discard its record window (unless adopt already closed it; the
+        refused graph is never saved either way). If the window allocated driver memory,
+        SAVE can no longer match LOAD: refuse every later capture."""
+        global _POISONED
         if discard_window:
             ops.native_record_abort()
+        moved = ops.get_current_alloc_offset() - self._alloc_offset_before
+        if moved and _POISONED is None:
+            _POISONED = (
+                f"an earlier capture of this process ended without being saved after its record "
+                f"window allocated {moved} bytes of driver memory; LOAD cannot reproduce that "
+                "allocation, so no later graph of this SAVE would load at its addresses "
+                "(restart SAVE without the failing capture)"
+            )
 
     def capture_end(self) -> None:
         native = self._native_graph
@@ -392,7 +413,7 @@ class CUDAGraph(ops.CUDAGraph):
     def _abort_capture(self) -> None:
         """End a capture whose body raised without adopting it: torch's capture is ended
         (its errors are dropped, the body's exception is the one that propagates) and the
-        hook record window is discarded."""
+        hook record window is discarded (see _record_abort)."""
         native = self._native_graph
         if native is None:
             return
