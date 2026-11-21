@@ -1345,8 +1345,10 @@ static Tensor reconstruct_tensor_from_metadata(const boost::json::object& obj) {
 void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_tensors,
                      OutputTensorType output_type) {
   FOUNDRY_CHECK(!graph_nodes.empty(), "Graph hasn't been captured yet or has no nodes");
-  if (allocator_events_.contains("events")) {
+  if (!saved_events_noted_ && allocator_events_.contains("events")) {
+    // Once: a graph saved again (another path, binary) adds no new window to LOAD's sequence.
     foundry::note_saved_hook_events(allocator_events_);
+    saved_events_noted_ = true;
   }
   // LOAD maps exactly the driver allocations recorded in the windows of the graphs loaded so
   // far (= saved so far, in this order): the archived RNG pair must be in one of them.

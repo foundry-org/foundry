@@ -364,6 +364,7 @@ struct CUDAGraph {
   AttrQueryStats attr_query_stats_;
 
   boost::json::object allocator_events_;
+  bool saved_events_noted_ = false;  // SAVE: allocator_events_ noted as recorded (first save)
 
   struct LoadedGraphResources {
     std::vector<CUevent> created_events;
