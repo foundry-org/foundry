@@ -124,8 +124,26 @@ def _rng_pool(device: int) -> torch.cuda.MemPool:
     return pool
 
 
+class CaptureUnsupported(RuntimeError):
+    """SAVE refused a capture (or the save of a captured graph) that Foundry cannot persist
+    correctly; the message starts with "foundry capture: unsupported:" (or "foundry save:
+    unsupported:") and names the reason. Integrations fall back to native capture."""
+
+
+_UNSUPPORTED_PREFIXES = ("foundry capture: unsupported:", "foundry save: unsupported:")
+
+
+def _as_capture_unsupported(e: BaseException) -> BaseException:
+    """The CaptureUnsupported for a refusal raised as a plain RuntimeError (the C++ checks)."""
+    if isinstance(e, RuntimeError) and not isinstance(e, CaptureUnsupported):
+        text = str(e)
+        if any(p in text for p in _UNSUPPORTED_PREFIXES):
+            return CaptureUnsupported(text[text.index("foundry ") :])
+    return e
+
+
 def _unsupported_torch(what: str) -> RuntimeError:
-    return RuntimeError(
+    return CaptureUnsupported(
         f"foundry capture: unsupported: torch {torch.__version__}: {what} (Foundry's RNG state "
         "detection depends on it)"
     )
@@ -248,17 +266,17 @@ class CUDAGraph(ops.CUDAGraph):
         if self._native_graph is not None:
             raise RuntimeError("This CUDAGraph instance already owns a captured graph.")
         if _POISONED is not None:
-            raise RuntimeError(f"foundry capture: unsupported: {_POISONED}")
+            raise CaptureUnsupported(f"foundry capture: unsupported: {_POISONED}")
         device = torch.cuda.current_device()
         gen = torch.cuda.default_generators[device]
         if not hasattr(gen, "philox_state"):
-            raise RuntimeError(
-                "foundry native capture: unsupported torch "
-                f"{torch.__version__} (needs Generator.philox_state, torch >= 2.14)"
+            raise CaptureUnsupported(
+                f"foundry capture: unsupported: torch {torch.__version__} (needs "
+                "Generator.philox_state, torch >= 2.14)"
             )
         backend = torch.cuda.get_allocator_backend()
         if backend != "native":
-            raise RuntimeError(
+            raise CaptureUnsupported(
                 f"foundry capture: unsupported: CUDA allocator backend {backend!r} "
                 "(PYTORCH_CUDA_ALLOC_CONF backend:native is required: Foundry routes and finds "
                 "torch's capture RNG state through caching-allocator pools)"
@@ -316,8 +334,11 @@ class CUDAGraph(ops.CUDAGraph):
             raise RuntimeError("capture_end() without capture_begin()")
         try:
             self._capture_end(native)
-        except BaseException:
+        except BaseException as e:
             self._record_abort(discard_window=not self._adopted)
+            converted = _as_capture_unsupported(e)
+            if converted is not e:
+                raise converted from e
             raise
 
     _adopted = False
@@ -331,12 +352,21 @@ class CUDAGraph(ops.CUDAGraph):
         # default generator's seed/offset buffers of this capture (created now in the RNG
         # pool if no RNG op ran, by whichever thread created them otherwise) and the offset
         # consumed so far = torch's wholegraph_increment (v2.14.1 CUDAGeneratorImpl.cpp:516-536).
+        probe_error = None
         try:
-            seed_buf, offset_buf, intragraph = gen.philox_state(0)
-            native.capture_end()
+            try:
+                seed_buf, offset_buf, intragraph = gen.philox_state(0)
+            except RuntimeError as e:  # e.g. 2.16: "CUDA graph RNG state limit exceeded"
+                probe_error = e
+            native.capture_end()  # torch's capture is closed whatever the probe did
         finally:
             self._rng_route.__exit__(None, None, None)
             self._rng_route = None
+        if probe_error is not None:
+            raise CaptureUnsupported(
+                "foundry capture: unsupported: torch refused the default generator's capture "
+                f"RNG state: {probe_error}"
+            ) from probe_error
         pair = (seed_buf.data_ptr(), offset_buf.data_ptr())
         if device not in _RNG_SELF_TEST:
             # After this capture's pair exists: the self-test shares its segment.
@@ -352,7 +382,7 @@ class CUDAGraph(ops.CUDAGraph):
         seed = gen.initial_seed()  # diagnostic only: LOAD takes the seed from torch
         outside = [a for a in pair if a not in now or now[a].pool != rng_pool_id]
         if outside:
-            raise RuntimeError(
+            raise CaptureUnsupported(
                 "foundry capture: unsupported: the default generator's capture RNG state "
                 f"{', '.join(hex(a) for a in outside)} is not in Foundry's RNG pool (RNG drawn "
                 "on the capturing stream from a thread other than the capturing one)"
@@ -406,7 +436,7 @@ class CUDAGraph(ops.CUDAGraph):
             a: b for a, b in new.items() if b.pool == rng_pool_id and a not in set(pair) | held
         }
         if strays:
-            raise RuntimeError(
+            raise CaptureUnsupported(
                 "foundry capture: unsupported: allocation(s) on a non-capturing stream during "
                 "the capture (they landed in Foundry's RNG pool, not in the graph pool) or RNG "
                 f"state of another generator: {_stray_message(strays)}"
@@ -457,7 +487,13 @@ class CUDAGraph(ops.CUDAGraph):
         return super().raw_cuda_graph()
 
     def save(self, json_path: str, output_tensors: OutputTensors | None = None) -> None:
-        return super().save(json_path, output_tensors)
+        try:
+            super().save(json_path, output_tensors)
+        except RuntimeError as e:
+            converted = _as_capture_unsupported(e)
+            if converted is not e:
+                raise converted from e
+            raise
 
     @staticmethod
     def load(

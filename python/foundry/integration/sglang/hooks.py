@@ -501,9 +501,13 @@ def _save_capture(shape_key, variant, forward_fn, *, pool, stream):
     memory that later graphs and eager forwards would share, where a native
     capture builds it in its eager warmup; so the graph is discarded, the
     attributes are reset and :class:`Unsupported` lets SGLang capture this
-    shape and the rest natively (the graphs captured before stay valid)."""
+    shape and the rest natively (the graphs captured before stay valid). A
+    capture Foundry itself refuses (:class:`foundry.CaptureUnsupported`) takes the
+    same path; no Foundry capture follows the fallback, so Foundry's refusal of
+    every capture after a failed one never fires here."""
     from sglang.srt.model_executor.runner_utils.pool import graph_pool_capture_scope
 
+    from foundry.graph import CaptureUnsupported
     from foundry.integration.sglang.graph_ops import (
         agree_unsupported,
         attribute_snapshot,
@@ -518,11 +522,18 @@ def _save_capture(shape_key, variant, forward_fn, *, pool, stream):
         reason = f"shape {shape_key} is a graph variant ({variant})"
     else:
         before = attribute_snapshot(_snapshot_objects)
-        with graph_pool_capture_scope():
-            graph, out = capture_graph(pool, stream, forward_fn)
+        refused = None
+        try:
+            with graph_pool_capture_scope():
+                graph, out = capture_graph(pool, stream, forward_fn)
+        except CaptureUnsupported as e:
+            # Foundry refused this capture (e.g. RNG state it cannot persist): the same
+            # vote and native fallback as below, with Foundry's message as the reason.
+            refused = e
+            graph = getattr(e, "graph", None)
         created = created_attributes(_snapshot_objects, before)
-        reason = None
-        if created:
+        reason = str(refused) if refused is not None else None
+        if created and refused is None:
             counts: dict[str, int] = {}
             for obj, name, _ in created:
                 key = f"{type(obj).__name__}.{name}"

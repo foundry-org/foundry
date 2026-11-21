@@ -22,6 +22,7 @@ from .allocation_region import (
 
 from .ops import *  # isort: skip
 from .graph import (
+    CaptureUnsupported,
     CUDAGraph,
     LoadedEvent,
     RestoredEvent,
@@ -35,6 +36,7 @@ from .graph import (
 # (We also configure per-file-ignores for F401 in pyproject.toml as a backstop.)
 __all__ = [
     "CUDAGraph",
+    "CaptureUnsupported",
     "LoadedEvent",
     "RestoredEvent",
     "allocation_region",

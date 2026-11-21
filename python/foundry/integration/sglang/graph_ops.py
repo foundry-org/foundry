@@ -18,6 +18,7 @@ import torch
 
 import foundry as foundry_pkg
 from foundry import ops as cge
+from foundry.graph import CaptureUnsupported
 from foundry.graph import CUDAGraph as FoundryCUDAGraph
 from foundry.graph import graph as foundry_graph_ctx
 from foundry.integration.sglang.config import (
@@ -267,8 +268,12 @@ def capture_graph(pool, stream, forward_fn) -> tuple[Any, Any]:
     """SAVE: capture ``forward_fn`` on ``stream`` into ``pool`` as a new
     foundry graph; returns ``(graph, output)``."""
     graph = FoundryCUDAGraph()
-    with foundry_graph_ctx(graph, pool=pool, stream=stream):
-        out = forward_fn()
+    try:
+        with foundry_graph_ctx(graph, pool=pool, stream=stream):
+            out = forward_fn()
+    except CaptureUnsupported as e:
+        e.graph = graph  # the caller keeps it alive (the pool's use count, see hooks)
+        raise
     return graph, out
 
 
