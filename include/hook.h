@@ -71,9 +71,13 @@ void start_hook_record();
 void end_hook_record();
 void clear_hook_events();
 boost::json::object save_hook_events_to_json();
+// SAVE, when a graph is saved: its window's alloc/free events update the set that
+// recorded_allocation_contains() answers from (saved graphs only, in save order = LOAD order).
+void note_saved_hook_events(const boost::json::object& events_obj);
 void replay_hook_events_from_json(const boost::json::object& events_obj);
 // [addr, addr+len) lies inside one driver allocation that a closed record window
-// recorded (SAVE) or replay_hook_events_from_json made (LOAD), not freed since.
+// recorded in saved graphs' windows (SAVE) or replay_hook_events_from_json made (LOAD), not freed
+// since.
 bool recorded_allocation_contains(uint64_t addr, size_t len);
 
 std::variant<CUfunction, CUkernel> query_function_handle(uint64_t binary_hash,

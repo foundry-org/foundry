@@ -212,7 +212,7 @@ std::unordered_set<uint64_t> scan_raw_graph_words(CUgraph graph,
   return found;
 }
 
-void CUDAGraph::adopt_native_capture(uintptr_t raw_graph, MempoolId_t pool,
+bool CUDAGraph::adopt_native_capture(uintptr_t raw_graph, MempoolId_t pool,
                                      const std::vector<NativeGenerator>& generators,
                                      const std::vector<uint64_t>& rng_candidates) {
   FOUNDRY_CHECK(!has_graph_ && !has_graph_exec_ && !capture_ended_ && !adopted_native_,
@@ -264,19 +264,6 @@ void CUDAGraph::adopt_native_capture(uintptr_t raw_graph, MempoolId_t pool,
   foundry::end_hook_record();
   allocator_events_ = foundry::save_hook_events_to_json();
   foundry::clear_hook_events();
-  for (const auto& g : gens) {
-    // LOAD maps exactly the driver allocations recorded in windows: the pair must be in one.
-    for (uint64_t addr : {std::get<4>(g), std::get<5>(g)}) {
-      char hex[32];
-      snprintf(hex, sizeof(hex), "0x%lx", (unsigned long)addr);
-      FOUNDRY_CHECK(foundry::recorded_allocation_contains(addr, sizeof(uint64_t)),
-                    "foundry capture: unsupported: the default generator's capture RNG buffer ",
-                    hex,
-                    " is not inside a driver allocation Foundry recorded (torch did not create it "
-                    "in Foundry's RNG pool inside a record window, or the RNG pool's segment was "
-                    "allocated in the record window of a capture that was refused or aborted)");
-    }
-  }
 
   graph_ = reinterpret_cast<cudaGraph_t>(raw_graph);
   has_graph_ = true;
@@ -291,6 +278,7 @@ void CUDAGraph::adopt_native_capture(uintptr_t raw_graph, MempoolId_t pool,
     graph_ = nullptr;
     has_graph_ = false;
   }
+  return !gens.empty();
 }
 
 namespace {
@@ -1357,6 +1345,22 @@ static Tensor reconstruct_tensor_from_metadata(const boost::json::object& obj) {
 void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_tensors,
                      OutputTensorType output_type) {
   FOUNDRY_CHECK(!graph_nodes.empty(), "Graph hasn't been captured yet or has no nodes");
+  if (allocator_events_.contains("events")) {
+    foundry::note_saved_hook_events(allocator_events_);
+  }
+  // LOAD maps exactly the driver allocations recorded in the windows of the graphs loaded so
+  // far (= saved so far, in this order): the archived RNG pair must be in one of them.
+  for (const auto& g : native_generators_) {
+    for (uint64_t addr : {std::get<4>(g), std::get<5>(g)}) {
+      char hex[32];
+      snprintf(hex, sizeof(hex), "0x%lx", (unsigned long)addr);
+      FOUNDRY_CHECK(foundry::recorded_allocation_contains(addr, sizeof(uint64_t)),
+                    "foundry save: unsupported: the default generator's capture RNG buffer ", hex,
+                    " is not inside a driver allocation recorded in the window of this graph or "
+                    "of a graph saved before it (save the graph that allocated Foundry's RNG pool "
+                    "segment first; LOAD loads in save order)");
+    }
+  }
 
   set_pack_fatbins_on_exit(true);
 

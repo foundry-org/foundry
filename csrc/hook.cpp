@@ -4417,8 +4417,9 @@ void clear_hook_events() {
   hook_alloc_events.clear();
 }
 
-// Driver allocations Foundry recorded in a closed record window (SAVE) or made by
-// replaying recorded events (LOAD), not freed by a recorded/replayed free since:
+// Driver allocations recorded in the windows of the graphs saved so far, in save order
+// (SAVE, note_saved_hook_events) or made by replaying recorded events (LOAD), not freed by
+// a recorded/replayed free since:
 // ptr -> size. Same update rule on both sides, so a SAVE-time and a LOAD-time
 // recorded_allocation_contains() answer the same question.
 static std::mutex recorded_allocs_mutex;
@@ -4430,6 +4431,17 @@ static void note_recorded_event(const std::string_view type, CUdeviceptr ptr, si
     recorded_allocs[ptr] = size;
   } else if (type == "free") {
     recorded_allocs.erase(ptr);
+  }
+}
+
+void note_saved_hook_events(const boost::json::object& events_obj) {
+  for (const auto& v : events_obj.at("events").as_array()) {
+    const auto& e = v.as_object();
+    const std::string_view type = e.at("type").as_string();
+    if (type == "alloc" || type == "free") {
+      note_recorded_event(type, static_cast<CUdeviceptr>(e.at("ptr").to_number<uint64_t>()),
+                          type == "alloc" ? e.at("size").to_number<uint64_t>() : 0);
+    }
   }
 }
 
@@ -4454,11 +4466,9 @@ boost::json::object save_hook_events_to_json() {
       event_obj["type"] = "alloc";
       event_obj["size"] = event.size;
       event_obj["ptr"] = static_cast<uint64_t>(event.ptr);
-      note_recorded_event("alloc", event.ptr, event.size);
     } else if (event.type == HookAllocationEvent::Type::Free) {
       event_obj["type"] = "free";
       event_obj["ptr"] = static_cast<uint64_t>(event.ptr);
-      note_recorded_event("free", event.ptr, 0);
     } else if (event.type == HookAllocationEvent::Type::Reserve) {
       event_obj["type"] = "reserve";
       event_obj["size"] = event.size;

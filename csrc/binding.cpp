@@ -293,7 +293,7 @@ PYBIND11_MODULE(ops, m) {
           [](::foundry::CUDAGraph& self, uintptr_t raw_graph, ::foundry::MempoolId_t pool,
              const std::vector<::foundry::NativeGenerator>& generators,
              const std::vector<uint64_t>& rng_candidates) {
-            self.adopt_native_capture(raw_graph, pool, generators, rng_candidates);
+            return self.adopt_native_capture(raw_graph, pool, generators, rng_candidates);
           },
           py::arg("raw_graph"), py::arg("pool"), py::arg("generators"),
           py::arg("rng_candidates") = std::vector<uint64_t>{},

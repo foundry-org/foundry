@@ -67,7 +67,9 @@ void native_record_abort();
 enum class RngPlacement : uint64_t {
   Recorded = 1,
 };
-// (id, seed, wholegraph_increment, placement, seed_ptr, offset_ptr) as SAVE passes them.
+// (id, seed, wholegraph_increment, placement, seed_ptr, offset_ptr) as SAVE passes them. seed
+// is diagnostic (the default generator's seed at SAVE): LOAD takes seed and offset from
+// torch's generator per replay.
 using NativeGenerator = std::tuple<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t>;
 
 // Per (loaded graph, generator id) seed/offset buffer addresses the archived kernels read
@@ -144,7 +146,8 @@ struct CUDAGraph {
   // capture ran inside native_record_begin(): closes the hook record, analyzes the graph.
   // torch keeps owning the cudaGraph_t and the pool (never destroyed or released here);
   // the caller keeps the torch graph alive. generators: NativeGenerator entries.
-  void adopt_native_capture(uintptr_t raw_graph, MempoolId_t pool,
+  // Returns whether a generator entry is archived (the graph reads the default pair).
+  bool adopt_native_capture(uintptr_t raw_graph, MempoolId_t pool,
                             const std::vector<NativeGenerator>& generators,
                             const std::vector<uint64_t>& rng_candidates = {});
   void save(const std::string& json_path, const OutputTensors& output_tensors = std::monostate{},
