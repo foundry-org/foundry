@@ -20,3 +20,10 @@ Refused at SAVE (`foundry capture: unsupported: ...`):
 - saving an RNG graph before the graph whose capture allocated Foundry's RNG pool segment
 
 torch refuses captures on the default stream.
+
+Unsupported and not detected:
+
+- RNG from a non-default `torch.Generator` drawn on the capturing stream by another thread
+  whose state takes an address freed inside the same capture (torch 2.14 / 2.15)
+- swapping the default generator's state (`graphsafe_set_state`) after a capture: torch's
+  replay keeps the captured state, a loaded graph uses the generator's current one
