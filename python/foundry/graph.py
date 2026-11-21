@@ -143,34 +143,79 @@ def _as_capture_unsupported(e: BaseException) -> BaseException:
 
 
 _RNG_RESERVED: set[int] = set()
+_CAPTURES_BEGUN: set[int] = set()  # devices where a Foundry capture began
+
+
+def _check_generator_contract(device: int) -> None:
+    """LOAD takes (seed, offset) per replay from ``philox_state(inc)`` outside capture (the
+    replay binding): it must return the generator's current seed and offset and advance the
+    offset by exactly ``inc``. Checked once per device with public API; the generator's
+    offset is restored, so later draws are unchanged."""
+    gen = torch.cuda.default_generators[device]
+    offset = gen.get_offset()
+    seed_t, offset_t, _ = gen.philox_state(4)
+    after = gen.get_offset()
+    gen.set_offset(offset)
+    seed = int(seed_t.item()) & 0xFFFFFFFFFFFFFFFF
+    if seed != gen.initial_seed() or int(offset_t.item()) != offset or after != offset + 4:
+        raise CaptureUnsupported(
+            f"foundry capture: unsupported: torch {torch.__version__}: Generator.philox_state(4) "
+            f"outside capture returned seed {seed} / offset {int(offset_t.item())} and left offset "
+            f"{after}; Foundry's loaded graphs need seed {gen.initial_seed()}, offset {offset} and "
+            f"offset {offset + 4} after it"
+        )
 
 
 def reserve_rng_pool() -> None:
     """SAVE and LOAD alike, at the same program point right after ``set_allocation_region``
-    (the integrations call it there): create the first segment of Foundry's RNG pool for the
-    current device outside any capture, with the same torch allocation on both sides, so it
-    lands at the same address and counts as recorded on both. Capture seed/offset pairs then
-    live in it instead of in a segment of the first capture's record window (later segments,
-    one per ~2048 live captures, are still allocated inside the capture that needs them and
-    recorded when that graph is saved). LOAD allocates this one segment once; nothing per
-    graph or replay. Without the call the first segment comes from the first capture."""
+    and before any capture (the integrations call it there): create the first segment of
+    Foundry's RNG pool for the current device outside any capture, with the same torch
+    allocation on both sides, so it lands at the same address and counts as recorded on
+    both. Capture seed/offset pairs then live in it instead of in a segment of the first
+    capture's record window (later segments, one per ~2048 live captures, are still
+    allocated inside the capture that needs them and recorded when that graph is saved).
+    The allocated block is kept for the process on both sides, so the segment survives any
+    pool-release rule. LOAD allocates this one segment once; nothing per graph or replay.
+    Also checks the generator contract LOAD relies on. Without the call the first segment
+    comes from the first capture. A second call on the same device is a no-op."""
     device = torch.cuda.current_device()
     if device in _RNG_RESERVED:
         return
+    if device in _CAPTURES_BEGUN:
+        raise CaptureUnsupported(
+            "foundry capture: unsupported: reserve_rng_pool() after a capture began on device "
+            f"{device}: call it right after set_allocation_region, before any capture"
+        )
+    _check_generator_contract(device)
     pool = _rng_pool(device)
     pool_id = tuple(pool.id)
+
+    def segments():
+        try:
+            return [
+                (seg["address"], seg["total_size"], seg["is_expandable"])
+                for seg in torch.cuda.memory_snapshot()
+                if tuple(seg["segment_pool_id"]) == pool_id
+            ]
+        except KeyError as e:
+            raise _unsupported_torch(f"torch.cuda.memory_snapshot() has no {e} field") from None
+
+    if segments():
+        raise CaptureUnsupported(
+            "foundry capture: unsupported: reserve_rng_pool(): Foundry's RNG pool already has a "
+            "segment it did not create here"
+        )
     with torch.cuda.use_mem_pool(pool), torch.cuda.stream(torch.cuda.default_stream(device)):
         block = torch.empty(1, dtype=torch.int64, device=device)
-    del block  # the pool keeps the segment
-    try:
-        segments = [
-            (seg["address"], seg["total_size"])
-            for seg in torch.cuda.memory_snapshot()
-            if tuple(seg["segment_pool_id"]) == pool_id
-        ]
-    except KeyError as e:
-        raise _unsupported_torch(f"torch.cuda.memory_snapshot() has no {e} field") from None
-    for address, size in segments:
+    _RNG_HELD.setdefault(device, []).append(block)  # kept for the process, SAVE and LOAD
+    reserved = segments()
+    if any(expandable for _, _, expandable in reserved):
+        raise CaptureUnsupported(
+            "foundry capture: unsupported: expandable segments (PYTORCH_CUDA_ALLOC_CONF "
+            "expandable_segments:True) in Foundry's RNG pool: a segment that grows in place is "
+            "not a fixed reservation"
+        )
+    for address, size, _ in reserved:
         ops.note_reserved_allocation(address, size)
     _RNG_RESERVED.add(device)
 
@@ -272,6 +317,12 @@ def _rng_self_test(device: int, pool: torch.cuda.MemPool) -> str | None:
     new = {a: b for a, b in _live_blocks().items() if a not in before}
     held = _RNG_HELD.setdefault(device, [])
     held += [native, out, seed_buf, offset_buf]
+    if any(
+        seg["is_expandable"]
+        for seg in torch.cuda.memory_snapshot()
+        if tuple(seg["segment_pool_id"]) == pool_id
+    ):
+        return "expandable segments (PYTORCH_CUDA_ALLOC_CONF expandable_segments:True) in the pool"
     problems = []
     if not all(a in new and new[a].pool == pool_id for a in pair):
         problems.append(
@@ -323,6 +374,7 @@ class CUDAGraph(ops.CUDAGraph):
             raise _unsupported_torch(
                 f"RNG self-test capture of Tensor.uniform_: {_RNG_SELF_TEST[device]}"
             )
+        _CAPTURES_BEGUN.add(device)
         native = torch.cuda.CUDAGraph(keep_graph=True)
         self._native_capture_stream = torch.cuda.current_stream().cuda_stream
         rng_pool = _rng_pool(device)
