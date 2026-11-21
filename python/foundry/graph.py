@@ -218,7 +218,9 @@ def _rng_self_test(device: int, pool: torch.cuda.MemPool) -> str | None:
     held += [native, out, seed_buf, offset_buf]
     problems = []
     if not all(a in new and new[a].pool == pool_id for a in pair):
-        problems.append(f"its seed/offset pair {[hex(a) for a in pair]} is not new in the routed pool")
+        problems.append(
+            f"its seed/offset pair {[hex(a) for a in pair]} is not new in the routed pool"
+        )
     if int(intragraph.item()) <= 0:
         problems.append("philox_state reports no offset consumed by uniform_")
     if not ops.scan_graph_words(native.raw_cuda_graph(), list(pair)):

@@ -313,8 +313,9 @@ PYBIND11_MODULE(ops, m) {
                    py::object(py::module_::import("torch.cuda").attr("default_generators"))
                        .release()
                        .ptr();
-               py::tuple st = py::reinterpret_borrow<py::tuple>(generators)[self.native_rng_device()]
-                                  .attr("philox_state")(inc);
+               py::tuple st =
+                   py::reinterpret_borrow<py::tuple>(generators)[self.native_rng_device()].attr(
+                       "philox_state")(inc);
                // int64 tensors holding the uint64 seed/offset bits (torch fills its own
                // buffers with static_cast<int64_t> of them too).
                self.set_native_rng_philox(

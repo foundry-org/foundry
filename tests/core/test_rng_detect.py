@@ -27,7 +27,8 @@ REPLAYS = 3
 
 # torch >= 2.16 pre-allocates a capture's seed/offset pairs in capture_begin (in Foundry's
 # RNG pool), so another thread drawing from the default generator claims one of those.
-PREALLOCATED_PAIRS = tuple(int(v) for v in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 16)
+_TORCH = tuple(int(v) for v in torch.__version__.split("+")[0].split(".")[:2])
+PREALLOCATED_PAIRS = _TORCH >= (2, 16)
 _KEEP = []  # default-pool int64[1] blocks a case frees inside its capture body
 
 
